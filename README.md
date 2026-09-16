@@ -1,3 +1,5 @@
+> **Disclaimer: All code in this repository is LLM-generated. See [LLMs](https://github.com/cgwalters/cgwalters#llms).**
+
 # praxis-credential-broker (alpha architecture spike)
 
 This repository is an intentionally local, security-focused spike. It places a
