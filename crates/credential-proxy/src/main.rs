@@ -218,6 +218,10 @@ async fn route(State(app): State<App>, req: Request<Body>) -> Response<Body> {
         Ok(Err(_)) => return simple(StatusCode::PAYLOAD_TOO_LARGE, "request too large\n"),
         Err(_) => return simple(StatusCode::REQUEST_TIMEOUT, "request body timeout\n"),
     };
+    let body = match normalize_codex_request(body) {
+        Ok(body) => body,
+        Err(error) => return normalization_error_response(error),
+    };
     let mut recovered = false;
     loop {
         let credentials = match agent(&app, Operation::Acquire).await {
@@ -249,6 +253,40 @@ async fn route(State(app): State<App>, req: Request<Body>) -> Response<Body> {
         return forward(response, permit, app.max_bytes, app.idle);
     }
 }
+
+/// Apply compatibility rules for the fixed Codex Responses profile.
+///
+/// The Codex backend does not accept OpenAI's `max_output_tokens` request
+/// field.  Parse only after the existing body limit has been enforced, and
+/// rewrite just the top-level object so nested tool/input data is untouched.
+#[derive(Debug)]
+enum CodexNormalizationError {
+    InvalidJson,
+    NonObject,
+    Serialization,
+}
+
+fn normalize_codex_request(body: bytes::Bytes) -> Result<bytes::Bytes, CodexNormalizationError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| CodexNormalizationError::InvalidJson)?;
+    let object = value
+        .as_object_mut()
+        .ok_or(CodexNormalizationError::NonObject)?;
+    object.remove("max_output_tokens");
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|_| CodexNormalizationError::Serialization)
+}
+
+fn normalization_error_response(error: CodexNormalizationError) -> Response<Body> {
+    let message = match error {
+        CodexNormalizationError::InvalidJson => "request body must be valid JSON\n",
+        CodexNormalizationError::NonObject => "request body must be a JSON object\n",
+        CodexNormalizationError::Serialization => "request body cannot be normalized\n",
+    };
+    simple(StatusCode::BAD_REQUEST, message)
+}
+
 async fn send(
     app: &App,
     parts: &http::request::Parts,
@@ -359,6 +397,34 @@ mod tests {
     fn upstream_path_is_not_client_selectable() {
         assert!(UPSTREAM.ends_with("/responses"));
         assert!(!UPSTREAM.contains("{"));
+    }
+
+    #[test]
+    fn codex_normalization_removes_only_top_level_max_output_tokens() {
+        let body = br#"{"model":"gpt-6-astra","max_output_tokens":42,"input":{"max_output_tokens":7},"tools":[{"max_output_tokens":9}]}"#;
+        let normalized = normalize_codex_request(bytes::Bytes::from_static(body)).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+
+        assert_eq!(value["model"], "gpt-6-astra");
+        assert!(value.get("max_output_tokens").is_none());
+        assert_eq!(value["input"]["max_output_tokens"], 7);
+        assert_eq!(value["tools"][0]["max_output_tokens"], 9);
+    }
+
+    #[test]
+    fn codex_normalization_rejects_malformed_json() {
+        assert!(matches!(
+            normalize_codex_request(bytes::Bytes::from_static(b"{not-json")),
+            Err(CodexNormalizationError::InvalidJson)
+        ));
+    }
+
+    #[test]
+    fn codex_normalization_rejects_non_object_json() {
+        assert!(matches!(
+            normalize_codex_request(bytes::Bytes::from_static(b"[]")),
+            Err(CodexNormalizationError::NonObject)
+        ));
     }
 
     #[tokio::test]
