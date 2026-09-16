@@ -5,6 +5,7 @@ COPY crates ./crates
 ARG CARGO_FEATURES=
 RUN if [ -n "$CARGO_FEATURES" ]; then cargo build --release --locked -p credential-proxy --features "$CARGO_FEATURES"; else cargo build --release --locked -p credential-proxy; fi
 FROM registry.access.redhat.com/hi/core-runtime:latest
+LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-credential-broker"
 COPY --from=build /src/target/release/credential-proxy /usr/local/bin/credential-proxy
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/credential-proxy"]

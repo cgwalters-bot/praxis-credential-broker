@@ -1,0 +1,73 @@
+name: Container images
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build production images
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY,,}"
+          docker build --pull --file Containerfile.proxy --tag "ghcr.io/${repository}-proxy:ci" .
+          docker build --pull --file Containerfile.codex --tag "ghcr.io/${repository}-provider-codex:ci" .
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify manual dispatch targets main
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main || {
+            echo 'Manual image publication must run from main.' >&2
+            exit 1
+          }
+      - name: Set image names
+        id: images
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY,,}"
+          printf 'proxy=ghcr.io/%s-proxy\n' "$repository" >> "$GITHUB_OUTPUT"
+          printf 'provider=ghcr.io/%s-provider-codex\n' "$repository" >> "$GITHUB_OUTPUT"
+      - name: Build production images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --file Containerfile.proxy --tag "${{ steps.images.outputs.proxy }}:ci" .
+          docker build --pull --file Containerfile.codex --tag "${{ steps.images.outputs.provider }}:ci" .
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish main and commit tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse --verify HEAD)
+          for image in "${{ steps.images.outputs.proxy }}" "${{ steps.images.outputs.provider }}"; do
+            docker tag "$image:ci" "$image:main"
+            docker tag "$image:ci" "$image:$commit"
+            docker push "$image:main"
+            docker push "$image:$commit"
+          done
