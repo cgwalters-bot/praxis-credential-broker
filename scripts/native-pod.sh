@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=$(pwd)
-mode=${1:?usage: native-pod.sh up|down|test}
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+mode=${1:?usage: native-pod.sh login|up|health|logs|down|rotate-agent-secret|reset-secrets|reset-auth|test}
 pod=praxis-credential-broker
 socket_volume=praxis-credential-broker-socket
 client_secret=praxis-credential-broker-client-auth
 channel_secret=praxis-credential-broker-agent-channel
+proxy_image=${PRAXIS_PROXY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main}
+provider_codex_image=${PRAXIS_PROVIDER_CODEX_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main}
 
 mounts() {
     podman inspect "$1" | python3 -c 'import json,sys; print("\n".join(m["Destination"] for m in (json.load(sys.stdin)[0]["Mounts"] or [])))'
@@ -41,16 +43,65 @@ production_down() {
     remove_socket "$socket_volume"
 }
 
-if [[ $mode == down ]]; then
-    production_down
-    exit 0
-fi
+require_stopped_pod() {
+    if podman pod exists "$pod" >/dev/null 2>&1; then
+        echo "production pod is running; run '$0 down' first" >&2
+        exit 1
+    fi
+}
+
+case "$mode" in
+    down)
+        production_down
+        exit 0
+        ;;
+    health)
+        curl --fail --silent http://127.0.0.1:18080/healthz
+        exit 0
+        ;;
+    logs)
+        podman pod logs "$pod"
+        exit 0
+        ;;
+    login)
+        [[ -n $provider_codex_image ]] || { echo 'PRAXIS_PROVIDER_CODEX_IMAGE must not be empty' >&2; exit 2; }
+        require_stopped_pod
+        podman run --rm -it --network=host -v praxis-credential-broker-auth:/codex-home:Z \
+            -e CODEX_HOME=/codex-home -- "$provider_codex_image" login
+        exit 0
+        ;;
+    rotate-agent-secret)
+        require_stopped_pod
+        bash "$root/scripts/create-agent-secret" "$channel_secret"
+        exit 0
+        ;;
+    reset-secrets)
+        test "${RESET_SECRETS:-}" = RESET
+        require_stopped_pod
+        podman secret rm "$client_secret" "$channel_secret" >/dev/null
+        exit 0
+        ;;
+    reset-auth)
+        test "${RESET_AUTH:-}" = RESET
+        production_down
+        podman volume rm praxis-credential-broker-auth
+        exit 0
+        ;;
+    up|test)
+        ;;
+    *)
+        echo "unknown mode: $mode" >&2
+        exit 2
+        ;;
+esac
 
 if [[ $mode == up ]]; then
-    podman secret exists "$client_secret" || { echo "missing Podman secret: $client_secret (run 'just init-secrets')" >&2; exit 1; }
-    podman secret exists "$channel_secret" || { echo "missing Podman secret: $channel_secret (run 'just init-secrets')" >&2; exit 1; }
+    [[ -n $proxy_image ]] || { echo 'PRAXIS_PROXY_IMAGE must not be empty' >&2; exit 2; }
+    [[ -n $provider_codex_image ]] || { echo 'PRAXIS_PROVIDER_CODEX_IMAGE must not be empty' >&2; exit 2; }
+    podman secret exists "$client_secret" || { echo "missing Podman secret: $client_secret (run 'bash scripts/init-secrets')" >&2; exit 1; }
+    podman secret exists "$channel_secret" || { echo "missing Podman secret: $channel_secret (run 'bash scripts/init-secrets')" >&2; exit 1; }
     if podman pod exists "$pod" >/dev/null 2>&1; then
-        echo "pod $pod already exists; run 'just down' before starting it again" >&2
+        echo "pod $pod already exists; run 'bash scripts/native-pod.sh down' before starting it again" >&2
         exit 1
     fi
     podman volume create "$socket_volume" >/dev/null
@@ -64,13 +115,13 @@ if [[ $mode == up ]]; then
         --secret "$channel_secret,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
         --volume "$socket_volume:/run/praxis-credentials:Z" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-        localhost/praxis-credential-proxy:dev >/dev/null
+        -- "$proxy_image" >/dev/null
     podman create "${common[@]}" --name praxis-credential-broker-provider-codex \
         --env CODEX_HOME=/codex-home --volume praxis-credential-broker-auth:/codex-home:Z \
         --volume "$socket_volume:/run/praxis-credentials:Z" \
         --secret "$channel_secret,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-        localhost/praxis-provider-codex:dev >/dev/null
+        -- "$provider_codex_image" >/dev/null
     podman create "${common[@]}" --name praxis-credential-broker-praxis \
         --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
