@@ -1,0 +1,5 @@
+praxis-credential-broker is Apache-2.0.
+
+provider-codex consumes the official OpenAI Codex repository and codex-login
+without copying its source. The exact revision is documented in README.md and
+Cargo.toml; consult that upstream repository for its applicable notices.

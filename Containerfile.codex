@@ -1,0 +1,9 @@
+FROM docker.io/library/rust:1.95-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked -p provider-codex
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /src/target/release/provider-codex /usr/local/bin/provider-codex
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/provider-codex"]

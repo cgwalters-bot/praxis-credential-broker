@@ -1,0 +1,31 @@
+[package]
+name = "credential-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+synthetic-test = []
+
+[dependencies]
+axum = "0.8"
+bytes.workspace = true
+credential-protocol = { path = "../credential-protocol" }
+futures-util.workspace = true
+async-stream = "0.3"
+http.workspace = true
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2"
+rand = "0.9"
+hex = "0.4"
+libc = "0.2"
+tokio.workspace = true
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

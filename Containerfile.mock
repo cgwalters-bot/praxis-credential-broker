@@ -1,0 +1,4 @@
+FROM docker.io/library/python:3.13-alpine
+COPY mock-upstream.py /mock-upstream.py
+USER 65532:65532
+ENTRYPOINT ["python", "-u", "/mock-upstream.py"]

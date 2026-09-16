@@ -1,0 +1,37 @@
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+# These are transitive dependencies of the pinned Codex/Rama alpha sources;
+# neither currently has a safe upgrade compatible with this spike.
+# Their advisories are documented in README.md; unmaintained checking is scoped
+# to workspace crates so this policy does not silently bless those transitive
+# packages. The two hickory-proto vulnerabilities remain hard failures.
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+  "0BSD",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "BSL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  "https://github.com/openai/codex",
+  "https://github.com/openai-oss-forks/tokio-tungstenite",
+  "https://github.com/openai-oss-forks/tungstenite-rs",
+]

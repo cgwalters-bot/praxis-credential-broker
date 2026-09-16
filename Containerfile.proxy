@@ -1,0 +1,10 @@
+FROM docker.io/library/rust:1.95-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+ARG CARGO_FEATURES=
+RUN if [ -n "$CARGO_FEATURES" ]; then cargo build --release --locked -p credential-proxy --features "$CARGO_FEATURES"; else cargo build --release --locked -p credential-proxy; fi
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /src/target/release/credential-proxy /usr/local/bin/credential-proxy
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/credential-proxy"]

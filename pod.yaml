@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: praxis-credential-broker}
+spec:
+  securityContext: {runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532}
+  containers:
+    - name: proxy
+      image: localhost/praxis-credential-proxy:dev
+      securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts: [{name: agent-socket, mountPath: /run/praxis-credentials}, {name: client-auth, mountPath: /run/secrets/client, readOnly: true}, {name: agent-channel, mountPath: /run/secrets/channel, readOnly: true}, {name: tmp, mountPath: /tmp}]
+    - name: provider-codex
+      image: localhost/praxis-provider-codex:dev
+      securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      env: [{name: CODEX_HOME, value: /codex-home}]
+      volumeMounts: [{name: auth, mountPath: /codex-home}, {name: agent-socket, mountPath: /run/praxis-credentials}, {name: agent-channel, mountPath: /run/secrets/channel, readOnly: true}, {name: tmp, mountPath: /tmp}]
+    - name: praxis
+      image: ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8
+      args: ["--config", "/etc/praxis/praxis.yaml"]
+      ports: [{containerPort: 8081, hostPort: 18080, hostIP: 127.0.0.1}]
+      securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts: [{name: config, mountPath: /etc/praxis, readOnly: true}, {name: praxis-tmp, mountPath: /tmp}]
+  volumes:
+    - {name: auth, persistentVolumeClaim: {claimName: praxis-credential-broker-auth}}
+    - {name: client-auth, secret: {secretName: praxis-credential-broker-client-auth}}
+    - {name: agent-channel, secret: {secretName: praxis-credential-broker-agent-channel}}
+    - {name: config, configMap: {name: praxis-credential-broker-config}}
+    - {name: tmp, emptyDir: {medium: Memory}}
+    - {name: praxis-tmp, emptyDir: {medium: Memory}}
+    - {name: agent-socket, emptyDir: {}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: praxis-credential-broker-auth}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 64Mi}}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: praxis-credential-broker-config}
+data:
+  praxis.yaml: |
+    listeners:
+      - {name: ai-gateway, address: "0.0.0.0:8081", filter_chains: [responses-proxy]}
+    filter_chains:
+      - name: responses-proxy
+        filters:
+          - {filter: openai_responses_proxy, name: inference}
+          - {filter: router, routes: [{path_prefix: "/healthz", cluster: inference-backend}, {path_prefix: "/v1/responses", cluster: inference-backend}]}
+          - {filter: load_balancer, clusters: [{name: inference-backend, endpoints: ["127.0.0.1:8080"]}]}
+    insecure_options: {allow_private_endpoints: true}

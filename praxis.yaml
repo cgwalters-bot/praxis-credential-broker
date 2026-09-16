@@ -1,0 +1,23 @@
+# Praxis' native router/filter schema. The broker is pod-local 127.0.0.1:8080;
+# Praxis listens on 8081 so the two processes do not collide in the pod netns.
+listeners:
+  - name: ai-gateway
+    address: "0.0.0.0:8081"
+    filter_chains: [responses-proxy]
+filter_chains:
+  - name: responses-proxy
+    filters:
+      - filter: openai_responses_proxy
+        name: inference
+      - filter: router
+        routes:
+          - path_prefix: "/healthz"
+            cluster: inference-backend
+          - path_prefix: "/v1/responses"
+            cluster: inference-backend
+      - filter: load_balancer
+        clusters:
+          - name: inference-backend
+            endpoints: ["127.0.0.1:8080"]
+insecure_options:
+  allow_private_endpoints: true
