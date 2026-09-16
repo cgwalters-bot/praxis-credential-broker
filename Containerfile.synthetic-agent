@@ -1,9 +1,9 @@
-FROM docker.io/library/rust:1.95-bookworm AS build
+FROM registry.access.redhat.com/hi/rust:latest AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release --locked -p provider-codex --no-default-features --features synthetic-test
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM registry.access.redhat.com/hi/core-runtime:latest
 COPY --from=build /src/target/release/provider-codex /usr/local/bin/provider-codex
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/provider-codex"]
