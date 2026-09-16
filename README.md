@@ -40,14 +40,47 @@ the synthetic test pod.
 
 ## Run and test
 
-Requires Podman and `just`. Put a private 32-byte minimum key at
-`/tmp/praxis-credential-broker-client-auth` and a separate channel secret at
-`/tmp/praxis-credential-broker-agent-channel` (both mode 0600), then run `just up`,
-`just health`, and `just down`. `just login` runs the pinned device-login command
+Requires Podman and `just`. Initialize the pre-existing Podman secrets without
+creating a secret file or manifest. For example, have a password manager
+provide the key through the environment and run:
+
+```sh
+PRAXIS_API_KEY="$(password-manager read praxis/api-key)" just init-secrets
+```
+
+The key must be at least 32 bytes. Environment handling is the caller's
+responsibility: command substitution and environment variables may be visible
+to local tooling or process inspection. A direct stdin alternative is:
+
+```sh
+read -r -s PRAXIS_API_KEY; printf '%s' "$PRAXIS_API_KEY" | podman secret create praxis-credential-broker-client-auth -
+```
+
+`just init-secrets` also generates the 32-byte internal channel key from a
+CSPRNG. It pipes both values directly to `podman secret create --replace -`.
+Podman manages these secrets; they are not embedded in manifests, images, or
+files created by this project. This does not claim that the Podman file driver
+encrypts data at rest. Run `just up`, `just health`, and `just down`.
+
+`just up` never rotates secrets and refuses to replace secrets while the pod is
+running. `just down` preserves the OAuth volume and both secrets for restart.
+Startup waits for all three containers and the published health endpoint. A
+successful process-level startup without OAuth is reported explicitly as
+OAuth-not-initialized when the endpoint returns the expected upstream 502;
+connection refusal, exited containers, and other statuses fail closed.
+Use `just rotate-agent-secret` explicitly (while down) to replace only the
+channel key. `RESET_SECRETS=RESET just reset-secrets` removes only the two named
+secrets; it does not remove OAuth state. `just reset-auth` is the
+separate, destructive OAuth-volume operation; run it as
+`RESET_AUTH=RESET just reset-auth`. `just login` runs the pinned device-login command
 against the named auth volume while the provider is stopped; an existing lock
 fails closed. `just test-pod` builds a synthetic agent and
-mock upstream; it has no production OAuth and publishes only the test Praxis
-listener on `127.0.0.1:18081`. Run `cargo fmt --all`, `cargo clippy --workspace
+mock upstream; it has no production OAuth and publishes only loopback test
+ports: Praxis on `127.0.0.1:18081`, mock counters on `127.0.0.1:18082`, and
+the synthetic-agent counter on `127.0.0.1:19090`. Podman 5.8 cannot use pre-existing native
+secrets from `podman kube play` secret volumes, so this project intentionally
+constructs pods and containers imperatively with `podman pod create` and
+`podman create --secret`; the old kube manifests are retired. Run `cargo fmt --all`, `cargo clippy --workspace
 --all-targets --all-features --locked`, and `cargo test --workspace --locked`.
 
 Codex client:
