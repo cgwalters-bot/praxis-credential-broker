@@ -269,6 +269,8 @@ async fn handle_real(
 }
 #[cfg(not(feature = "synthetic-test"))]
 async fn acquire(m: &AuthManager, nonce: String) -> Response {
+    // auth() performs managed ChatGPT proactive refresh when needed; File mode
+    // persists it under CODEX_HOME. The proxy calls Acquire before forwarding.
     match m.auth().await {
         Some(a @ (CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_))) => {
             match a.get_token() {
