@@ -168,34 +168,21 @@ if [[ $mode == up ]]; then
         sleep 1
     done
     [[ $all_running == true ]] || fail_startup
-    health_state=starting
+    health_ready=false
     for _ in {1..30}; do
-        health=$(curl --silent --show-error --max-time 2 --write-out $'\n%{http_code}' http://127.0.0.1:18080/healthz || true)
-        health_code=${health##*$'\n'}
-        health_body=${health%$'\n'*}
-        if [[ $health_code == 200 ]]; then
-            health_state=ready
+        if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:18080/healthz >/dev/null; then
+            health_ready=true
             break
-        elif [[ $health_code == 502 && $health_body == *'Upstream connection refused'* ]]; then
-            health_state=oauth-not-initialized
-            break
-        elif [[ $health_code != 000 ]]; then
-            sleep 1
-        else
-            sleep 1
         fi
+        sleep 1
         all_running=true
         for c in "${expected[@]}"; do
             podman inspect "$c" | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin)[0]["State"]["Running"] else 1)' || all_running=false
         done
         [[ $all_running == true ]] || fail_startup
     done
-    [[ $health_state != starting ]] || { echo 'native pod startup timed out waiting for healthz' >&2; fail_startup; }
-    if [[ $health_state == oauth-not-initialized ]]; then
-        echo 'Started praxis-credential-broker; processes are running but OAuth is not initialized (healthz: 502 upstream connection refused).'
-    else
-        echo 'Started praxis-credential-broker; healthz is ready.'
-    fi
+    [[ $health_ready == true ]] || { echo 'native pod startup timed out waiting for healthz' >&2; fail_startup; }
+    echo 'Started praxis-credential-broker; healthz is ready.'
     trap - EXIT INT TERM
     exit 0
 fi
