@@ -38,7 +38,7 @@ const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 struct App {
     client: Client,
-    key: Key,
+    client_auth: ClientAuth,
     channel_key: Vec<u8>,
     max_bytes: usize,
     idle: Duration,
@@ -76,17 +76,58 @@ impl Key {
     }
 }
 
+#[derive(Clone)]
+enum ClientAuth {
+    Required(Key),
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientAuthMode {
+    Required,
+    Disabled,
+}
+
+impl ClientAuthMode {
+    fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value.unwrap_or("required") {
+            "required" => Ok(Self::Required),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err("CLIENT_AUTH_MODE must be exactly 'required' or 'disabled'"),
+        }
+    }
+}
+
+impl ClientAuth {
+    fn load(mode: ClientAuthMode) -> io::Result<Self> {
+        match mode {
+            ClientAuthMode::Required => Key::read(
+                &env::var("CLIENT_AUTH_FILE")
+                    .unwrap_or_else(|_| "/run/secrets/client/client-api-key".into()),
+            )
+            .map(Self::Required),
+            ClientAuthMode::Disabled => Ok(Self::Disabled),
+        }
+    }
+
+    fn accepts(&self, authorization: Option<&http::HeaderValue>) -> bool {
+        match self {
+            Self::Required(key) => key.accepts(authorization),
+            Self::Disabled => true,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
-    let key = Key::read(
-        &env::var("CLIENT_AUTH_FILE")
-            .unwrap_or_else(|_| "/run/secrets/client/client-api-key".into()),
-    )
-    .expect("client secret unavailable or weak");
+    let client_auth_mode = ClientAuthMode::parse(env::var("CLIENT_AUTH_MODE").ok().as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
+    let client_auth =
+        ClientAuth::load(client_auth_mode).expect("client secret unavailable or weak");
     let channel_key =
         std::fs::read_to_string(CHANNEL_SECRET).expect("agent channel secret unavailable");
     if channel_key.trim().len() < MIN_KEY {
@@ -97,7 +138,7 @@ async fn main() {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap(),
-        key,
+        client_auth,
         channel_key: channel_key.trim().as_bytes().to_vec(),
         max_bytes: env_num("MAX_RESPONSE_BYTES", 64 * 1024 * 1024, 1024 * 1024 * 1024),
         idle: Duration::from_secs(env_num("CHUNK_IDLE_SECS", 30, 300) as u64),
@@ -205,7 +246,10 @@ async fn route(State(app): State<App>, req: Request<Body>) -> Response<Body> {
     {
         return simple(StatusCode::NOT_FOUND, "not found\n");
     }
-    if !app.key.accepts(req.headers().get(header::AUTHORIZATION)) {
+    if !app
+        .client_auth
+        .accepts(req.headers().get(header::AUTHORIZATION))
+    {
         return simple(StatusCode::UNAUTHORIZED, "client authentication required\n");
     }
     let permit = match app.concurrency.clone().try_acquire_owned() {
@@ -379,6 +423,35 @@ mod tests {
         let header = format!("Bearer {value}").parse().unwrap();
         assert!(key.accepts(Some(&header)));
     }
+
+    #[test]
+    fn client_auth_mode_defaults_to_required_and_rejects_unknown_modes() {
+        assert_eq!(ClientAuthMode::parse(None), Ok(ClientAuthMode::Required));
+        assert_eq!(
+            ClientAuthMode::parse(Some("disabled")),
+            Ok(ClientAuthMode::Disabled)
+        );
+        assert!(matches!(
+            ClientAuthMode::parse(Some("")),
+            Err("CLIENT_AUTH_MODE must be exactly 'required' or 'disabled'")
+        ));
+        assert!(matches!(
+            ClientAuthMode::parse(Some("optional")),
+            Err("CLIENT_AUTH_MODE must be exactly 'required' or 'disabled'")
+        ));
+    }
+
+    #[test]
+    fn required_and_disabled_client_auth_have_explicit_behavior() {
+        let key = Key::read_from_value("abcdefghijklmnopqrstuvwxyz012345");
+        let required = ClientAuth::Required(key);
+        let correct = "Bearer abcdefghijklmnopqrstuvwxyz012345".parse().unwrap();
+        assert!(!required.accepts(None));
+        assert!(!required.accepts(Some(&"Bearer wrong".parse().unwrap())));
+        assert!(required.accepts(Some(&correct)));
+        assert!(ClientAuth::Disabled.accepts(None));
+        assert!(ClientAuth::Disabled.accepts(Some(&correct)));
+    }
     #[test]
     fn sensitive_and_hop_headers_are_not_forwarded() {
         for name in [
@@ -431,7 +504,9 @@ mod tests {
     async fn slow_request_body_times_out_and_releases_permit() {
         let app = App {
             client: Client::new(),
-            key: Key::read_from_value("abcdefghijklmnopqrstuvwxyz012345"),
+            client_auth: ClientAuth::Required(Key::read_from_value(
+                "abcdefghijklmnopqrstuvwxyz012345",
+            )),
             channel_key: vec![b'c'; MIN_KEY],
             max_bytes: MAX_BODY,
             idle: Duration::from_secs(1),
