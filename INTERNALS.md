@@ -14,8 +14,9 @@ client -> stock Praxis -> credential-proxy -> fixed chatgpt.com Codex endpoint
 
 There are three credential classes:
 
-1. The client API key authenticates a local client to Praxis and must be at
-   least 32 bytes.
+1. In the default `required` client-auth mode, the client API key
+   authenticates a local client to Praxis and must be at least 32 bytes. In
+   explicit `disabled` mode it is neither read nor mounted.
 2. The internal channel key is a generated HMAC secret between the proxy and
    provider; it is not a client credential.
 3. Provider-owned ChatGPT Codex OAuth tokens live in the provider's auth
@@ -41,8 +42,9 @@ depends on the Podman deployment and its shared secret.
 The socket is in the private named volume
 `praxis-credential-broker-socket`, is mode 0660, and is shared only by proxy
 and provider. Both images run as UID/GID 65532 with read-only root filesystems,
-no capabilities, and no privilege escalation. The proxy alone receives the
-Podman client-key secret; Praxis receives neither secret. The provider's
+no capabilities, and no privilege escalation. In required mode the proxy alone
+receives the Podman client-key secret; Praxis receives neither secret. In
+disabled mode no container receives that secret. The provider's
 separate writable auth volume is mounted only at `/codex-home`.
 
 Finite and SSE streams have idle, byte, and concurrency limits. `/healthz`
@@ -64,7 +66,29 @@ Device login runs while the provider is stopped. It uses an advisory lock,
 same-volume staging, and atomic installation, so cancellation leaves an
 existing `auth.json` unchanged. The health check verifies process and private
 credential-channel readiness only; it does not acquire OAuth credentials. An
-authenticated Responses request is required to verify the Codex login.
+upstream Responses request is required to verify the Codex login.
+
+## Client authentication modes
+
+`PRAXIS_CLIENT_AUTH_MODE` is strictly either `required` (the default) or
+`disabled` for `up`; unknown values stop that operation before a pod is
+created. It does not affect cleanup or maintenance operations. The proxy
+receives the corresponding `CLIENT_AUTH_MODE` and rejects unknown values at
+startup. There is no opportunistic authentication mode: an absent client secret
+in required mode is a startup failure, not a downgrade.
+
+Required mode retains the >=32-byte Podman client secret, constant-time bearer
+comparison, and 401 response. Disabled mode admits requests without an
+`Authorization` header but always removes caller authorization before adding
+the provider credential upstream. The internal HMAC channel secret and the
+provider-only OAuth auth volume remain mandatory in both modes.
+
+Disabled mode is appropriate only when an intentionally managed access-control
+boundary, such as a tailnet/Tailscale policy, protects access. The current
+runtime remains loopback-only and does not configure Tailscale. Changing modes
+requires stopping the pod and recreating it with the selected mode. Running
+`init-secrets` in disabled mode creates/replaces only the channel secret and
+does not prompt for, remove, or otherwise modify an existing client secret.
 
 ## Operations
 
@@ -76,7 +100,7 @@ or maintenance commands while observing their required stopped-pod state:
 # Replace only the internal channel key; pod must be down.
 bash scripts/native-pod.sh rotate-agent-secret
 
-# Remove client and channel secrets; pod must be down.
+# Remove the client secret if present and the mandatory channel secret; pod must be down.
 RESET_SECRETS=RESET bash scripts/native-pod.sh reset-secrets
 
 # Remove the OAuth auth volume (and stop/remove the pod).
@@ -86,7 +110,7 @@ RESET_AUTH=RESET bash scripts/native-pod.sh reset-auth
 bash scripts/native-pod.sh logs
 ```
 
-`scripts/init-secrets` can receive the client key interactively, through
+In required mode, `scripts/init-secrets` can receive the client key interactively, through
 `PRAXIS_API_KEY`, through `PRAXIS_API_KEY_COMMAND`, or on standard input. For
 example, a password manager can provide it without creating a project file:
 
@@ -109,9 +133,18 @@ real credentials in that test pod.
 
 The test pod exposes loopback-only ports: Praxis on `127.0.0.1:18081`, mock
 counters on `127.0.0.1:18082`, and the synthetic provider counter on
-`127.0.0.1:19090`. It verifies client authentication, 401 recovery, finite and
-SSE responses, secret isolation, socket mode/label, hardening, and that secrets
-do not appear in pod logs.
+`127.0.0.1:19090`. It verifies required client authentication, 401 recovery,
+finite and SSE responses, secret isolation, socket mode/label, hardening, and
+that secrets do not appear in pod logs. It then recreates the synthetic pod in
+disabled mode and verifies a no-Authorization request succeeds with provider
+credentials, no client-secret mount, and a separate caller Authorization value
+is replaced with the provider credential. It also checks idempotent removal of
+absent synthetic secrets.
+
+Codex 0.154.0 accepted the disabled provider with no `env_key` and
+`requires_openai_auth = false`, resolving its top-level named profile. OpenCode
+1.18.30 with `@ai-sdk/openai` rejects a missing `apiKey` before sending a
+request; use a non-secret placeholder such as `unused`, which the proxy strips.
 
 ```sh
 just check

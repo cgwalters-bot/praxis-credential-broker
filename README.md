@@ -18,8 +18,9 @@ ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main
 ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main
 ```
 
-Create and export a client API key (at least 32 bytes), initialize the Podman
-secrets, then complete the Codex device login and start the pod:
+Client API-key authentication is required by default. Create and export a
+client API key (at least 32 bytes), initialize the Podman secrets, then
+complete the Codex device login and start the pod:
 
 ```sh
 read -r -s PRAXIS_API_KEY
@@ -35,6 +36,17 @@ bash scripts/native-pod.sh down
 
 `down` preserves the client secrets and Codex login for a later restart. GHCR
 access policies may require `podman login ghcr.io`.
+
+To deliberately rely on another access-control boundary, such as a tailnet
+policy, disable client authentication before initialization. The service still
+binds loopback-only; this does not configure Tailscale.
+
+```sh
+export PRAXIS_CLIENT_AUTH_MODE=disabled
+bash scripts/init-secrets # creates only the mandatory internal channel secret
+bash scripts/native-pod.sh login
+bash scripts/native-pod.sh up
+```
 
 To use a full-commit-SHA tag or a compatible private mirror, override both
 images before `login` and `up`:
@@ -63,10 +75,11 @@ Use the same secret setup above before starting local images.
 
 ## Configure and launch clients
 
-Praxis listens on `127.0.0.1:18080` and accepts `POST /v1/responses`. Use
-`PRAXIS_API_KEY`, not a ChatGPT credential.
+Praxis listens on `127.0.0.1:18080` and accepts `POST /v1/responses`. In the
+default required mode, use `PRAXIS_API_KEY`, not a ChatGPT credential.
 
-Codex configuration:
+Codex required-mode configuration uses a provider definition in
+`~/.codex/config.toml`:
 
 ```toml
 [model_providers.praxis]
@@ -74,12 +87,26 @@ name = "Local Praxis"
 base_url = "http://127.0.0.1:18080/v1"
 wire_api = "responses"
 env_key = "PRAXIS_API_KEY"
+```
 
-[profiles.praxis]
+and a named profile in `~/.codex/praxis.config.toml`:
+
+```toml
 model_provider = "praxis"
 ```
 
-Known-working OpenCode configuration:
+In disabled mode, replace the provider definition with this keyless variant;
+the profile is unchanged:
+
+```toml
+[model_providers.praxis]
+name = "Local Praxis"
+base_url = "http://127.0.0.1:18080/v1"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+OpenCode required-mode configuration:
 
 ```json
 {
@@ -100,7 +127,9 @@ Known-working OpenCode configuration:
 }
 ```
 
-Do not set `requires_openai_auth`. Launch either configured client with:
+In disabled mode, replace `"{env:PRAXIS_API_KEY}"` with `"unused"`. It is a
+non-secret placeholder required by OpenCode's AI SDK; the broker strips it
+before upstream forwarding. Launch either configured client with:
 
 ```sh
 codex --profile praxis
