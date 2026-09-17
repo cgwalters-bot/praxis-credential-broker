@@ -3,7 +3,7 @@ unmaintained = "workspace"
 yanked = "deny"
 # These are transitive dependencies of the pinned Codex/Rama alpha sources;
 # neither currently has a safe upgrade compatible with this spike.
-# Their advisories are documented in README.md; unmaintained checking is scoped
+# Their advisories are documented in INTERNALS.md; unmaintained checking is scoped
 # to workspace crates so this policy does not silently bless those transitive
 # packages. The two hickory-proto vulnerabilities remain hard failures.
 
