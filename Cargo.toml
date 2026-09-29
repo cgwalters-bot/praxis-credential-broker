@@ -17,5 +17,13 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 
 [patch.crates-io]
+# Praxis core from cgwalters-forge/praxis, whose AuthenticatedIdentity
+# constructor is public, so that run_token can name the run a request
+# belongs to. Every crate of it, so that they stay one version.
+praxis-proxy = { git = "https://github.com/cgwalters-forge/praxis", rev = "9556f2a4a0b686ad2f392ed3150279f82bee176f" }
+praxis-proxy-core = { git = "https://github.com/cgwalters-forge/praxis", rev = "9556f2a4a0b686ad2f392ed3150279f82bee176f" }
+praxis-proxy-filter = { git = "https://github.com/cgwalters-forge/praxis", rev = "9556f2a4a0b686ad2f392ed3150279f82bee176f" }
+praxis-proxy-protocol = { git = "https://github.com/cgwalters-forge/praxis", rev = "9556f2a4a0b686ad2f392ed3150279f82bee176f" }
+praxis-proxy-tls = { git = "https://github.com/cgwalters-forge/praxis", rev = "9556f2a4a0b686ad2f392ed3150279f82bee176f" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

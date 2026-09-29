@@ -8,7 +8,8 @@
 
 A reference implementation for using [Praxis AI](https://github.com/praxis-proxy/ai)
 with the ChatGPT Codex Responses endpoint, authenticated through `codex login`.
-Praxis meters every response and caps token use over a time window.
+Praxis meters every response and caps token use over a time window, and can
+cap each CI job's run separately with per-run tokens.
 
 ## Run published images
 
@@ -49,6 +50,24 @@ bash scripts/init-secrets # creates only the mandatory internal channel secret
 bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```
+
+For CI agent jobs, `run-token` mode refuses every request that lacks the
+token of a run registered with a GitHub Actions OIDC token from an allowed
+repository (pinned by id), workflow and event (by default only
+`workflow_dispatch`), and caps each run's tokens. Copy
+`run-token-policy.yaml`, name the workflows and repository ids that may
+register, and:
+
+```sh
+export PRAXIS_CLIENT_AUTH_MODE=run-token
+export PRAXIS_RUN_TOKEN_POLICY=$HOME/run-token-policy.yaml
+bash scripts/init-secrets
+bash scripts/native-pod.sh up
+```
+
+The job's supervisor registers the run and hands only the returned token to
+the agent, whose sandbox must not get the job's `ACTIONS_ID_TOKEN_REQUEST_*`
+variables; see [INTERNALS.md](INTERNALS.md#run-tokens).
 
 To use a full-commit-SHA tag or a compatible private mirror, override the
 images before `login` and `up`:

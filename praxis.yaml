@@ -12,11 +12,48 @@
 # reservation_timeout outlasts any single response: a reservation still
 # open after it is charged its estimate for good, and the actual usage
 # is then ignored.
+#
+# The run-token-gateway listener (8083) is the same chain behind per-run
+# tokens, for PRAXIS_CLIENT_AUTH_MODE=run-token: the pod publishes it instead
+# of ai-gateway. A job registers its run with a GitHub Actions OIDC token
+# (POST /v1/runs) and gets a token that every request must carry; each run
+# is capped by a token_rate_limit rule keyed on it. Which jobs may register
+# is the deployment's policy file (run-token-policy.yaml); without it no run
+# can register, and the listener refuses everything but /healthz.
 listeners:
   - name: ai-gateway
     address: "0.0.0.0:8081"
     filter_chains: [ai-proxy]
+  - name: run-token-gateway
+    address: "0.0.0.0:8083"
+    filter_chains: [run-token, ai-proxy]
 filter_chains:
+  - name: run-token
+    filters:
+      # A bearer token in Authorization, but Claude Code sends its own OAuth
+      # token there, so it puts the run token in x-run-token
+      # (ANTHROPIC_CUSTOM_HEADERS), which then takes precedence. Praxis
+      # refuses conditions on security filters, so one filter serves both.
+      - filter: run_token
+        token_headers: [x-run-token, authorization]
+        # /healthz answers without a run token, for the pod's health check.
+        public_paths: ["/healthz"]
+        registration:
+          policy_file: /etc/praxis/run-token-policy.yaml
+      # Each run's cap, across both APIs. The window must be at least the
+      # policy's max_secs (6h by default), so that it spans the whole run.
+      - filter: token_rate_limit
+        key: authenticated_subject
+        conditions:
+          - when:
+              methods: ["POST"]
+        rules:
+          - name: run
+            algorithm: sliding_window
+            window: 6h
+            capacity: 20000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
   - name: ai-proxy
     filters:
       # These native filters validate/classify the Messages protocol without

@@ -1,0 +1,22 @@
+# Which GitHub Actions jobs may register runs in run-token mode
+# (PRAXIS_CLIENT_AUTH_MODE=run-token); see praxis.yaml's run-token-gateway.
+# This example matches no token: copy it, name the workflows and the
+# repository or owner ids that may register runs, and point
+# PRAXIS_RUN_TOKEN_POLICY at the copy.
+#
+# Exact job_workflow_ref claims that may register runs.
+workflows:
+  - "example-owner/example-repo/.github/workflows/agent.yml@refs/heads/main"
+# Pin the repository (or owner) by id: names can be re-registered.
+repository_ids: [0]
+# Optional, with these defaults:
+# owner_ids: []
+# entry_workflows: only the job's own workflow
+# events: [workflow_dispatch]
+# audience: praxis-credential-broker
+# jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+# How long a run lasts. Past 6h, also lengthen the window of the per-run cap
+# (the `run` rule in praxis.yaml), or the cap starts sliding mid-run.
+# max_secs: 21600
+# Requests of one run in flight at once.
+# concurrency: 4
