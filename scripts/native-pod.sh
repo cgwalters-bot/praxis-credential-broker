@@ -188,6 +188,14 @@ if [[ $mode == up ]]; then
 fi
 
 [[ $mode == test ]] || { echo "unknown mode: $mode" >&2; exit 2; }
+# Wait up to a minute each for Praxis to report healthy and for the mock
+# upstream, which starts on its own schedule, to answer.
+wait_ready() {
+    local url i
+    for url in http://127.0.0.1:18081/healthz http://127.0.0.1:18082/counters; do
+        i=0; while [ "$i" -lt 60 ]; do curl --fail --silent "$url" >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+    done
+}
 test_pod=praxis-credential-broker-test
 test_socket=praxis-credential-broker-test-socket
 test_client=praxis-credential-broker-test-client
@@ -236,7 +244,7 @@ for _ in {1..30}; do [[ -S "$socket_dir/agent.sock" ]] && break; sleep 1; done
 [[ $(stat -c '%a' "$socket_dir/agent.sock") == 660 ]]
 socket_label=$(ls -Zd "$socket_dir/agent.sock")
 [[ $socket_label != *' ? '* ]]
-i=0; while [ "$i" -lt 60 ]; do curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+wait_ready
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST --data '{}' http://127.0.0.1:18081/v1/responses); test "$status" = 401
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 body=$(curl --fail --silent -H 'Authorization: Bearer synthetic-client-key-012345678901234567890123' -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); python3 -c 'import json,sys; assert json.loads(sys.argv[1])["id"] == "synthetic"' "$body"
@@ -269,7 +277,7 @@ proxy=$test_pod-proxy
 secret_names "$proxy" | grep -qx "$test_client" && exit 1
 check_secret "$proxy" "$test_channel" /run/secrets/channel/agent-channel-key
 for c in "$proxy" "$test_pod-agent" "$test_pod-praxis" "$test_pod-mock"; do check_hardening "$c"; done
-i=0; while [ "$i" -lt 60 ]; do curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+wait_ready
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 body=$(curl --fail --silent -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); python3 -c 'import json,sys; assert json.loads(sys.argv[1])["id"] == "synthetic"' "$body"
 python3 -c 'import json,urllib.request; x=json.load(urllib.request.urlopen("http://127.0.0.1:18082/counters")); assert x == {"calls": 2, "observed": [[True, True]]}, x'
