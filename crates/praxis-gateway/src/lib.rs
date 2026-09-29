@@ -1,6 +1,9 @@
 //! Praxis AI, built with this repository's own filters added to its
 //! registry.
 
+#[cfg(test)]
+mod integration_tests;
+
 use praxis_filter::FilterRegistry;
 
 /// Praxis AI's full filter registry plus this crate's filters.

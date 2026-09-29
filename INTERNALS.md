@@ -94,6 +94,37 @@ requires stopping the pod and recreating it with the selected mode. Running
 `init-secrets` in disabled mode creates/replaces only the channel secret and
 does not prompt for, remove, or otherwise modify an existing client secret.
 
+## Metering and the window cap
+
+Subscription inference has no per-token bill, so without a cap only a job's
+timeout bounds what an agent spends, and in disabled mode so does every peer
+that can reach the port. The gateway therefore meters every response and
+caps use, in every mode, with praxis-ai's own filters:
+
+- **Metering.** `token_count` reads each response's usage: the Responses
+  API's top-level `usage` or the `response.completed` event of a stream,
+  and the `message_start`/`message_delta` usage of Messages. It records the
+  counts in the request's filter metadata. A `headers` filter drops
+  `accept-encoding`, so responses stay readable.
+- **Window cap.** `token_rate_limit` reserves a fixed 10k tokens per
+  request, refuses a request with 429 when that would exceed 100M tokens in
+  a sliding 5-hour window (the Codex usage-limit window), and reconciles the
+  reservation with the counts `token_count` recorded. Each API has its own
+  window, since each is a different subscription with a limit of its own.
+  Its callers are indistinguishable, so one of them can use up a window and
+  lock out the others until it slides. A reservation still open after
+  `reservation_timeout` (30 minutes, longer than any one response) is
+  charged its estimate for good, as is one whose client left before the
+  usage arrived.
+
+Both APIs share one chain, whose Responses and Messages filters are
+conditioned on the path (`/v1/responses`, `/v1/messages`). Messages
+requests go straight to api.anthropic.com with the caller's own Claude
+OAuth token; credential-proxy, and so the client API key of required mode,
+is only on the Responses path.
+
+Windows live in the gateway's memory: restarting it resets them.
+
 ## Operations
 
 `down` removes the production pod and socket volume but preserves the client
@@ -129,7 +160,10 @@ key at rest.
 
 ## Development and synthetic testing
 
-`just check` runs formatting, clippy, and locked workspace tests. `just
+`just check` runs formatting, clippy, and locked workspace tests. Those
+include the gateway's integration tests, which serve `praxis.yaml` with the
+gateway's registry in front of a fake upstream, and check that streamed
+Responses and Messages responses are metered and capped per window. `just
 test-pod` builds a synthetic provider and mock upstream, then runs the native
 Podman integration checks. It always uses hardwired local synthetic images;
 it does not read production image overrides or OAuth credentials. Never put

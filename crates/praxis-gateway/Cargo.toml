@@ -11,3 +11,14 @@ praxis-ai = { package = "praxis-ai-proxy", git = "https://github.com/praxis-prox
 praxis-core = { package = "praxis-proxy-core", version = "0.7" }
 praxis-filter = { package = "praxis-proxy-filter", version = "0.7", default-features = false }
 tracing = "0.1"
+
+[dev-dependencies]
+async-stream = "0.3"
+axum = "0.8"
+bytes.workspace = true
+praxis-test-utils = { git = "https://github.com/praxis-proxy/ai", tag = "v0.4.1", default-features = false, features = ["openai-responses"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+serde_json.workspace = true
+serde_yaml = { package = "yaml_serde", version = "0.10" }
+tokio.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,23 +1,115 @@
-# Praxis' native router/filter schema. The broker is pod-local 127.0.0.1:8080;
-# Praxis listens on 8081 so the two processes do not collide in the pod netns.
+# Praxis' native router/filter schema. The Codex broker is pod-local
+# 127.0.0.1:8080; Praxis listens on 8081 so the two processes do not collide
+# in the pod netns. OpenAI Responses (/v1/responses) and Anthropic Messages
+# (/v1/messages) share one chain, whose protocol filters are conditioned on
+# the path, so OpenAI filters never inspect Messages bodies and vice versa.
+#
+# Usage is metered by praxis-ai's token_count and capped by its
+# token_rate_limit over a sliding 5h window (the Codex limit window), one
+# window per provider, since each subscription has a limit of its own.
+# token_rate_limit comes before token_count because response filters run in
+# reverse order, so it sees the counts token_count records. Its
+# reservation_timeout outlasts any single response: a reservation still
+# open after it is charged its estimate for good, and the actual usage
+# is then ignored.
 listeners:
   - name: ai-gateway
     address: "0.0.0.0:8081"
-    filter_chains: [responses-proxy]
+    filter_chains: [ai-proxy]
 filter_chains:
-  - name: responses-proxy
+  - name: ai-proxy
     filters:
+      # These native filters validate/classify the Messages protocol without
+      # translating its body. Keep classifier headers internal to Praxis.
+      - filter: anthropic_messages_format
+        conditions:
+          - when:
+              path: "/v1/messages"
+        on_invalid: reject
+        headers:
+          format: null
+          model: null
+          stream: null
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path: "/v1/messages"
+      - filter: anthropic_messages_protocol
+        conditions:
+          - when:
+              path: "/v1/messages"
+      - filter: token_rate_limit
+        conditions:
+          - when:
+              path: "/v1/responses"
+        rules:
+          - name: window
+            algorithm: sliding_window
+            window: 5h
+            capacity: 100000000
+            # Reserved at admission and reconciled with the actual usage.
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      - filter: token_rate_limit
+        conditions:
+          - when:
+              path: "/v1/messages"
+        rules:
+          - name: window
+            algorithm: sliding_window
+            window: 5h
+            capacity: 100000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      - filter: token_count
+        conditions:
+          - when:
+              path: "/v1/responses"
+        provider: openai
+        # response.completed carries the whole response.
+        max_body_bytes: 16777216
+        max_scratch_bytes: 16777216
+      - filter: token_count
+        conditions:
+          - when:
+              path: "/v1/messages"
+        provider: anthropic
+        max_body_bytes: 16777216
+        max_scratch_bytes: 16777216
       - filter: openai_responses_proxy
         name: inference
+        conditions:
+          - when:
+              path: "/v1/responses"
+      # token_count reads bodies as they are, so ask for them uncompressed.
+      - filter: headers
+        request_remove: ["accept-encoding"]
+      # Claude Code's OAuth bearer token and Anthropic protocol headers pass
+      # through unchanged. Remove API-key authentication so the two credential
+      # forms cannot be sent together, and force the upstream authority.
+      - filter: headers
+        conditions:
+          - when:
+              path: "/v1/messages"
+        request_remove: ["x-api-key"]
+        request_set:
+          - name: Host
+            value: api.anthropic.com
       - filter: router
         routes:
           - path_prefix: "/healthz"
             cluster: inference-backend
           - path_prefix: "/v1/responses"
             cluster: inference-backend
+          - path: "/v1/messages"
+            cluster: anthropic-api
       - filter: load_balancer
         clusters:
           - name: inference-backend
             endpoints: ["127.0.0.1:8080"]
+          - name: anthropic-api
+            endpoints: ["api.anthropic.com:443"]
+            tls:
+              sni: "api.anthropic.com"
 insecure_options:
   allow_private_endpoints: true

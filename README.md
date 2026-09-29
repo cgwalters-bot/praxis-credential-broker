@@ -8,6 +8,7 @@
 
 A reference implementation for using [Praxis AI](https://github.com/praxis-proxy/ai)
 with the ChatGPT Codex Responses endpoint, authenticated through `codex login`.
+Praxis meters every response and caps token use over a time window.
 
 ## Run published images
 
