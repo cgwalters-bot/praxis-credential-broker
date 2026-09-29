@@ -1,0 +1,13 @@
+[package]
+name = "praxis-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# praxis-ai's minimum.
+rust-version = "1.96"
+
+[dependencies]
+praxis-ai = { package = "praxis-ai-proxy", git = "https://github.com/praxis-proxy/ai", tag = "v0.4.1", default-features = false, features = ["openai-responses", "token-rate-limit-filter"] }
+praxis-core = { package = "praxis-proxy-core", version = "0.7" }
+praxis-filter = { package = "praxis-proxy-filter", version = "0.7", default-features = false }
+tracing = "0.1"

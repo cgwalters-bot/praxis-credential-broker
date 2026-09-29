@@ -6,7 +6,7 @@
 > [INTERNALS.md](INTERNALS.md) for architecture, security, operations, and
 > development details.
 
-A reference implementation for using stock [Praxis AI](https://github.com/praxis-proxy/ai)
+A reference implementation for using [Praxis AI](https://github.com/praxis-proxy/ai)
 with the ChatGPT Codex Responses endpoint, authenticated through `codex login`.
 
 ## Run published images
@@ -16,6 +16,7 @@ Requires Podman, `curl`, and this repository's scripts. The default images are:
 ```text
 ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main
 ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main
+ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:main
 ```
 
 Client API-key authentication is required by default. Create and export a
@@ -48,12 +49,13 @@ bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```
 
-To use a full-commit-SHA tag or a compatible private mirror, override both
+To use a full-commit-SHA tag or a compatible private mirror, override the
 images before `login` and `up`:
 
 ```sh
 export PRAXIS_PROXY_IMAGE=ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:<commit-sha>
 export PRAXIS_PROVIDER_CODEX_IMAGE=ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:<commit-sha>
+export PRAXIS_GATEWAY_IMAGE=ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:<commit-sha>
 bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```
@@ -67,6 +69,7 @@ explicitly select them for the runtime scripts:
 just build
 export PRAXIS_PROXY_IMAGE=localhost/praxis-credential-proxy:dev
 export PRAXIS_PROVIDER_CODEX_IMAGE=localhost/praxis-provider-codex:dev
+export PRAXIS_GATEWAY_IMAGE=localhost/praxis-gateway:dev
 bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```

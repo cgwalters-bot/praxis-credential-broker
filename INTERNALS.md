@@ -6,11 +6,15 @@ details that are intentionally kept out of the [quick-start README](README.md).
 ## Architecture and trust boundaries
 
 ```text
-client -> stock Praxis -> credential-proxy -> fixed chatgpt.com Codex endpoint
-                             ^
-                             | private versioned Unix socket (credentials only)
-                       provider-codex
+client -> praxis-gateway -> credential-proxy -> fixed chatgpt.com Codex endpoint
+                                ^
+                                | private versioned Unix socket (credentials only)
+                          provider-codex
 ```
+
+`praxis-gateway` (`crates/praxis-gateway`) is Praxis AI built from its
+released source as a library, with its full filter registry plus this
+repository's own filters. Its configuration is `praxis.yaml`.
 
 There are three credential classes:
 
@@ -157,16 +161,18 @@ containers with `podman create --secret`.
 
 ## Pinned dependencies and publishing
 
-Stock Praxis is pinned to
-`ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8`.
-The Codex provider uses the official `codex-login` source at
+The gateway builds praxis-ai from its `v0.4.1` tag (commit
+`b9d6016764888e02dc049ec088496b10b7e886c1`, locked in `Cargo.lock`), with
+the `openai-responses` and experimental `token-rate-limit-filter` features;
+`Containerfile.gateway` builds it like upstream's image, on Alpine. The
+Codex provider uses the official `codex-login` source at
 `0dfb28edb9305fcae4ab006fb6b7b196cbdbac28`.
 
-GitHub Actions builds both production Containerfiles for pull requests. Pushes
-to `main` and manual dispatches from `main` publish the proxy and Codex-provider
-GHCR images with `main` and immutable full-commit-SHA tags using `GITHUB_TOKEN`.
-Both production Containerfiles set the OCI `org.opencontainers.image.source`
-label to this repository.
+GitHub Actions builds the three production Containerfiles for pull requests.
+Pushes to `main` and manual dispatches from `main` publish the proxy,
+Codex-provider and gateway GHCR images with `main` and immutable
+full-commit-SHA tags using `GITHUB_TOKEN`. The production Containerfiles set
+the OCI `org.opencontainers.image.source` label to this repository.
 
 ## Advisories, extension, and provenance
 

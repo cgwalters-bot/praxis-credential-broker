@@ -21,6 +21,7 @@ jobs:
           repository="${GITHUB_REPOSITORY,,}"
           docker build --pull --file Containerfile.proxy --tag "ghcr.io/${repository}-proxy:ci" .
           docker build --pull --file Containerfile.codex --tag "ghcr.io/${repository}-provider-codex:ci" .
+          docker build --pull --file Containerfile.gateway --tag "ghcr.io/${repository}-gateway:ci" .
   publish:
     needs: build
     if: github.event_name != 'pull_request'
@@ -47,12 +48,14 @@ jobs:
           repository="${GITHUB_REPOSITORY,,}"
           printf 'proxy=ghcr.io/%s-proxy\n' "$repository" >> "$GITHUB_OUTPUT"
           printf 'provider=ghcr.io/%s-provider-codex\n' "$repository" >> "$GITHUB_OUTPUT"
+          printf 'gateway=ghcr.io/%s-gateway\n' "$repository" >> "$GITHUB_OUTPUT"
       - name: Build production images
         shell: bash
         run: |
           set -euo pipefail
           docker build --pull --file Containerfile.proxy --tag "${{ steps.images.outputs.proxy }}:ci" .
           docker build --pull --file Containerfile.codex --tag "${{ steps.images.outputs.provider }}:ci" .
+          docker build --pull --file Containerfile.gateway --tag "${{ steps.images.outputs.gateway }}:ci" .
       - name: Log in to GHCR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           commit=$(git rev-parse --verify HEAD)
-          for image in "${{ steps.images.outputs.proxy }}" "${{ steps.images.outputs.provider }}"; do
+          for image in "${{ steps.images.outputs.proxy }}" "${{ steps.images.outputs.provider }}" "${{ steps.images.outputs.gateway }}"; do
             docker tag "$image:ci" "$image:main"
             docker tag "$image:ci" "$image:$commit"
             docker push "$image:main"

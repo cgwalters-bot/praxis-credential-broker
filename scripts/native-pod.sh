@@ -9,6 +9,7 @@ client_secret=praxis-credential-broker-client-auth
 channel_secret=praxis-credential-broker-agent-channel
 proxy_image=${PRAXIS_PROXY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main}
 provider_codex_image=${PRAXIS_PROVIDER_CODEX_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main}
+gateway_image=${PRAXIS_GATEWAY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:main}
 
 client_auth_mode=
 if [[ $mode == up ]]; then
@@ -114,6 +115,7 @@ esac
 if [[ $mode == up ]]; then
     [[ -n $proxy_image ]] || { echo 'PRAXIS_PROXY_IMAGE must not be empty' >&2; exit 2; }
     [[ -n $provider_codex_image ]] || { echo 'PRAXIS_PROVIDER_CODEX_IMAGE must not be empty' >&2; exit 2; }
+    [[ -n $gateway_image ]] || { echo 'PRAXIS_GATEWAY_IMAGE must not be empty' >&2; exit 2; }
     if [[ $client_auth_mode == required ]]; then
         podman secret exists "$client_secret" || { echo "missing Podman secret: $client_secret (run 'bash scripts/init-secrets')" >&2; exit 1; }
     fi
@@ -147,8 +149,7 @@ if [[ $mode == up ]]; then
     podman create "${common[@]}" --name praxis-credential-broker-praxis \
         --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-        ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-        --config /etc/praxis/praxis.yaml >/dev/null
+        -- "$gateway_image" --config /etc/praxis/praxis.yaml >/dev/null
     expected=(praxis-credential-broker-proxy praxis-credential-broker-provider-codex praxis-credential-broker-praxis)
     diagnostics() {
         echo "native pod startup failed; redacted container status:" >&2
@@ -225,8 +226,7 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     --volume "$test_socket:/run/praxis-credentials:Z" \
     localhost/praxis-provider-codex:synthetic >/dev/null
 podman create "${common[@]}" --name "$test_pod-praxis" --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
-    ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-    --config /etc/praxis/praxis.yaml >/dev/null
+    localhost/praxis-gateway:test --config /etc/praxis/praxis.yaml >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
 podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy
@@ -269,8 +269,7 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     --volume "$test_socket:/run/praxis-credentials:Z" \
     localhost/praxis-provider-codex:synthetic >/dev/null
 podman create "${common[@]}" --name "$test_pod-praxis" --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
-    ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-    --config /etc/praxis/praxis.yaml >/dev/null
+    localhost/praxis-gateway:test --config /etc/praxis/praxis.yaml >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
 podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy

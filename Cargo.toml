@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/credential-protocol", "crates/credential-proxy", "crates/provider-codex"]
+members = ["crates/credential-protocol", "crates/credential-proxy", "crates/praxis-gateway", "crates/provider-codex"]
 resolver = "2"
 
 [workspace.package]

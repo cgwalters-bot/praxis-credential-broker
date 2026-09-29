@@ -1,0 +1,17 @@
+# Praxis AI with the broker's filters (crates/praxis-gateway). Built like
+# upstream's own image: praxis-ai links the system OpenSSL dynamically, so
+# the musl binary must not be static, and the builder and runtime are the
+# same Alpine release.
+FROM docker.io/library/rust:1.98-alpine3.24 AS build
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+RUN apk add --no-cache musl-dev openssl-dev pkgconf cmake make g++ git
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked -p praxis-gateway
+FROM docker.io/library/alpine:3.24
+LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-credential-broker"
+RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc
+COPY --from=build /src/target/release/praxis-gateway /usr/local/bin/praxis-gateway
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/praxis-gateway"]
