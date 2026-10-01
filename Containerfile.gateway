@@ -7,7 +7,10 @@ LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-c
 COPY --chmod=0644 praxis.yaml praxis-anthropic.yaml /etc/praxis/
 COPY --chmod=0755 scripts/praxis-gateway-entrypoint /usr/local/libexec/praxis-gateway-entrypoint
 # Upstream's check polls an admin listener on 9901 that these configurations
-# do not enable, so it could only ever report unhealthy.
+# do not enable, so it could only ever report unhealthy. Podman (5.8) still
+# schedules a check for HEALTHCHECK NONE in a Docker-format image, and fails
+# to create the container without a systemd user bus, so containers from
+# this image also need --no-healthcheck.
 HEALTHCHECK NONE
 USER 65532:65532
 ENTRYPOINT ["/bin/sh", "/usr/local/libexec/praxis-gateway-entrypoint"]
