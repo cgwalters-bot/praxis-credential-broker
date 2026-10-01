@@ -6,6 +6,9 @@ FROM ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a58
 LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-credential-broker"
 COPY --chmod=0644 praxis.yaml praxis-anthropic.yaml /etc/praxis/
 COPY --chmod=0755 scripts/praxis-gateway-entrypoint /usr/local/libexec/praxis-gateway-entrypoint
+# Upstream's check polls an admin listener on 9901 that these configurations
+# do not enable, so it could only ever report unhealthy.
+HEALTHCHECK NONE
 USER 65532:65532
 ENTRYPOINT ["/bin/sh", "/usr/local/libexec/praxis-gateway-entrypoint"]
 CMD []
