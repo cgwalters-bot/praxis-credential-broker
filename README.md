@@ -136,5 +136,48 @@ codex --profile praxis
 opencode run --model praxis/gpt-6-astra
 ```
 
+## Claude Code through the Anthropic gateway
+
+Optionally, the pod also runs an Anthropic Messages gateway for Claude Code.
+The broker holds a Claude subscription OAuth token and Claude Code holds only
+a fixed placeholder, so a sandboxed client never sees the token. This is
+meant for your own CI and agents on your own subscription.
+
+**This listener has no client authentication.** The placeholder is public
+configuration, not a secret, and `PRAXIS_CLIENT_AUTH_MODE` does not apply to
+it: anything that can reach `127.0.0.1:18090` can spend the subscription. It
+relies on the network boundary, as `disabled` mode does. See
+[INTERNALS.md](INTERNALS.md#anthropic-messages-gateway) for the risks.
+
+Create a long-lived token with `claude setup-token` on a trusted machine and
+store it as a Podman secret. The script reads it from the terminal without
+echo, or from standard input, for example from a password manager:
+
+```sh
+bash scripts/init-anthropic-token
+# or
+password-manager read claude/oauth-token | bash scripts/init-anthropic-token
+```
+
+Then start the pod with the gateway enabled, alongside the usual secrets:
+
+```sh
+export PRAXIS_ANTHROPIC_GATEWAY=enabled
+bash scripts/native-pod.sh up
+bash scripts/native-pod.sh health
+```
+
+Point Claude Code at it with exactly this placeholder:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18090
+export ANTHROPIC_AUTH_TOKEN=praxis-substitute:anthropic
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+claude
+```
+
+Any other `Authorization` value, including a real Anthropic key or token, is
+refused with 403 and never forwarded.
+
 For operational procedures, security properties, test topology, publishing,
 and provenance, read [INTERNALS.md](INTERNALS.md).
