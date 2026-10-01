@@ -25,4 +25,4 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo test --workspace --locked
       # Builds the gateway image and runs it under rootless Podman.
-      - run: python3 tests/anthropic_gateway.py
+      - run: python3 tests/gateway.py
