@@ -1,9 +1,14 @@
-# Praxis' native router/filter schema. The broker is pod-local 127.0.0.1:8080;
-# Praxis listens on 8081 so the two processes do not collide in the pod netns.
+# Praxis' native router/filter schema. The Codex broker is pod-local
+# 127.0.0.1:8080; Praxis listens on 8081 so the two processes do not collide
+# in the pod netns. Anthropic traffic has a separate listener and filter chain
+# so OpenAI Responses filters never inspect Anthropic Messages bodies.
 listeners:
   - name: ai-gateway
     address: "0.0.0.0:8081"
     filter_chains: [responses-proxy]
+  - name: claude-gateway
+    address: "0.0.0.0:8082"
+    filter_chains: [anthropic-messages-proxy]
 filter_chains:
   - name: responses-proxy
     filters:
@@ -19,5 +24,35 @@ filter_chains:
         clusters:
           - name: inference-backend
             endpoints: ["127.0.0.1:8080"]
+  - name: anthropic-messages-proxy
+    filters:
+      # These native filters validate/classify the Messages protocol without
+      # translating its body. Keep classifier headers internal to Praxis.
+      - filter: anthropic_messages_format
+        on_invalid: reject
+        headers:
+          format: null
+          model: null
+          stream: null
+      - filter: anthropic_validate
+      - filter: anthropic_messages_protocol
+      - filter: router
+        routes:
+          - path: "/v1/messages"
+            cluster: anthropic-api
+      # Claude Code's OAuth bearer token and Anthropic protocol headers pass
+      # through unchanged. Remove API-key authentication so the two credential
+      # forms cannot be sent together, and force the upstream authority.
+      - filter: headers
+        request_remove: ["x-api-key"]
+        request_set:
+          - name: Host
+            value: api.anthropic.com
+      - filter: load_balancer
+        clusters:
+          - name: anthropic-api
+            endpoints: ["api.anthropic.com:443"]
+            tls:
+              sni: "api.anthropic.com"
 insecure_options:
   allow_private_endpoints: true

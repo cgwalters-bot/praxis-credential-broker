@@ -6,21 +6,25 @@ details that are intentionally kept out of the [quick-start README](README.md).
 ## Architecture and trust boundaries
 
 ```text
-client -> stock Praxis -> credential-proxy -> fixed chatgpt.com Codex endpoint
-                             ^
-                             | private versioned Unix socket (credentials only)
-                       provider-codex
+Codex client -> stock Praxis -> credential-proxy -> fixed chatgpt.com Codex endpoint
+                                    ^
+                                    | private versioned Unix socket (credentials only)
+                              provider-codex
+Claude Code -> stock Praxis ----------------------> fixed api.anthropic.com Messages endpoint
 ```
 
-There are three credential classes:
+There are four credential classes:
 
 1. In the default `required` client-auth mode, the client API key
-   authenticates a local client to Praxis and must be at least 32 bytes. In
-   explicit `disabled` mode it is neither read nor mounted.
+   authenticates a Codex client to the credential proxy and must be at least
+   32 bytes. In explicit `disabled` mode it is neither read nor mounted.
 2. The internal channel key is a generated HMAC secret between the proxy and
    provider; it is not a client credential.
 3. Provider-owned ChatGPT Codex OAuth tokens live in the provider's auth
    volume after device login.
+4. Claude Code owns its subscription OAuth credential on the host. It passes
+   transiently through Praxis to Anthropic and is neither stored nor refreshed
+   by the pod.
 
 The proxy has no Codex SDK, OAuth state, or writable credential volume. The
 provider exclusively owns `CODEX_HOME`. OAuth headers pass transiently through
@@ -30,6 +34,29 @@ provider-owned.
 The proxy accepts only `POST /v1/responses`, strips caller authorization,
 cookies, account, hop-by-hop, and proxy headers, and forwards to a fixed HTTPS
 endpoint. The client cannot choose a URL, authority, or provider profile.
+
+Praxis exposes Anthropic Messages separately on host port `18083` (pod port
+`8082`). Its native Anthropic filters run on a listener separate from the Codex
+Responses listener on `18080`/`8081`. The Anthropic chain routes only the exact
+path `/v1/messages` to `api.anthropic.com:443`, with TLS SNI and `Host` fixed to
+that name. It preserves Claude Code's `Authorization`,
+`anthropic-version`, and `anthropic-beta` headers, while removing `x-api-key`
+to prevent ambiguous API-key and subscription-OAuth authentication.
+
+Production publishes both Claude and Codex on loopback and on the single IPv4
+address assigned to Xenon's `tailscale0`. Before creating the pod, the launcher
+parses `ip -j -4 addr show dev tailscale0` and requires exactly one address
+belonging to `100.64.0.0/10`. A missing interface, zero or multiple IPv4
+addresses, or an address outside that range aborts startup; the address cannot
+be overridden by an environment variable. It never publishes a wildcard or LAN
+binding, and it does not mutate or make claims about Tailscale configuration or
+access policy. Loopback remains available for local clients.
+
+Tailnet clients use Xenon's MagicDNS FQDN: `xenon.tailf2eb8.ts.net` (port
+`18080` for Codex Responses and `18083` for Claude Messages). The numeric
+address remains deliberately in the Quadlet `PublishPort` entries and the
+`tailscale ip --assert=100.121.0.115` precheck: those bind and assert an IPv4
+address, not a DNS name, and establish the trusted-tailnet boundary.
 
 ### Private protocol and hardening
 
@@ -48,7 +75,11 @@ disabled mode no container receives that secret. The provider's
 separate writable auth volume is mounted only at `/codex-home`.
 
 Finite and SSE streams have idle, byte, and concurrency limits. `/healthz`
-uses a side-effect-free `Ping` and returns only `ready` or `not ready`.
+is only the Codex Responses listener's endpoint: it uses a side-effect-free
+`Ping` and returns only `ready` or `not ready`. The `health` script command also
+checks that the separate Claude listener rejects a malformed Messages request
+with 400. Checks exercise both loopback and published tailnet bindings; neither
+forwards a request nor validates upstream authentication.
 
 ## OAuth lifecycle and startup
 
@@ -64,9 +95,9 @@ API key and channel key do not rotate automatically.
 
 Device login runs while the provider is stopped. It uses an advisory lock,
 same-volume staging, and atomic installation, so cancellation leaves an
-existing `auth.json` unchanged. The health check verifies process and private
-credential-channel readiness only; it does not acquire OAuth credentials. An
-upstream Responses request is required to verify the Codex login.
+existing `auth.json` unchanged. Claude Code login occurs outside the pod and
+does not require a Codex login to start a Claude-only pod. An upstream request
+is required to verify either login.
 
 ## Client authentication modes
 
@@ -83,14 +114,90 @@ comparison, and 401 response. Disabled mode admits requests without an
 the provider credential upstream. The internal HMAC channel secret and the
 provider-only OAuth auth volume remain mandatory in both modes.
 
-Disabled mode is appropriate only when an intentionally managed access-control
-boundary, such as a tailnet/Tailscale policy, protects access. The current
-runtime remains loopback-only and does not configure Tailscale. Changing modes
-requires stopping the pod and recreating it with the selected mode. Running
-`init-secrets` in disabled mode creates/replaces only the channel secret and
-does not prompt for, remove, or otherwise modify an existing client secret.
+Disabled mode relies on the tailnet as its sole Codex client-auth boundary:
+every tailnet peer permitted to connect to port 18080 can make requests using
+the provider's stored Codex OAuth credential. Tailnet ACLs must restrict that
+port to trusted peers. The launcher neither configures nor verifies those ACLs,
+so disabled mode is unsafe for a tailnet containing untrusted peers. Changing
+modes requires stopping the pod and recreating it with the selected mode.
+Running `init-secrets` in disabled mode creates/replaces only the channel secret
+and does not prompt for, remove, or otherwise modify an existing client secret.
+
+The Claude listener has no broker client-auth filter: Claude Code's OAuth is
+forwarded to Anthropic. Its loopback and tailnet-only host bindings are
+therefore critical boundaries; any process able to reach either binding and
+obtain a Claude Code authorization header can submit requests through it. Tailnet
+ACLs should explicitly restrict which peers may connect to this port; this
+alpha design does not claim protection from untrusted local users or processes.
 
 ## Operations
+
+### Xenon rootless Quadlet
+
+`quadlet/` contains the deployed rootless units. It targets Podman 5.8.4
+and uses one `.pod`, three `.container`, and two `.volume` definitions. Its
+container and volume names deliberately match the native deployment so the
+existing `praxis-credential-broker-auth` volume and
+`praxis-credential-broker-agent-channel` Podman secret are preserved. The
+client-auth secret is deliberately not mounted: Xenon is configured with
+`CLIENT_AUTH_MODE=disabled` and must remain accessible only to trusted tailnet
+peers.
+
+The pod publishes `18080` and `18083` on loopback and fixed Xenon tailnet
+address `100.121.0.115`. Before Podman creates the pod, its user service runs
+`tailscale wait --timeout=30s` and `tailscale ip --4 --assert=100.121.0.115` on the host.
+These are host prechecks, not container commands. They intentionally avoid a
+dependency on a Tailscale systemd unit, which could introduce a user/system
+unit ordering cycle. Quadlet links containers to the pod declaratively; the
+explicit `[Unit]` links use generated `.service` names rather than source-file
+`.container` names.
+
+The Praxis configuration mount is intentionally fixed to
+`%h/src/github/cgwalters-bot/praxis-credential-broker/praxis.yaml`, the
+checkout path on Xenon. `%h` keeps the source usable by the rootless account
+without embedding that account's absolute home directory. The Praxis image
+digest is the existing pinned runtime image verified in local Podman metadata;
+the proxy and provider retain this repository's published `:main` images.
+
+Validate the sources before installation:
+
+```sh
+bash -n scripts/native-pod.sh scripts/init-secrets scripts/create-agent-secret
+shellcheck scripts/native-pod.sh scripts/init-secrets scripts/create-agent-secret
+QUADLET_UNIT_DIRS="$PWD/quadlet" /usr/lib/systemd/system-generators/podman-system-generator --user --dryrun
+git diff --check
+```
+
+The generator command validates the actual host generator without installing
+units. Inspect its generated services to confirm the host `tailscale` prechecks,
+all four explicit bindings, `ExitPolicy=continue`, hardening options, and
+volume/secret ownership before any production action.
+
+The deployed installation is a directory symlink, so edits to the sources take
+effect after a daemon reload. Stop the old native pod before the first Quadlet
+start: both use the same names and ports. Run these commands on the host:
+
+```sh
+mkdir -p ~/.config/containers/systemd
+ln -s "$PWD/quadlet" ~/.config/containers/systemd/praxis-credential-broker
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user start praxis-credential-broker-pod.service
+bash scripts/native-pod.sh health
+```
+
+Quadlet's `[Install]` section attaches the pod to `default.target`; do not
+`systemctl enable` the generated service. Lingering keeps the user manager
+available at boot and after logout. Each application container restarts after
+an unexpected exit; the pod retries startup after a failed Tailscale precheck.
+Local checks verified a whole-pod restart and recovery after killing the proxy
+container. A reboot has not been tested.
+
+Operate the persistent deployment with `systemctl --user start`, `stop`, or
+`restart praxis-credential-broker-pod.service`, not `native-pod.sh up/down`.
+Stopping it preserves both named volumes and the Podman secrets. From a toolbox
+with an inaccessible user bus, use `flatpak-spawn --host systemctl --user
+--machine=sandbox-walters@.host ...` to reach Xenon's user manager.
 
 `down` removes the production pod and socket volume but preserves the client
 and channel secrets plus the Codex auth volume. Use the following destructive
@@ -131,15 +238,19 @@ Podman integration checks. It always uses hardwired local synthetic images;
 it does not read production image overrides or OAuth credentials. Never put
 real credentials in that test pod.
 
-The test pod exposes loopback-only ports: Praxis on `127.0.0.1:18081`, mock
-counters on `127.0.0.1:18082`, and the synthetic provider counter on
-`127.0.0.1:19090`. It verifies required client authentication, 401 recovery,
+The synthetic test pod deliberately exposes loopback-only ports: Codex Praxis
+on `127.0.0.1:18081`, mock counters on `127.0.0.1:18082`, the Claude listener on
+`127.0.0.1:18084`, and the synthetic provider counter on `127.0.0.1:19090`.
+It verifies required client authentication, 401 recovery,
 finite and SSE responses, secret isolation, socket mode/label, hardening, and
 that secrets do not appear in pod logs. It then recreates the synthetic pod in
 disabled mode and verifies a no-Authorization request succeeds with provider
 credentials, no client-secret mount, and a separate caller Authorization value
 is replaced with the provider credential. It also checks idempotent removal of
-absent synthetic secrets.
+absent synthetic secrets. The Claude-listener test is readiness-only: it sends
+a malformed Messages request and expects local validation to return 400. It
+does not contact Anthropic, authenticate Claude OAuth, or establish that the
+header-forwarding boundary is safe for untrusted local processes.
 
 Codex 0.154.0 accepted the disabled provider with no `env_key` and
 `requires_openai_auth = false`, resolving its top-level named profile. OpenCode
@@ -177,9 +288,10 @@ Review the dependency graph before deployment.
 
 Adding a provider requires an agent that implements the private protocol and a
 registered profile/audience; the HTTP streaming and client-auth core remain
-unchanged. Tailscale support, if added, is limited to tailnet-only Serve and
-`svc:inference`: this project deliberately provides no Funnel, public bind, or
-tailnet mutation.
+unchanged. The runtime binds directly to the host's tailnet IPv4, but does not
+configure Tailscale. Any future Serve integration is limited to tailnet-only
+Serve and `svc:inference`: this project deliberately provides no Funnel, public
+bind, or tailnet mutation.
 
 The project and directly consumed Codex sources are Apache-2.0; see `NOTICE`
 for provenance. This spike exceeds the roughly 500 substantial-line

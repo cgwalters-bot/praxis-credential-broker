@@ -42,6 +42,46 @@ check_config_mount() {
     podman inspect "$1" | python3 -c 'import json,sys; mounts=json.load(sys.stdin)[0]["Mounts"]; assert any(m["Destination"] == "/etc/praxis/praxis.yaml" and not m["RW"] for m in mounts)'
 }
 
+tailnet_ipv4() {
+    # Do not accept a caller-provided address: publishing on an unintended
+    # interface would expose the credential broker outside the tailnet.
+    ip -j -4 addr show dev tailscale0 | python3 -c '
+import ipaddress
+import json
+import sys
+
+try:
+    interfaces = json.load(sys.stdin)
+    addresses = [entry["local"] for interface in interfaces
+                 for entry in interface.get("addr_info", [])
+                 if entry.get("family") == "inet"]
+    if len(addresses) != 1:
+        raise ValueError("expected exactly one IPv4 address")
+    address = ipaddress.IPv4Address(addresses[0])
+    if address not in ipaddress.IPv4Network("100.64.0.0/10"):
+        raise ValueError("address is not in tailnet CGNAT range 100.64.0.0/10")
+except (KeyError, TypeError, ValueError, ipaddress.AddressValueError) as error:
+    raise SystemExit(f"could not determine a safe tailscale0 IPv4 address: {error}")
+
+print(address)
+'
+}
+
+codex_listener_ready() {
+    local address=$1
+    local port=$2
+    curl --noproxy '*' --fail --silent --show-error --max-time 2 "http://$address:$port/healthz" >/dev/null
+}
+
+claude_listener_ready() {
+    local address=$1
+    local port=$2
+    local status
+    status=$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
+        --request POST "http://$address:$port/v1/messages") || return 1
+    [[ $status == 400 ]]
+}
+
 remove_pod() {
     podman pod rm -f "$1" >/dev/null 2>&1 || true
 }
@@ -72,7 +112,12 @@ case "$mode" in
         exit 0
         ;;
     health)
-        curl --fail --silent http://127.0.0.1:18080/healthz
+        tailnet_address=$(tailnet_ipv4)
+        codex_listener_ready 127.0.0.1 18080
+        codex_listener_ready "$tailnet_address" 18080
+        claude_listener_ready 127.0.0.1 18083
+        claude_listener_ready "$tailnet_address" 18083
+        echo ready
         exit 0
         ;;
     logs)
@@ -122,11 +167,14 @@ if [[ $mode == up ]]; then
         echo "pod $pod already exists; run 'bash scripts/native-pod.sh down' before starting it again" >&2
         exit 1
     fi
+    tailnet_address=$(tailnet_ipv4)
     podman volume create "$socket_volume" >/dev/null
     # shellcheck disable=SC2317
     cleanup() { remove_pod "$pod"; remove_socket "$socket_volume"; }
     trap cleanup EXIT INT TERM
-    podman pod create --name "$pod" --publish 127.0.0.1:18080:8081 >/dev/null
+    podman pod create --name "$pod" \
+        --publish 127.0.0.1:18080:8081 --publish "$tailnet_address:18080:8081" \
+        --publish 127.0.0.1:18083:8082 --publish "$tailnet_address:18083:8082" >/dev/null
     common=(--pod "$pod" --user 65532:65532 --read-only --cap-drop=ALL --security-opt=no-new-privileges)
     proxy_client_secret=()
     if [[ $client_auth_mode == required ]]; then
@@ -170,7 +218,10 @@ if [[ $mode == up ]]; then
     [[ $all_running == true ]] || fail_startup
     health_ready=false
     for _ in {1..30}; do
-        if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:18080/healthz >/dev/null; then
+        if codex_listener_ready 127.0.0.1 18080 \
+            && codex_listener_ready "$tailnet_address" 18080 \
+            && claude_listener_ready 127.0.0.1 18083 \
+            && claude_listener_ready "$tailnet_address" 18083; then
             health_ready=true
             break
         fi
@@ -181,8 +232,8 @@ if [[ $mode == up ]]; then
         done
         [[ $all_running == true ]] || fail_startup
     done
-    [[ $health_ready == true ]] || { echo 'native pod startup timed out waiting for healthz' >&2; fail_startup; }
-    echo 'Started praxis-credential-broker; healthz is ready.'
+    [[ $health_ready == true ]] || { echo 'native pod startup timed out waiting for listener readiness' >&2; fail_startup; }
+    echo 'Started praxis-credential-broker; both listeners are ready.'
     trap - EXIT INT TERM
     exit 0
 fi
@@ -205,7 +256,8 @@ printf '%s' 'synthetic-client-key-012345678901234567890123' | podman secret crea
 printf '%s' 'synthetic-agent-channel-012345678901234567890123' | podman secret create --replace "$test_channel" - >/dev/null
 podman volume create "$test_socket" >/dev/null
 podman pod create --name "$test_pod" \
-    --publish 127.0.0.1:18081:8081 --publish 127.0.0.1:18082:18081 --publish 127.0.0.1:19090:19090 >/dev/null
+    --publish 127.0.0.1:18081:8081 --publish 127.0.0.1:18082:18081 \
+    --publish 127.0.0.1:18084:8082 --publish 127.0.0.1:19090:19090 >/dev/null
 common=(--pod "$test_pod" --user 65532:65532 --read-only --cap-drop=ALL --security-opt=no-new-privileges)
 podman create "${common[@]}" --name "$test_pod-proxy" \
     --secret "$test_client,target=/run/secrets/client/client-api-key,uid=65532,gid=65532,mode=0400" \
@@ -237,6 +289,7 @@ for _ in {1..30}; do [[ -S "$socket_dir/agent.sock" ]] && break; sleep 1; done
 socket_label=$(ls -Zd "$socket_dir/agent.sock")
 [[ $socket_label != *' ? '* ]]
 i=0; while [ "$i" -lt 60 ]; do curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+claude_listener_ready 127.0.0.1 18084
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST --data '{}' http://127.0.0.1:18081/v1/responses); test "$status" = 401
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 body=$(curl --fail --silent -H 'Authorization: Bearer synthetic-client-key-012345678901234567890123' -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); python3 -c 'import json,sys; assert json.loads(sys.argv[1])["id"] == "synthetic"' "$body"
@@ -250,7 +303,8 @@ remove_pod "$test_pod"
 remove_socket "$test_socket"
 podman volume create "$test_socket" >/dev/null
 podman pod create --name "$test_pod" \
-    --publish 127.0.0.1:18081:8081 --publish 127.0.0.1:18082:18081 --publish 127.0.0.1:19090:19090 >/dev/null
+    --publish 127.0.0.1:18081:8081 --publish 127.0.0.1:18082:18081 \
+    --publish 127.0.0.1:18084:8082 --publish 127.0.0.1:19090:19090 >/dev/null
 common=(--pod "$test_pod" --user 65532:65532 --read-only --cap-drop=ALL --security-opt=no-new-privileges)
 podman create "${common[@]}" --name "$test_pod-proxy" --env CLIENT_AUTH_MODE=disabled \
     --secret "$test_channel,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
@@ -270,6 +324,7 @@ secret_names "$proxy" | grep -qx "$test_client" && exit 1
 check_secret "$proxy" "$test_channel" /run/secrets/channel/agent-channel-key
 for c in "$proxy" "$test_pod-agent" "$test_pod-praxis" "$test_pod-mock"; do check_hardening "$c"; done
 i=0; while [ "$i" -lt 60 ]; do curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+claude_listener_ready 127.0.0.1 18084
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 body=$(curl --fail --silent -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); python3 -c 'import json,sys; assert json.loads(sys.argv[1])["id"] == "synthetic"' "$body"
 python3 -c 'import json,urllib.request; x=json.load(urllib.request.urlopen("http://127.0.0.1:18082/counters")); assert x == {"calls": 2, "observed": [[True, True]]}, x'
