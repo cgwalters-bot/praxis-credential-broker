@@ -1,0 +1,16 @@
+#!/bin/sh
+# Entrypoint for the Anthropic gateway's stock Praxis container. Core
+# credential_injection reads credentials only from environment variables, so
+# export the Claude OAuth token from its Podman secret file and exec Praxis.
+# The token ends up only in Praxis's own environment: never on a command line,
+# and never in the container configuration, where Podman 4 shows the values of
+# type=env secrets in podman inspect.
+set -eu
+token_file=/run/secrets/anthropic/oauth-token
+if [ ! -s "$token_file" ]; then
+    echo "praxis-anthropic-entrypoint: missing Claude OAuth token secret at $token_file" >&2
+    exit 1
+fi
+PRAXIS_ANTHROPIC_OAUTH_TOKEN=$(cat "$token_file")
+export PRAXIS_ANTHROPIC_OAUTH_TOKEN
+exec praxis-ai "$@"

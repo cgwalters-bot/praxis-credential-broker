@@ -1,0 +1,79 @@
+# Anthropic Messages gateway for Claude Code, in a Praxis container of its
+# own. The broker holds a Claude subscription OAuth token (`claude
+# setup-token`) and injects it upstream; clients hold only the public
+# placeholder below. See INTERNALS.md before changing anything here.
+#
+# Clients send exactly `Authorization: Bearer praxis-substitute:anthropic`
+# (Claude Code: ANTHROPIC_AUTH_TOKEN=praxis-substitute:anthropic). The
+# placeholder is not authentication: anyone who can reach this listener can
+# spend the subscription. It is loopback-only in the pod.
+#
+# THE FILTER ORDER IS SECURITY-CRITICAL. Conditions and router header matches
+# see the request as it is when each filter runs, so every check of the
+# client's Authorization has to run before the headers filter removes it.
+# Without the deny filter in front, a request that matched no injection
+# entry would be forwarded with the client's own credentials.
+listeners:
+  - name: anthropic-gateway
+    address: "0.0.0.0:8090"
+    filter_chains: [anthropic-oauth]
+filter_chains:
+  - name: anthropic-oauth
+    filters:
+      # 1. Default deny: unless this is a POST whose Authorization is exactly
+      #    the placeholder (case-sensitive, first header if duplicated),
+      #    answer 403 here and never forward. A missing header is denied too.
+      #    Other methods could have an upstream echo the token (TRACE).
+      - filter: static_response
+        conditions:
+          - unless:
+              methods: [POST]
+              headers:
+                authorization: "Bearer praxis-substitute:anthropic"
+        status: 403
+        headers:
+          - name: content-type
+            value: application/json
+        body: '{"type":"error","error":{"type":"permission_error","message":"missing or unknown praxis placeholder credential"}}'
+      # 2. The upstream is fixed by the route, not by the client. The route
+      #    also matches the placeholder, so the credential is bound to it.
+      #    Exact paths only: Praxis forwards paths without normalizing them,
+      #    and api.anthropic.com resolves "..", so a prefix like "/v1/" would
+      #    let "/v1/../api/oauth/..." spend the token on other endpoints.
+      - filter: router
+        routes:
+          - path: "/v1/messages"
+            headers:
+              authorization: "Bearer praxis-substitute:anthropic"
+            cluster: anthropic
+          - path: "/v1/messages/count_tokens"
+            headers:
+              authorization: "Bearer praxis-substitute:anthropic"
+            cluster: anthropic
+      # 3. Strip every copy of the client's credentials, fix the authority,
+      #    and append the OAuth beta to any anthropic-beta the client sent
+      #    (request_add appends rather than replaces).
+      - filter: headers
+        request_remove:
+          - authorization
+          - x-api-key
+        request_set:
+          - name: Host
+            value: api.anthropic.com
+        request_add:
+          - name: anthropic-beta
+            value: oauth-2025-04-20
+      # 4. The real token, from a Podman secret exposed only to this
+      #    container's environment.
+      - filter: credential_injection
+        clusters:
+          - name: anthropic
+            header: Authorization
+            header_prefix: "Bearer "
+            env_var: PRAXIS_ANTHROPIC_OAUTH_TOKEN
+      - filter: load_balancer
+        clusters:
+          - name: anthropic
+            endpoints: ["api.anthropic.com:443"]
+            tls:
+              sni: "api.anthropic.com"

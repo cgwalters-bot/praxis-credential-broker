@@ -8,6 +8,10 @@ test-pod:
     podman build --pull=missing -f Containerfile.mock -t localhost/praxis-mock-upstream:dev .
     bash scripts/native-pod.sh test
 
+# The Anthropic gateway's filter chain against a fake upstream; no real token.
+test-anthropic:
+    python3 tests/anthropic_gateway.py
+
 check:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --all-features --locked
