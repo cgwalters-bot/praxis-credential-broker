@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Check praxis-anthropic.yaml against a fake Anthropic upstream.
 
-Runs the pinned stock Praxis image with the production filter chain, the
-same container hardening and entrypoint as the pod, and a synthetic OAuth
-token delivered as a Podman secret file. Only the listener address and the upstream endpoint
-are rewritten, so the filter order under test is the one that ships. No real
-credential is used or needed.
+Builds the gateway image (Containerfile.gateway) and runs it with the pod's
+container hardening and a synthetic OAuth token delivered as a Podman secret
+file. The configuration baked into the image is replaced by a copy in which
+only the listener address and the upstream endpoint are rewritten, so the
+filter order under test is the one that ships. No real credential is used or
+needed.
 
 Usage: python3 tests/anthropic_gateway.py
 """
@@ -25,9 +26,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "praxis-anthropic.yaml"
+CONTAINERFILE = ROOT / "Containerfile.gateway"
 POD_SCRIPT = ROOT / "scripts" / "native-pod.sh"
-ENTRYPOINT = ROOT / "scripts" / "praxis-anthropic-entrypoint"
 
+IMAGE = "localhost/praxis-gateway:test"
 CONTAINER = "praxis-credential-broker-test-anthropic"
 SECRET = "praxis-credential-broker-test-anthropic-oauth"
 TOKEN_FILE = "/run/secrets/anthropic/oauth-token"
@@ -142,12 +144,12 @@ def free_port():
         return s.getsockname()[1]
 
 
-def praxis_image():
-    """The Praxis digest the pod runs, so the test cannot drift from it."""
-    digests = set(re.findall(r"ghcr\.io/praxis-proxy/ai@sha256:[0-9a-f]{64}", POD_SCRIPT.read_text()))
-    if len(digests) != 1:
-        raise SystemExit(f"expected one pinned Praxis image in {POD_SCRIPT}, found {sorted(digests)}")
-    return digests.pop()
+def build_image():
+    """The image under test, built from this checkout."""
+    pins = set(re.findall(r"ghcr\.io/praxis-proxy/ai@sha256:[0-9a-f]{64}", POD_SCRIPT.read_text()))
+    if pins:
+        raise SystemExit(f"{POD_SCRIPT.name} must run the gateway image, not stock Praxis: {sorted(pins)}")
+    podman("build", "--quiet", "--pull=missing", "--file", str(CONTAINERFILE), "--tag", IMAGE, str(ROOT))
 
 
 def replace_once(text, old, new):
@@ -168,16 +170,15 @@ def test_config(praxis_port, upstream_port):
     return text + "insecure_options:\n  allow_private_endpoints: true\n"
 
 
-def container_args(image, config_path, with_secret=True):
+def container_args(config_path, with_secret=True):
     """The anthropic container's settings in native-pod.sh, on the host network."""
     args = ["--network", "host", "--user", "65532:65532", "--read-only", "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            "--volume", f"{config_path}:/etc/praxis/praxis.yaml:ro,Z",
-            "--volume", f"{ENTRYPOINT}:/usr/local/libexec/praxis-anthropic-entrypoint:ro,Z",
-            "--entrypoint", '["/bin/sh", "/usr/local/libexec/praxis-anthropic-entrypoint"]']
+            "--env", "PRAXIS_ANTHROPIC_GATEWAY=enabled",
+            "--volume", f"{config_path}:/etc/praxis/{CONFIG.name}:ro,Z"]
     if with_secret:
         args += ["--secret", f"{SECRET},target={TOKEN_FILE},uid=65532,gid=65532,mode=0400"]
-    return args + [image, "--config", "/etc/praxis/praxis.yaml"]
+    return args + [IMAGE]
 
 
 def request(port, path, headers, body=b"{}", method="POST"):
@@ -278,12 +279,12 @@ def wait_ready(port, proc_name):
     raise SystemExit("Praxis did not become ready")
 
 
-def check_missing_secret_fails(image, config_path, check):
+def check_missing_secret_fails(config_path, check):
     """Without the token, Praxis must refuse to start rather than forward."""
     name = CONTAINER + "-nosecret"
     try:
         proc = subprocess.run(["podman", "run", "--rm", "--name", name,
-                               *container_args(image, config_path, with_secret=False)],
+                               *container_args(config_path, with_secret=False)],
                               capture_output=True, text=True, timeout=60)
         check.report("startup fails without the token", {
             "Praxis started": proc.returncode != 0,
@@ -296,7 +297,7 @@ def check_missing_secret_fails(image, config_path, check):
 
 
 def main():
-    image = praxis_image()
+    build_image()
     check = Checker()
     upstream = ThreadingHTTPServer(("127.0.0.1", free_port()), Upstream)
     upstream.seen = []
@@ -312,7 +313,7 @@ def main():
         podman("secret", "rm", "--ignore", SECRET, check=False)
         podman("secret", "create", SECRET, "-", stdin=TOKEN)
         try:
-            podman("run", "--detach", "--name", CONTAINER, *container_args(image, config_path))
+            podman("run", "--detach", "--name", CONTAINER, *container_args(config_path))
             wait_ready(praxis_port, CONTAINER)
             run_cases(praxis_port, upstream.seen, check)
             run_stream(praxis_port, upstream.seen, check)
@@ -322,7 +323,7 @@ def main():
                 "token in logs": TOKEN not in logs.stdout + logs.stderr,
                 "token in podman inspect": TOKEN not in inspect,
             })
-            check_missing_secret_fails(image, config_path, check)
+            check_missing_secret_fails(config_path, check)
         finally:
             podman("rm", "-f", CONTAINER, check=False)
             podman("secret", "rm", "--ignore", SECRET, check=False)
