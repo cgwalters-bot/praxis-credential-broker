@@ -16,7 +16,10 @@ Requires Podman, `curl`, and this repository's scripts. The default images are:
 ```text
 ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main
 ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main
+ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:main
 ```
+
+The gateway image is stock Praxis with this repository's routes built in.
 
 Client API-key authentication is required by default. Create and export a
 client API key (at least 32 bytes), initialize the Podman secrets, then
@@ -48,12 +51,13 @@ bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```
 
-To use a full-commit-SHA tag or a compatible private mirror, override both
+To use a full-commit-SHA tag or a compatible private mirror, override the
 images before `login` and `up`:
 
 ```sh
 export PRAXIS_PROXY_IMAGE=ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:<commit-sha>
 export PRAXIS_PROVIDER_CODEX_IMAGE=ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:<commit-sha>
+export PRAXIS_GATEWAY_IMAGE=ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:<commit-sha>
 bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```
@@ -67,6 +71,7 @@ explicitly select them for the runtime scripts:
 just build
 export PRAXIS_PROXY_IMAGE=localhost/praxis-credential-proxy:dev
 export PRAXIS_PROVIDER_CODEX_IMAGE=localhost/praxis-provider-codex:dev
+export PRAXIS_GATEWAY_IMAGE=localhost/praxis-gateway:dev
 bash scripts/native-pod.sh login
 bash scripts/native-pod.sh up
 ```
@@ -138,15 +143,15 @@ opencode run --model praxis/gpt-6-astra
 
 ## Claude Code through the Anthropic gateway
 
-Optionally, the pod also runs an Anthropic Messages gateway for Claude Code.
-The broker holds a Claude subscription OAuth token and Claude Code holds only
-a fixed placeholder, so a sandboxed client never sees the token. This is
-meant for your own CI and agents on your own subscription.
+Optionally, the same listener also serves Anthropic Messages for Claude Code
+under `/anthropic`. The broker holds a Claude subscription OAuth token and
+Claude Code holds only a fixed placeholder, so a sandboxed client never sees
+the token. This is meant for your own CI and agents on your own subscription.
 
-**This listener has no client authentication.** The placeholder is public
+**These routes have no client authentication.** The placeholder is public
 configuration, not a secret, and `PRAXIS_CLIENT_AUTH_MODE` does not apply to
-it: anything that can reach `127.0.0.1:18090` can spend the subscription. It
-relies on the network boundary, as `disabled` mode does. See
+them: anything that can reach `127.0.0.1:18080` can spend the subscription.
+They rely on the network boundary, as `disabled` mode does. See
 [INTERNALS.md](INTERNALS.md#anthropic-messages-gateway) for the risks.
 
 Create a long-lived token with `claude setup-token` on a trusted machine and
@@ -167,10 +172,11 @@ bash scripts/native-pod.sh up
 bash scripts/native-pod.sh health
 ```
 
-Point Claude Code at it with exactly this placeholder:
+Point Claude Code at the `/anthropic` prefix with exactly this placeholder.
+Claude Code appends `/v1/messages` to the base URL:
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:18090
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18080/anthropic
 export ANTHROPIC_AUTH_TOKEN=praxis-substitute:anthropic
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 claude
@@ -178,6 +184,18 @@ claude
 
 Any other `Authorization` value, including a real Anthropic key or token, is
 refused with 403 and never forwarded.
+
+With the gateway enabled, `POST /v1/messages` (without the prefix) is also
+forwarded to Anthropic with the client's own `Authorization`, for a Claude
+Code that is logged in itself: set only `ANTHROPIC_BASE_URL=http://127.0.0.1:18080`.
+The broker's token is never added there, and the placeholder is refused
+there.
+
+## Run under systemd
+
+`contrib/quadlet/` has rootless Quadlet units for the same pod that run the
+published images and mount nothing from a checkout; see
+[INTERNALS.md](INTERNALS.md#quadlet).
 
 For operational procedures, security properties, test topology, publishing,
 and provenance, read [INTERNALS.md](INTERNALS.md).
