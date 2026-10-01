@@ -54,11 +54,12 @@ check_no_config_mount() {
     podman inspect "$1" | python3 -c 'import json,sys; mounts=json.load(sys.stdin)[0]["Mounts"] or []; assert not any(m["Destination"].startswith("/etc/praxis") for m in mounts), mounts'
 }
 
-# The Anthropic gateway is up when it answers a request without the
-# placeholder with its own 403, which also shows the deny filter is in place.
-anthropic_ready() {
-    [[ $(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
-        --request POST --data '{}' http://127.0.0.1:18090/v1/messages) == 403 ]]
+# The status of a request for /anthropic without the placeholder: 403 from
+# the deny filter when the Anthropic gateway is enabled, which also shows the
+# deny filter is in place, and 404 when it is disabled.
+anthropic_status() {
+    curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
+        --request POST --data '{}' "http://127.0.0.1:$1/anthropic/v1/messages"
 }
 
 remove_pod() {
@@ -92,11 +93,12 @@ case "$mode" in
         ;;
     health)
         curl --fail --silent http://127.0.0.1:18080/healthz
-        if podman container exists praxis-credential-broker-anthropic; then
-            printf '\n'
-            anthropic_ready || { echo 'Anthropic gateway: not ready' >&2; exit 1; }
-            echo 'Anthropic gateway: ready'
-        fi
+        printf '\n'
+        case $(anthropic_status 18080) in
+            403) echo 'Anthropic gateway: ready' ;;
+            404) echo 'Anthropic gateway: disabled' ;;
+            *) echo 'Anthropic gateway: not ready' >&2; exit 1 ;;
+        esac
         exit 0
         ;;
     logs)
@@ -154,11 +156,7 @@ if [[ $mode == up ]]; then
     # shellcheck disable=SC2317
     cleanup() { remove_pod "$pod"; remove_socket "$socket_volume"; }
     trap cleanup EXIT INT TERM
-    publish=(--publish 127.0.0.1:18080:8081)
-    if [[ $anthropic_gateway == enabled ]]; then
-        publish+=(--publish 127.0.0.1:18090:8090)
-    fi
-    podman pod create --name "$pod" "${publish[@]}" >/dev/null
+    podman pod create --name "$pod" --publish 127.0.0.1:18080:8081 >/dev/null
     common=(--pod "$pod" --user 65532:65532 --read-only --cap-drop=ALL --security-opt=no-new-privileges)
     proxy_client_secret=()
     if [[ $client_auth_mode == required ]]; then
@@ -176,21 +174,18 @@ if [[ $mode == up ]]; then
         --secret "$channel_secret,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
         -- "$provider_codex_image" >/dev/null
+    # The gateway image carries its own routes. With the Anthropic gateway
+    # enabled it serves /anthropic on the same listener, and only this
+    # container holds the Claude token; see praxis-anthropic.yaml.
+    anthropic_token=()
+    if [[ $anthropic_gateway == enabled ]]; then
+        anthropic_token=(--secret "$anthropic_secret,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400")
+    fi
     podman create "${common[@]}" --name praxis-credential-broker-praxis \
-        --env PRAXIS_ANTHROPIC_GATEWAY=disabled \
+        --env "PRAXIS_ANTHROPIC_GATEWAY=$anthropic_gateway" "${anthropic_token[@]}" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
         -- "$gateway_image" >/dev/null
     expected=(praxis-credential-broker-proxy praxis-credential-broker-provider-codex praxis-credential-broker-praxis)
-    if [[ $anthropic_gateway == enabled ]]; then
-        # A Praxis of its own, so that only this container holds the Claude
-        # token. See praxis-anthropic.yaml and praxis-gateway-entrypoint.
-        podman create "${common[@]}" --name praxis-credential-broker-anthropic \
-            --env PRAXIS_ANTHROPIC_GATEWAY=enabled \
-            --secret "$anthropic_secret,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \
-            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-            -- "$gateway_image" >/dev/null
-        expected+=(praxis-credential-broker-anthropic)
-    fi
     diagnostics() {
         echo "native pod startup failed; redacted container status:" >&2
         podman ps --filter label=io.podman.pod.name="$pod" --format '{{.Names}} {{.Status}}' >&2 || true
@@ -226,7 +221,7 @@ if [[ $mode == up ]]; then
     if [[ $anthropic_gateway == enabled ]]; then
         health_ready=false
         for _ in {1..30}; do
-            if anthropic_ready; then
+            if [[ $(anthropic_status 18080) == 403 ]]; then
                 health_ready=true
                 break
             fi
@@ -244,17 +239,20 @@ test_pod=praxis-credential-broker-test
 test_socket=praxis-credential-broker-test-socket
 test_client=praxis-credential-broker-test-client
 test_channel=praxis-credential-broker-test-channel
+test_anthropic=praxis-credential-broker-test-pod-anthropic
+test_anthropic_token=sk-ant-oat01-SYNTHETIC-POD-TOKEN-0123456789abcdef
 cleanup() {
     remove_pod "$test_pod"
     remove_socket "$test_socket"
-    remove_secrets "$test_client" "$test_channel"
+    remove_secrets "$test_client" "$test_channel" "$test_anthropic"
 }
 trap cleanup EXIT INT TERM
-remove_secrets "$test_client" "$test_channel"
+remove_secrets "$test_client" "$test_channel" "$test_anthropic"
 printf '%s' 'synthetic-reset-check' | podman secret create --replace "$test_client" - >/dev/null
 remove_secrets "$test_client" "$test_channel"
 printf '%s' 'synthetic-client-key-012345678901234567890123' | podman secret create --replace "$test_client" - >/dev/null
 printf '%s' 'synthetic-agent-channel-012345678901234567890123' | podman secret create --replace "$test_channel" - >/dev/null
+printf '%s' "$test_anthropic_token" | podman secret create --replace "$test_anthropic" - >/dev/null
 podman volume create "$test_socket" >/dev/null
 podman pod create --name "$test_pod" \
     --publish 127.0.0.1:18081:8081 --publish 127.0.0.1:18082:18081 --publish 127.0.0.1:19090:19090 >/dev/null
@@ -268,7 +266,11 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     --secret "$test_channel,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
     --volume "$test_socket:/run/praxis-credentials:Z" \
     localhost/praxis-provider-codex:synthetic >/dev/null
-podman create "${common[@]}" --name "$test_pod-praxis" localhost/praxis-gateway:test >/dev/null
+# The first pass runs the Responses checks against praxis-anthropic.yaml, the
+# second against praxis.yaml.
+podman create "${common[@]}" --name "$test_pod-praxis" --env PRAXIS_ANTHROPIC_GATEWAY=enabled \
+    --secret "$test_anthropic,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \
+    localhost/praxis-gateway:test >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
 podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy
@@ -277,7 +279,10 @@ check_secret "$proxy" "$test_client" /run/secrets/client/client-api-key
 check_secret "$proxy" "$test_channel" /run/secrets/channel/agent-channel-key
 check_secret "$agent" "$test_channel" /run/secrets/channel/agent-channel-key
 secret_names "$agent" | grep -qx "$test_client" && exit 1
-for c in "$test_pod-praxis" "$test_pod-mock"; do secret_names "$c" | grep -q . && exit 1; done
+check_secret "$test_pod-praxis" "$test_anthropic" /run/secrets/anthropic/oauth-token
+[[ $(secret_names "$test_pod-praxis") == "$test_anthropic" ]]
+for c in "$proxy" "$agent"; do secret_names "$c" | grep -qx "$test_anthropic" && exit 1; done
+secret_names "$test_pod-mock" | grep -q . && exit 1
 for c in "$proxy" "$agent" "$test_pod-praxis" "$test_pod-mock"; do check_hardening "$c"; done
 check_no_config_mount "$test_pod-praxis"
 socket_dir=$(podman volume inspect "$test_socket" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["Mountpoint"])')
@@ -287,6 +292,7 @@ for _ in {1..30}; do [[ -S "$socket_dir/agent.sock" ]] && break; sleep 1; done
 socket_label=$(ls -Zd "$socket_dir/agent.sock")
 [[ $socket_label != *' ? '* ]]
 i=0; while [ "$i" -lt 60 ]; do curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+[[ $(anthropic_status 18081) == 403 ]]
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST --data '{}' http://127.0.0.1:18081/v1/responses); test "$status" = 401
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 body=$(curl --fail --silent -H 'Authorization: Bearer synthetic-client-key-012345678901234567890123' -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); python3 -c 'import json,sys; assert json.loads(sys.argv[1])["id"] == "synthetic"' "$body"
@@ -296,6 +302,8 @@ sleep 1
 python3 -c 'import json,urllib.request; assert json.load(urllib.request.urlopen("http://127.0.0.1:18082/counters"))["calls"] == 2'
 stream=$(curl --fail --silent -H 'Authorization: Bearer synthetic-client-key-012345678901234567890123' -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); case "$stream" in *response.output_text.delta*function_call_arguments.delta*) ;; *) exit 1;; esac
 logs=$(podman pod logs "$test_pod"); printf '%s' "$logs" | grep -Fq 'synthetic-client-key-012345678901234567890123' && exit 1; printf '%s' "$logs" | grep -Fq 'synthetic-agent-channel-012345678901234567890123' && exit 1
+printf '%s' "$logs" | grep -Fq "$test_anthropic_token" && exit 1
+podman inspect "$test_pod-praxis" | grep -Fq "$test_anthropic_token" && exit 1
 remove_pod "$test_pod"
 remove_socket "$test_socket"
 podman volume create "$test_socket" >/dev/null
@@ -316,8 +324,10 @@ podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy
 secret_names "$proxy" | grep -qx "$test_client" && exit 1
 check_secret "$proxy" "$test_channel" /run/secrets/channel/agent-channel-key
+secret_names "$test_pod-praxis" | grep -q . && exit 1
 for c in "$proxy" "$test_pod-agent" "$test_pod-praxis" "$test_pod-mock"; do check_hardening "$c"; done
 i=0; while [ "$i" -lt 60 ]; do curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null && break; sleep 1; i=$((i + 1)); done; test "$i" -lt 60
+[[ $(anthropic_status 18081) == 404 ]]
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 body=$(curl --fail --silent -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses); python3 -c 'import json,sys; assert json.loads(sys.argv[1])["id"] == "synthetic"' "$body"
 python3 -c 'import json,urllib.request; x=json.load(urllib.request.urlopen("http://127.0.0.1:18082/counters")); assert x == {"calls": 2, "observed": [[True, True]]}, x'

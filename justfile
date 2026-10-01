@@ -10,9 +10,9 @@ test-pod:
     podman build --pull=missing -f Containerfile.gateway -t localhost/praxis-gateway:test .
     bash scripts/native-pod.sh test
 
-# The gateway image's Anthropic routes against a fake upstream; no real token.
-test-anthropic:
-    python3 tests/anthropic_gateway.py
+# The gateway image's routes against fake upstreams; no real token.
+test-gateway:
+    python3 tests/gateway.py
 
 check:
     cargo fmt --all --check
