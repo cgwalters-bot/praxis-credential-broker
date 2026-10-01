@@ -90,6 +90,129 @@ requires stopping the pod and recreating it with the selected mode. Running
 `init-secrets` in disabled mode creates/replaces only the channel secret and
 does not prompt for, remove, or otherwise modify an existing client secret.
 
+## Anthropic Messages gateway
+
+The optional Anthropic gateway (`PRAXIS_ANTHROPIC_GATEWAY=enabled`, strictly
+`enabled` or `disabled`, default `disabled`) serves Claude Code in gateway
+mode with a Claude subscription OAuth token from `claude setup-token`. It is
+plain stock Praxis configuration, with no broker code involved:
+
+```text
+Claude Code (placeholder) -> stock Praxis (praxis-anthropic.yaml) -> api.anthropic.com
+                               ^ token in this container's environment only
+```
+
+It runs as its own container, `praxis-credential-broker-anthropic`, from the
+same pinned Praxis image, listening on 8090 in the pod and published on
+`127.0.0.1:18090`. A separate container keeps the token out of the
+Responses Praxis and leaves `praxis.yaml` alone. It has the same hardening as
+the other containers.
+
+### Token handling
+
+`scripts/init-anthropic-token` stores the token as the Podman secret
+`praxis-credential-broker-anthropic-oauth`. It reads only from the terminal
+(without echo) or standard input, checks the `sk-ant-oat01-` shape, never
+prints the input, and stores it without a trailing newline because Praxis
+injects the value verbatim. Only the gateway container mounts the secret,
+as a 0400 file. Core `credential_injection` reads credentials only from
+environment variables, so `scripts/praxis-anthropic-entrypoint`, mounted
+read-only into the stock image, exports it as `PRAXIS_ANTHROPIC_OAUTH_TOKEN`
+and execs Praxis. Podman's `type=env` secrets would need no shim, but Podman 4
+shows their values in `podman inspect`. The token is therefore in neither the
+container configuration nor any command line, and the test checks that it is
+in neither `podman inspect` nor Praxis's logs. It is in the gateway process's
+environment, readable through `/proc` by the same UID inside that container
+and by the host user that owns the pod. Without the secret, the container
+exits at startup rather than forward anything.
+
+Setup tokens are long-lived and are not refreshed: there is no
+`UnauthorizedRecovery` equivalent. When one expires or is revoked, Claude Code
+sees the upstream 401; store a new one with `init-anthropic-token` and
+recreate the pod. `reset-secrets` removes this secret along with the others.
+
+### Placeholder semantics and filter order
+
+Clients send `Authorization: Bearer praxis-substitute:anthropic`. The
+comparison is an exact, case-sensitive match of the whole header value:
+`bearer`, an extra space, a different name, or a prefix or suffix are all
+refused. HTTP parsing trims leading and trailing whitespace, so those variants
+are accepted. Only `POST` is forwarded, so no other method (such as `TRACE`,
+which an upstream might echo) carries the token. Only `Authorization` counts;
+a placeholder in `x-api-key` alone is refused. With duplicate `Authorization`
+headers, Praxis matches the first one, so another value first is refused, and
+placeholder-first is forwarded with every client copy removed.
+
+The order of the chain is security-critical, because conditions and router
+header matches see the request as it is when each filter runs:
+
+1. `static_response` answers 403 unless the request is a `POST` and
+   `Authorization` is exactly the placeholder. It must come first: without
+   it, a request that matched no credential would be forwarded with the
+   client's own headers.
+2. `router` routes only the exact paths `/v1/messages` and
+   `/v1/messages/count_tokens` (any query string) with the placeholder, so
+   the upstream and credential are bound to it and the client cannot choose
+   either. Other paths get Praxis's 404 and are not forwarded. They must
+   stay exact: Praxis forwards paths without normalizing them and
+   api.anthropic.com resolves `..`, so with a prefix such as `/v1/`, a
+   request for `/v1/../api/oauth/...` would spend the token on account
+   endpoints.
+3. `headers` removes every `authorization` and `x-api-key`, sets `Host` to
+   `api.anthropic.com`, and appends `oauth-2025-04-20` to `anthropic-beta`
+   (`request_add` joins it to the client's betas rather than replacing them).
+4. `credential_injection` adds `Authorization: Bearer <token>`.
+5. `load_balancer` connects to `api.anthropic.com:443` with TLS and SNI.
+
+The 403 body is fixed JSON in the Messages error shape and carries neither
+the token nor the beta. A client can name `Authorization`, `Host` or
+`anthropic-beta` in `Connection`, which makes Praxis drop the injected value
+as hop-by-hop. That fails closed: the request goes upstream without it.
+Praxis is reloaded when the mounted config changes, so editing
+`praxis-anthropic.yaml` in place changes the live policy.
+
+`tests/anthropic_gateway.py` checks the chain's order and runs every case
+above against a fake upstream; run it after any change to
+`praxis-anthropic.yaml` or the Praxis pin.
+
+### Client authentication
+
+The placeholder is not authentication. It is public configuration, and
+anyone who can reach the listener can spend the subscription.
+`PRAXIS_CLIENT_AUTH_MODE` applies only to the Responses listener, whose
+client key is checked by `credential-proxy`. Stock Praxis cannot also require
+that key here: `basic_auth` takes over `Authorization`, which carries the
+placeholder, and a header match on a key would mean writing the key into the
+Praxis configuration and comparing it in non-constant time. So this listener
+relies on the network boundary, like `disabled` mode: loopback-only by
+default, and an intentionally managed boundary such as a tailnet policy, or
+per-UID egress rules for a sandbox, if exposed further. Per-run client
+authentication is better added as a filter in front of the chain that reads
+its own header (for example `x-run-token`), leaving `Authorization` to the
+placeholder.
+
+### Risks
+
+- **Undocumented behavior.** Anthropic documents gateways for API keys, and
+  subscription use through a gateway only when the client holds the login.
+  Injecting a subscription OAuth token at the gateway with the
+  `oauth-2025-04-20` beta is undocumented and may stop working, for example
+  if the beta is enforced differently. Make sure your use fits the
+  subscription's terms.
+- **Claude Code in gateway mode behaves differently.** Background tasks use
+  the main model instead of Haiku, so they count against its limits, and the
+  fast-mode and WebFetch safety checks bypass `ANTHROPIC_BASE_URL` and go to
+  Anthropic directly. In a sandbox without egress those checks fail and the
+  features degrade. Pin the Claude Code version and rerun a real request when
+  upgrading, since the beta set changes between releases.
+- **Client headers in logs.** On a malformed request Praxis logs the raw
+  request bytes at error level, including the client's own `Authorization`.
+  That is the placeholder for a correct client, never the broker's token,
+  but a client that wrongly sends a real key that way would put it in the
+  pod logs.
+- **Shared spend.** All clients share the one subscription's rate limits, and
+  there is no metering or cap in this chain.
+
 ## Operations
 
 `down` removes the production pod and socket volume but preserves the client
@@ -100,7 +223,7 @@ or maintenance commands while observing their required stopped-pod state:
 # Replace only the internal channel key; pod must be down.
 bash scripts/native-pod.sh rotate-agent-secret
 
-# Remove the client secret if present and the mandatory channel secret; pod must be down.
+# Remove the client, channel and Anthropic token secrets if present; pod must be down.
 RESET_SECRETS=RESET bash scripts/native-pod.sh reset-secrets
 
 # Remove the OAuth auth volume (and stop/remove the pod).
@@ -146,8 +269,20 @@ Codex 0.154.0 accepted the disabled provider with no `env_key` and
 1.18.30 with `@ai-sdk/openai` rejects a missing `apiKey` before sending a
 request; use a non-secret placeholder such as `unused`, which the proxy strips.
 
+`just test-anthropic` runs `tests/anthropic_gateway.py`, which CI also runs.
+It starts the pinned Praxis image (read from `scripts/native-pod.sh`) with
+`praxis-anthropic.yaml`, rewriting only the listener address and the upstream
+endpoint, which points at an in-process fake Anthropic upstream. It uses the
+pod's entrypoint and a synthetic token in a Podman secret. It checks every
+placeholder case, header stripping, Host and beta handling, byte-identical
+bodies, unbuffered SSE, that denied requests never reach upstream, that the
+token is in neither the logs nor `podman inspect`, and that the container
+refuses to start without the token. It needs rootless Podman with host
+networking.
+
 ```sh
 just check
+just test-anthropic
 just test-pod
 ```
 
@@ -157,7 +292,7 @@ containers with `podman create --secret`.
 
 ## Pinned dependencies and publishing
 
-Stock Praxis is pinned to
+Stock Praxis, for both the Responses and the Anthropic containers, is pinned to
 `ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8`.
 The Codex provider uses the official `codex-login` source at
 `0dfb28edb9305fcae4ab006fb6b7b196cbdbac28`.
