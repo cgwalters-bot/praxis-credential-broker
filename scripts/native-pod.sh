@@ -7,16 +7,26 @@ pod=praxis-credential-broker
 socket_volume=praxis-credential-broker-socket
 client_secret=praxis-credential-broker-client-auth
 channel_secret=praxis-credential-broker-agent-channel
+anthropic_secret=praxis-credential-broker-anthropic-oauth
 proxy_image=${PRAXIS_PROXY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main}
 provider_codex_image=${PRAXIS_PROVIDER_CODEX_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main}
 
 client_auth_mode=
+anthropic_gateway=
 if [[ $mode == up ]]; then
     client_auth_mode=${PRAXIS_CLIENT_AUTH_MODE-required}
     case "$client_auth_mode" in
         required|disabled) ;;
         *)
             echo "PRAXIS_CLIENT_AUTH_MODE must be exactly 'required' or 'disabled'" >&2
+            exit 2
+            ;;
+    esac
+    anthropic_gateway=${PRAXIS_ANTHROPIC_GATEWAY-disabled}
+    case "$anthropic_gateway" in
+        enabled|disabled) ;;
+        *)
+            echo "PRAXIS_ANTHROPIC_GATEWAY must be exactly 'enabled' or 'disabled'" >&2
             exit 2
             ;;
     esac
@@ -40,6 +50,13 @@ check_hardening() {
 
 check_config_mount() {
     podman inspect "$1" | python3 -c 'import json,sys; mounts=json.load(sys.stdin)[0]["Mounts"]; assert any(m["Destination"] == "/etc/praxis/praxis.yaml" and not m["RW"] for m in mounts)'
+}
+
+# The Anthropic gateway is up when it answers a request without the
+# placeholder with its own 403, which also shows the deny filter is in place.
+anthropic_ready() {
+    [[ $(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
+        --request POST --data '{}' http://127.0.0.1:18090/v1/messages) == 403 ]]
 }
 
 remove_pod() {
@@ -73,6 +90,11 @@ case "$mode" in
         ;;
     health)
         curl --fail --silent http://127.0.0.1:18080/healthz
+        if podman container exists praxis-credential-broker-anthropic; then
+            printf '\n'
+            anthropic_ready || { echo 'Anthropic gateway: not ready' >&2; exit 1; }
+            echo 'Anthropic gateway: ready'
+        fi
         exit 0
         ;;
     logs)
@@ -94,7 +116,7 @@ case "$mode" in
     reset-secrets)
         test "${RESET_SECRETS:-}" = RESET
         require_stopped_pod
-        remove_secrets "$client_secret" "$channel_secret"
+        remove_secrets "$client_secret" "$channel_secret" "$anthropic_secret"
         exit 0
         ;;
     reset-auth)
@@ -118,6 +140,9 @@ if [[ $mode == up ]]; then
         podman secret exists "$client_secret" || { echo "missing Podman secret: $client_secret (run 'bash scripts/init-secrets')" >&2; exit 1; }
     fi
     podman secret exists "$channel_secret" || { echo "missing Podman secret: $channel_secret (run 'bash scripts/init-secrets')" >&2; exit 1; }
+    if [[ $anthropic_gateway == enabled ]]; then
+        podman secret exists "$anthropic_secret" || { echo "missing Podman secret: $anthropic_secret (run 'bash scripts/init-anthropic-token')" >&2; exit 1; }
+    fi
     if podman pod exists "$pod" >/dev/null 2>&1; then
         echo "pod $pod already exists; run 'bash scripts/native-pod.sh down' before starting it again" >&2
         exit 1
@@ -126,7 +151,11 @@ if [[ $mode == up ]]; then
     # shellcheck disable=SC2317
     cleanup() { remove_pod "$pod"; remove_socket "$socket_volume"; }
     trap cleanup EXIT INT TERM
-    podman pod create --name "$pod" --publish 127.0.0.1:18080:8081 >/dev/null
+    publish=(--publish 127.0.0.1:18080:8081)
+    if [[ $anthropic_gateway == enabled ]]; then
+        publish+=(--publish 127.0.0.1:18090:8090)
+    fi
+    podman pod create --name "$pod" "${publish[@]}" >/dev/null
     common=(--pod "$pod" --user 65532:65532 --read-only --cap-drop=ALL --security-opt=no-new-privileges)
     proxy_client_secret=()
     if [[ $client_auth_mode == required ]]; then
@@ -150,6 +179,19 @@ if [[ $mode == up ]]; then
         ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
         --config /etc/praxis/praxis.yaml >/dev/null
     expected=(praxis-credential-broker-proxy praxis-credential-broker-provider-codex praxis-credential-broker-praxis)
+    if [[ $anthropic_gateway == enabled ]]; then
+        # A Praxis of its own, so that only this container holds the Claude
+        # token. See praxis-anthropic.yaml and praxis-anthropic-entrypoint.
+        podman create "${common[@]}" --name praxis-credential-broker-anthropic \
+            --secret "$anthropic_secret,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \
+            --volume "$root/praxis-anthropic.yaml:/etc/praxis/praxis.yaml:ro,Z" \
+            --volume "$root/scripts/praxis-anthropic-entrypoint:/usr/local/libexec/praxis-anthropic-entrypoint:ro,Z" \
+            --entrypoint '["/bin/sh", "/usr/local/libexec/praxis-anthropic-entrypoint"]' \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
+            --config /etc/praxis/praxis.yaml >/dev/null
+        expected+=(praxis-credential-broker-anthropic)
+    fi
     diagnostics() {
         echo "native pod startup failed; redacted container status:" >&2
         podman ps --filter label=io.podman.pod.name="$pod" --format '{{.Names}} {{.Status}}' >&2 || true
@@ -182,6 +224,17 @@ if [[ $mode == up ]]; then
         [[ $all_running == true ]] || fail_startup
     done
     [[ $health_ready == true ]] || { echo 'native pod startup timed out waiting for healthz' >&2; fail_startup; }
+    if [[ $anthropic_gateway == enabled ]]; then
+        health_ready=false
+        for _ in {1..30}; do
+            if anthropic_ready; then
+                health_ready=true
+                break
+            fi
+            sleep 1
+        done
+        [[ $health_ready == true ]] || { echo 'native pod startup timed out waiting for the Anthropic gateway' >&2; fail_startup; }
+    fi
     echo 'Started praxis-credential-broker; healthz is ready.'
     trap - EXIT INT TERM
     exit 0
