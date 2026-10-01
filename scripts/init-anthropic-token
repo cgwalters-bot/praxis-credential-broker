@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Store a Claude subscription OAuth token from `claude setup-token` as the
+# Podman secret the Anthropic gateway injects upstream. The token is read
+# from the terminal without echo, or from standard input; it is never taken
+# from the environment or the command line, and never printed.
+set -euo pipefail
+secret=praxis-credential-broker-anthropic-oauth
+
+if podman pod exists praxis-credential-broker >/dev/null 2>&1; then
+    echo "production pod is running; stop it with 'bash scripts/native-pod.sh down' before replacing secrets" >&2
+    exit 1
+fi
+if [[ -t 0 ]]; then
+    read -r -s -p 'Claude OAuth token (from claude setup-token): ' token
+    printf '\n' >&2
+    input=(printf '%s' "$token")
+else
+    input=(cat)
+fi
+# Validate before touching the secret, so bad input leaves an existing one
+# alone. Store it without a trailing newline: Praxis injects it verbatim.
+token=$("${input[@]}" |
+    python3 -c 'import re,sys; data=sys.stdin.buffer.read(); data=data[:-1] if data.endswith(b"\n") else data; raise SystemExit("expected a Claude OAuth token (sk-ant-oat01-...) from claude setup-token; the input is not shown") if not re.fullmatch(rb"sk-ant-oat01-[A-Za-z0-9_-]{16,}", data) else (sys.stdout.buffer.write(data), sys.exit(0))')
+printf '%s' "$token" | podman secret create --replace "$secret" - >/dev/null
+echo "Stored the Claude OAuth token as Podman secret $secret." >&2
