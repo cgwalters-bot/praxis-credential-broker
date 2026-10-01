@@ -274,7 +274,7 @@ def container_args(config_path, mode, with_secret=True):
     target = ANTHROPIC_CONFIG.name if mode == "enabled" else PLAIN_CONFIG.name
     args = ["--network", "host", "--user", "65532:65532", "--read-only", "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
-            "--env", f"PRAXIS_ANTHROPIC_GATEWAY={mode}",
+            "--no-healthcheck", "--env", f"PRAXIS_ANTHROPIC_GATEWAY={mode}",
             "--volume", f"{config_path}:/etc/praxis/{target}:ro,Z"]
     if with_secret:
         args += ["--secret", f"{SECRET},target={TOKEN_FILE},uid=65532,gid=65532,mode=0400"]

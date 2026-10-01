@@ -181,7 +181,7 @@ if [[ $mode == up ]]; then
     if [[ $anthropic_gateway == enabled ]]; then
         anthropic_token=(--secret "$anthropic_secret,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400")
     fi
-    podman create "${common[@]}" --name praxis-credential-broker-praxis \
+    podman create "${common[@]}" --name praxis-credential-broker-praxis --no-healthcheck \
         --env "PRAXIS_ANTHROPIC_GATEWAY=$anthropic_gateway" "${anthropic_token[@]}" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
         -- "$gateway_image" >/dev/null
@@ -268,7 +268,7 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     localhost/praxis-provider-codex:synthetic >/dev/null
 # The first pass runs the Responses checks against praxis-anthropic.yaml, the
 # second against praxis.yaml.
-podman create "${common[@]}" --name "$test_pod-praxis" --env PRAXIS_ANTHROPIC_GATEWAY=enabled \
+podman create "${common[@]}" --name "$test_pod-praxis" --no-healthcheck --env PRAXIS_ANTHROPIC_GATEWAY=enabled \
     --secret "$test_anthropic,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \
     localhost/praxis-gateway:test >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
@@ -318,7 +318,7 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     --secret "$test_channel,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
     --volume "$test_socket:/run/praxis-credentials:Z" \
     localhost/praxis-provider-codex:synthetic >/dev/null
-podman create "${common[@]}" --name "$test_pod-praxis" localhost/praxis-gateway:test >/dev/null
+podman create "${common[@]}" --name "$test_pod-praxis" --no-healthcheck localhost/praxis-gateway:test >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
 podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy
