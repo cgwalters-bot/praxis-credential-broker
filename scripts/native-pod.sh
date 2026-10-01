@@ -10,6 +10,7 @@ channel_secret=praxis-credential-broker-agent-channel
 anthropic_secret=praxis-credential-broker-anthropic-oauth
 proxy_image=${PRAXIS_PROXY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main}
 provider_codex_image=${PRAXIS_PROVIDER_CODEX_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main}
+gateway_image=${PRAXIS_GATEWAY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:main}
 
 client_auth_mode=
 anthropic_gateway=
@@ -48,8 +49,9 @@ check_hardening() {
     podman inspect "$1" | python3 -c 'import json,sys; x=json.load(sys.stdin)[0]; assert x["Config"]["User"] == "65532:65532" and x["HostConfig"]["ReadonlyRootfs"] and "no-new-privileges" in x["HostConfig"]["SecurityOpt"] and len(x["HostConfig"]["CapDrop"]) >= 1'
 }
 
-check_config_mount() {
-    podman inspect "$1" | python3 -c 'import json,sys; mounts=json.load(sys.stdin)[0]["Mounts"]; assert any(m["Destination"] == "/etc/praxis/praxis.yaml" and not m["RW"] for m in mounts)'
+# The routes come from the image, never from a mounted checkout.
+check_no_config_mount() {
+    podman inspect "$1" | python3 -c 'import json,sys; mounts=json.load(sys.stdin)[0]["Mounts"] or []; assert not any(m["Destination"].startswith("/etc/praxis") for m in mounts), mounts'
 }
 
 # The Anthropic gateway is up when it answers a request without the
@@ -136,6 +138,7 @@ esac
 if [[ $mode == up ]]; then
     [[ -n $proxy_image ]] || { echo 'PRAXIS_PROXY_IMAGE must not be empty' >&2; exit 2; }
     [[ -n $provider_codex_image ]] || { echo 'PRAXIS_PROVIDER_CODEX_IMAGE must not be empty' >&2; exit 2; }
+    [[ -n $gateway_image ]] || { echo 'PRAXIS_GATEWAY_IMAGE must not be empty' >&2; exit 2; }
     if [[ $client_auth_mode == required ]]; then
         podman secret exists "$client_secret" || { echo "missing Podman secret: $client_secret (run 'bash scripts/init-secrets')" >&2; exit 1; }
     fi
@@ -174,22 +177,18 @@ if [[ $mode == up ]]; then
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
         -- "$provider_codex_image" >/dev/null
     podman create "${common[@]}" --name praxis-credential-broker-praxis \
-        --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
+        --env PRAXIS_ANTHROPIC_GATEWAY=disabled \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-        ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-        --config /etc/praxis/praxis.yaml >/dev/null
+        -- "$gateway_image" >/dev/null
     expected=(praxis-credential-broker-proxy praxis-credential-broker-provider-codex praxis-credential-broker-praxis)
     if [[ $anthropic_gateway == enabled ]]; then
         # A Praxis of its own, so that only this container holds the Claude
-        # token. See praxis-anthropic.yaml and praxis-anthropic-entrypoint.
+        # token. See praxis-anthropic.yaml and praxis-gateway-entrypoint.
         podman create "${common[@]}" --name praxis-credential-broker-anthropic \
+            --env PRAXIS_ANTHROPIC_GATEWAY=enabled \
             --secret "$anthropic_secret,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \
-            --volume "$root/praxis-anthropic.yaml:/etc/praxis/praxis.yaml:ro,Z" \
-            --volume "$root/scripts/praxis-anthropic-entrypoint:/usr/local/libexec/praxis-anthropic-entrypoint:ro,Z" \
-            --entrypoint '["/bin/sh", "/usr/local/libexec/praxis-anthropic-entrypoint"]' \
             --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
-            ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-            --config /etc/praxis/praxis.yaml >/dev/null
+            -- "$gateway_image" >/dev/null
         expected+=(praxis-credential-broker-anthropic)
     fi
     diagnostics() {
@@ -269,9 +268,7 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     --secret "$test_channel,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
     --volume "$test_socket:/run/praxis-credentials:Z" \
     localhost/praxis-provider-codex:synthetic >/dev/null
-podman create "${common[@]}" --name "$test_pod-praxis" --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
-    ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-    --config /etc/praxis/praxis.yaml >/dev/null
+podman create "${common[@]}" --name "$test_pod-praxis" localhost/praxis-gateway:test >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
 podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy
@@ -282,7 +279,7 @@ check_secret "$agent" "$test_channel" /run/secrets/channel/agent-channel-key
 secret_names "$agent" | grep -qx "$test_client" && exit 1
 for c in "$test_pod-praxis" "$test_pod-mock"; do secret_names "$c" | grep -q . && exit 1; done
 for c in "$proxy" "$agent" "$test_pod-praxis" "$test_pod-mock"; do check_hardening "$c"; done
-check_config_mount "$test_pod-praxis"
+check_no_config_mount "$test_pod-praxis"
 socket_dir=$(podman volume inspect "$test_socket" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["Mountpoint"])')
 for _ in {1..30}; do [[ -S "$socket_dir/agent.sock" ]] && break; sleep 1; done
 [[ -S "$socket_dir/agent.sock" ]]
@@ -313,9 +310,7 @@ podman create "${common[@]}" --name "$test_pod-agent" \
     --secret "$test_channel,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400" \
     --volume "$test_socket:/run/praxis-credentials:Z" \
     localhost/praxis-provider-codex:synthetic >/dev/null
-podman create "${common[@]}" --name "$test_pod-praxis" --volume "$root/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z" \
-    ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8 \
-    --config /etc/praxis/praxis.yaml >/dev/null
+podman create "${common[@]}" --name "$test_pod-praxis" localhost/praxis-gateway:test >/dev/null
 podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
 podman pod start "$test_pod" >/dev/null
 proxy=$test_pod-proxy
