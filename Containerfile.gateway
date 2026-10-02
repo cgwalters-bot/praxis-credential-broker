@@ -1,17 +1,26 @@
-# Stock Praxis AI with this repository's routes baked in, so a deployment
-# needs only the image, its secrets and its published port. The entrypoint
-# chooses praxis.yaml, or praxis-anthropic.yaml when
-# PRAXIS_ANTHROPIC_GATEWAY=enabled; see INTERNALS.md.
-FROM ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8
+# Praxis AI with the broker's filters (crates/praxis-gateway) and this
+# repository's routes (praxis.yaml) baked in, so a deployment needs only the
+# image, its secrets, its run registration policy and its published port.
+# See INTERNALS.md.
+#
+# Built like upstream's own image: praxis-ai links the system OpenSSL
+# dynamically, so the musl binary must not be static, and the builder and
+# runtime are the same Alpine release. Both are pinned by digest, since the
+# runtime image holds the broker's Claude token.
+FROM docker.io/library/rust:1.98-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+RUN apk add --no-cache musl-dev openssl-dev pkgconf cmake make g++ git
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked -p praxis-gateway
+FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-credential-broker"
-COPY --chmod=0644 praxis.yaml praxis-anthropic.yaml /etc/praxis/
+RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc \
+    && mkdir /etc/praxis-credential-broker
+COPY --from=build /src/target/release/praxis-gateway /usr/local/bin/praxis-gateway
+COPY --chmod=0644 praxis.yaml /etc/praxis/
 COPY --chmod=0755 scripts/praxis-gateway-entrypoint /usr/local/libexec/praxis-gateway-entrypoint
-# Upstream's check polls an admin listener on 9901 that these configurations
-# do not enable, so it could only ever report unhealthy. Podman (5.8) still
-# schedules a check for HEALTHCHECK NONE in a Docker-format image, and fails
-# to create the container without a systemd user bus, so containers from
-# this image also need --no-healthcheck.
-HEALTHCHECK NONE
 USER 65532:65532
 ENTRYPOINT ["/bin/sh", "/usr/local/libexec/praxis-gateway-entrypoint"]
 CMD []

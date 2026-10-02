@@ -1,29 +1,20 @@
 #!/bin/sh
-# Entrypoint of the gateway image (Containerfile.gateway). It picks the
-# Praxis configuration baked into the image and, with the Anthropic gateway
-# enabled, exports the Claude OAuth token from its Podman secret file, since
-# core credential_injection reads credentials only from environment
-# variables. The token ends up only in Praxis's own environment: never on a
-# command line, and never in the container configuration, where Podman 4
-# shows the values of type=env secrets in podman inspect.
+# Entrypoint of the gateway image (Containerfile.gateway). It exports the
+# broker's Claude OAuth token from its Podman secret file, since core
+# credential_injection reads credentials only from environment variables,
+# and runs the baked-in praxis.yaml. The token ends up only in Praxis's own
+# environment: never on a command line, and never in the container
+# configuration, where Podman 4 shows the values of type=env secrets in
+# podman inspect.
 set -eu
 token_file=/run/secrets/anthropic/oauth-token
-case "${PRAXIS_ANTHROPIC_GATEWAY:-disabled}" in
-    enabled)
-        if [ ! -s "$token_file" ]; then
-            echo "praxis-gateway-entrypoint: PRAXIS_ANTHROPIC_GATEWAY=enabled but the Claude OAuth token secret at $token_file is missing or empty" >&2
-            exit 1
-        fi
-        PRAXIS_ANTHROPIC_OAUTH_TOKEN=$(cat "$token_file")
-        export PRAXIS_ANTHROPIC_OAUTH_TOKEN
-        config=/etc/praxis/praxis-anthropic.yaml
-        ;;
-    disabled)
-        config=/etc/praxis/praxis.yaml
-        ;;
-    *)
-        echo "praxis-gateway-entrypoint: PRAXIS_ANTHROPIC_GATEWAY must be exactly 'enabled' or 'disabled'" >&2
-        exit 2
-        ;;
-esac
-exec praxis-ai --config "$config" "$@"
+if [ -n "${PRAXIS_ANTHROPIC_GATEWAY+set}" ]; then
+    echo "praxis-gateway-entrypoint: PRAXIS_ANTHROPIC_GATEWAY is no longer used; the Anthropic routes are always served" >&2
+fi
+if [ ! -s "$token_file" ]; then
+    echo "praxis-gateway-entrypoint: the Claude OAuth token secret at $token_file is missing or empty; store one with scripts/init-anthropic-token" >&2
+    exit 1
+fi
+PRAXIS_ANTHROPIC_OAUTH_TOKEN=$(cat "$token_file")
+export PRAXIS_ANTHROPIC_OAUTH_TOKEN
+exec praxis-gateway --config /etc/praxis/praxis.yaml "$@"

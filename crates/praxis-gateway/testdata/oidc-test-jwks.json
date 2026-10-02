@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "alg": "RS256",
+      "use": "sig",
+      "kid": "praxis-test-key",
+      "n": "oxlW5IvTVym_H-S6eHk6kEBTApN31X_TmNRSphR-LhqcKr4af_KSMM5OmGLFd03wH_XpB9wAzVwfxl48WO8cEX61wxkHhnHZiiGxml6SVnHJ_I1FqgpPPmNF2_YPxLTG5IUemFXmU4ecrObWW70jTD2wc7LEf6Qd-HWcks3JAdTsE591SJ2qZyvV2toDB4VDWwXEKiE7rrE8KjMuHCBXi3rSRd3anolPoUevPcHTd5-S5ts_y8zOUuBc-Bc-8h1ZMAJtlvZ0wc0E37pCsOHAUD52jmwoVSHqmSkHmcq8mHP1VdFwlbK2wUrp2CDITU1atUTnMzBuO8-bbqsD83za6Q",
+      "e": "AQAB"
+    }
+  ]
+}
