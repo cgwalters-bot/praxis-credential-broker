@@ -144,7 +144,10 @@ async fn main() {
         idle: Duration::from_secs(env_num("CHUNK_IDLE_SECS", 30, 300) as u64),
         concurrency: Arc::new(Semaphore::new(env_num("CONCURRENCY", 16, 128))),
     };
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 8080))
+    // Only Praxis, in the same pod network namespace, connects. Loopback keeps
+    // the proxy, which adds the Codex credential, unreachable from anything
+    // else even if the pod's network is shared or a port is published.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8080))
         .await
         .unwrap();
     axum::serve(
