@@ -4,14 +4,17 @@ This alpha spike is for local review only. Do not report or store real OAuth
 credentials in issues, fixtures, logs, images, or test volumes. Report a
 vulnerability privately to the repository owner before any publication.
 
-The optional Anthropic gateway forwards a Claude subscription OAuth token
-for any request to `/anthropic` carrying its public placeholder, with no
-client authentication of its own. Keep the listener behind a boundary you
-control, and read the risks in
-[INTERNALS.md](INTERNALS.md#anthropic-messages-gateway) before enabling it.
+The broker's own credentials, the Codex login and a Claude subscription
+token, are used only for requests that carry the token of a CI run
+registered with an allowed job's GitHub Actions OIDC token. Other Claude
+requests are passed through with the caller's own credential, which the
+broker forwards and never stores. Read
+[INTERNALS.md](INTERNALS.md#credential-modes) and its risks before
+deploying.
 
-With the gateway enabled, the one Praxis process that serves Codex Responses
-also holds that token, and only its configuration keeps the token on the
-Anthropic routes. Report anything that gets the token injected on another
-path, or a client's credentials forwarded where they were not sent, as a
+The one Praxis process that serves Codex Responses also holds the Claude
+token, and only its configuration keeps the token on the injected Anthropic
+routes. Report anything that gets the broker's credentials used without a
+valid run token, the token injected on another route, a caller's credential
+or run token forwarded where it was not sent, or any of them logged, as a
 vulnerability.
