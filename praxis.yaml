@@ -1,23 +1,320 @@
-# Praxis' native router/filter schema. The broker is pod-local 127.0.0.1:8080;
-# Praxis listens on 8081 so the two processes do not collide in the pod netns.
+# The broker's one Praxis listener. credential-proxy, which adds the Codex
+# credential, is pod-local 127.0.0.1:8080; Praxis listens on 8081 so the two
+# processes do not collide in the pod netns. Routes, by raw request path:
+#
+#   /v1/responses (prefix), /healthz   Codex Responses via credential-proxy,
+#                                      POST only
+#   /anthropic/v1/messages             Anthropic Messages, with
+#   /anthropic/v1/messages/count_tokens    exact paths only
+#   /v1/runs (prefix)                  run registration, answered by run_token
+#
+# Each route that reaches a provider has a credential mode, given per
+# cluster in run_token's `credentials` below:
+#
+#   injected      the broker's credential, only for a registered run's
+#                 requests, each carrying its run token: Responses always,
+#                 and Messages sent with the placeholder
+#                 (counting tokens is admitted but neither capped nor
+#                 charged)
+#                 `Authorization: Bearer praxis-substitute:anthropic`
+#   pass-through  the caller's own Authorization, forwarded and never
+#                 stored: Messages with any other Authorization
+#
+# Every request that reaches a provider is metered by token_count, and run_token
+# logs its usage. Injected requests are also capped per run and per sliding
+# 5h window, the providers' own limit window, one per provider, by
+# token_rate_limit; pass-through requests spend the caller's own limits.
+#
+# THE FILTER ORDER AND THE CONDITIONS ARE SECURITY-CRITICAL; see
+# INTERNALS.md, and run `just test-gateway` after any change. Conditions and
+# the router see the request as it is when each filter runs, and all of them
+# match the raw request path: Praxis does not normalize it. A filter that
+# acts on one route has to be conditioned on that same raw path, and on the
+# placeholder when it acts on one credential mode only.
 listeners:
   - name: ai-gateway
     address: "0.0.0.0:8081"
-    filter_chains: [responses-proxy]
+    filter_chains: [gateway]
 filter_chains:
-  - name: responses-proxy
+  - name: gateway
     filters:
+      # 1. /anthropic forwards POST only: other methods could have an
+      #    upstream echo a credential (TRACE).
+      - filter: static_response
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+          - unless:
+              methods: [POST]
+        status: 403
+        headers:
+          - name: content-type
+            value: application/json
+        body: '{"type":"error","error":{"type":"permission_error","message":"only POST is forwarded"}}'
+      # The same for Responses, which credential-proxy only serves as POST
+      # anyway; refused here so that every request the caps let through is
+      # one they count.
+      - filter: static_response
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+          - unless:
+              methods: [POST]
+        status: 405
+        headers:
+          - name: content-type
+            value: application/json
+        body: '{"error":{"type":"invalid_request_error","message":"only POST is forwarded"}}'
+      # 2. The placeholder means nothing anywhere else, so refuse it there
+      #    rather than forward it to credential-proxy. This also catches
+      #    spellings of the prefix that skip step 1, such as "//anthropic/..."
+      #    or "/anthropic%2f...".
+      - filter: static_response
+        conditions:
+          - when:
+              headers:
+                authorization: "Bearer praxis-substitute:anthropic"
+          - unless:
+              path_prefix: "/anthropic"
+        status: 403
+        headers:
+          - name: content-type
+            value: application/json
+        body: '{"type":"error","error":{"type":"permission_error","message":"praxis placeholder credential outside /anthropic"}}'
+      # Protocol filters, each on its own API's path. Their presence makes
+      # Praxis read every request body before any request filter runs.
       - filter: openai_responses_proxy
         name: inference
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+      # Messages validation; keep classifier headers internal to Praxis.
+      - filter: anthropic_messages_format
+        conditions:
+          - when:
+              path: "/anthropic/v1/messages"
+        on_invalid: reject
+        headers:
+          format: null
+          model: null
+          stream: null
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path: "/anthropic/v1/messages"
+      - filter: anthropic_messages_protocol
+        conditions:
+          - when:
+              path: "/anthropic/v1/messages"
+      # 3. The only routes; any other path gets 404. The upstream is fixed by
+      #    the route, not by the client. The two Messages paths have a route
+      #    per credential mode, each with a cluster of its own, and the more
+      #    specific route, the one that also matches the placeholder, wins.
+      #    The Anthropic routes are exact: Praxis forwards paths without
+      #    normalizing them and api.anthropic.com resolves "..", so with a
+      #    prefix such as "/anthropic/v1/" a request for
+      #    "/anthropic/v1/../api/oauth/..." would spend the credential on
+      #    account endpoints.
       - filter: router
         routes:
-          - path_prefix: "/healthz"
+          - path: "/healthz"
             cluster: inference-backend
           - path_prefix: "/v1/responses"
             cluster: inference-backend
+          - path_prefix: "/v1/runs"
+            cluster: run-endpoints
+          - path: "/anthropic/v1/messages"
+            headers:
+              authorization: "Bearer praxis-substitute:anthropic"
+            cluster: anthropic
+          - path: "/anthropic/v1/messages/count_tokens"
+            headers:
+              authorization: "Bearer praxis-substitute:anthropic"
+            cluster: anthropic
+          - path: "/anthropic/v1/messages"
+            cluster: anthropic-pass-through
+          - path: "/anthropic/v1/messages/count_tokens"
+            cluster: anthropic-pass-through
+      # 4. Run tokens and credential modes, by the cluster the router chose.
+      #    It answers /v1/runs itself, refuses a request with more than one
+      #    Authorization header (the router matches any of them, conditions
+      #    the first), and removes the token headers before forwarding,
+      #    except a pass-through caller's Authorization. An injected request
+      #    needs a valid run token, in x-run-token or else as a bearer token
+      #    in Authorization; Claude Code puts it in x-run-token
+      #    (ANTHROPIC_CUSTOM_HEADERS), since its Authorization holds the
+      #    placeholder.
+      - filter: run_token
+        token_headers: [x-run-token, authorization]
+        # /healthz answers without a run token, for the pod's health check.
+        public_paths: ["/healthz"]
+        # Counting tokens uses none: admitted for the run, charged nothing.
+        usage_free_paths: ["/anthropic/v1/messages/count_tokens"]
+        registration:
+          policy_file: /etc/praxis-credential-broker/run-token-policy.yaml
+        credentials:
+          inference-backend: injected
+          anthropic: injected
+          anthropic-pass-through: pass-through
+      # 5. Each run's cap. Response filters run in reverse order, so every
+      #    token_rate_limit comes before the token_count whose counts it
+      #    reconciles with, and run_token before them all. Two instances,
+      #    one per API, because a condition cannot say "injected" for both;
+      #    a run normally uses one API. The window must be at least the
+      #    policy's max_secs (6h by default), so that it spans the whole run.
+      #    A reservation still open after reservation_timeout is charged its
+      #    estimate for good, so the timeout outlasts any single response.
+      - filter: token_rate_limit
+        key: authenticated_subject
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+              methods: [POST]
+        rules:
+          - name: run
+            algorithm: sliding_window
+            window: 6h
+            capacity: 20000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      - filter: token_rate_limit
+        key: authenticated_subject
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+              methods: [POST]
+              headers:
+                authorization: "Bearer praxis-substitute:anthropic"
+          - unless:
+              path: "/anthropic/v1/messages/count_tokens"
+        rules:
+          - name: run
+            algorithm: sliding_window
+            window: 6h
+            capacity: 20000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      # 6. The broker's own subscriptions, one 5h window each.
+      - filter: token_rate_limit
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+              methods: [POST]
+        rules:
+          - name: window
+            algorithm: sliding_window
+            window: 5h
+            capacity: 100000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      - filter: token_rate_limit
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+              methods: [POST]
+              headers:
+                authorization: "Bearer praxis-substitute:anthropic"
+          - unless:
+              path: "/anthropic/v1/messages/count_tokens"
+        rules:
+          - name: window
+            algorithm: sliding_window
+            window: 5h
+            capacity: 100000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      # 7. Metering, for both credential modes. response.completed carries
+      #    the whole Responses response.
+      - filter: token_count
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+        provider: openai
+        max_body_bytes: 16777216
+        max_scratch_bytes: 16777216
+      - filter: token_count
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+        provider: anthropic
+        max_body_bytes: 16777216
+        max_scratch_bytes: 16777216
+      # 8. Upstream, /anthropic/v1/... is /v1/.... Only the exact routes
+      #    above reach this with the prefix, so nothing is left to normalize.
+      - filter: path_rewrite
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+        strip_prefix: "/anthropic"
+      # 9. token_count reads bodies as they are, so ask for them
+      #    uncompressed.
+      - filter: headers
+        request_remove: ["accept-encoding"]
+      # 10. Injected Messages: strip every copy of the client's credentials,
+      #     fix the authority, and append the OAuth beta to any
+      #     anthropic-beta the client sent (request_add appends rather than
+      #     replaces).
+      - filter: headers
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+              headers:
+                authorization: "Bearer praxis-substitute:anthropic"
+        request_remove:
+          - authorization
+          - x-api-key
+        request_set:
+          - name: Host
+            value: api.anthropic.com
+        request_add:
+          - name: anthropic-beta
+            value: oauth-2025-04-20
+      # 11. Pass-through Messages: the caller's own Authorization and
+      #     Anthropic protocol headers pass through unchanged. Remove API-key
+      #     authentication so the two credential forms cannot be sent
+      #     together, and force the upstream authority.
+      - filter: headers
+        conditions:
+          - when:
+              path_prefix: "/anthropic"
+          - unless:
+              headers:
+                authorization: "Bearer praxis-substitute:anthropic"
+        request_remove: ["x-api-key"]
+        request_set:
+          - name: Host
+            value: api.anthropic.com
+      # 12. The broker's Claude token, from a Podman secret exposed only to
+      #     Praxis's environment. It is keyed on the cluster the router chose,
+      #     so only the anthropic cluster gets it: anthropic-pass-through is
+      #     a separate cluster for exactly this reason, and inference-backend
+      #     gets the Codex credential from credential-proxy instead.
+      - filter: credential_injection
+        clusters:
+          - name: anthropic
+            header: Authorization
+            header_prefix: "Bearer "
+            env_var: PRAXIS_ANTHROPIC_OAUTH_TOKEN
       - filter: load_balancer
         clusters:
           - name: inference-backend
             endpoints: ["127.0.0.1:8080"]
+          - name: anthropic
+            endpoints: ["api.anthropic.com:443"]
+            tls:
+              sni: "api.anthropic.com"
+          - name: anthropic-pass-through
+            endpoints: ["api.anthropic.com:443"]
+            tls:
+              sni: "api.anthropic.com"
+          # Never connected to: run_token answers every /v1/runs request.
+          - name: run-endpoints
+            endpoints: ["127.0.0.1:9"]
+# The Responses filter makes Praxis read each request body in full before any
+# request filter runs, including the deny filters above, and Praxis caps what
+# it reads at 10 MiB by default. Raise that to the Messages API's own 32 MB
+# request limit so large Claude Code requests (images, PDFs) still fit.
+body_limits:
+  max_request_bytes: 33554432
 insecure_options:
   allow_private_endpoints: true

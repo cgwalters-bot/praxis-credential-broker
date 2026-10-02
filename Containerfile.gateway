@@ -1,8 +1,7 @@
 # Praxis AI with the broker's filters (crates/praxis-gateway) and this
-# repository's routes baked in, so a deployment needs only the image, its
-# secrets and its published port. The entrypoint chooses praxis.yaml, or
-# praxis-anthropic.yaml when PRAXIS_ANTHROPIC_GATEWAY=enabled; see
-# INTERNALS.md.
+# repository's routes (praxis.yaml) baked in, so a deployment needs only the
+# image, its secrets, its run registration policy and its published port.
+# See INTERNALS.md.
 #
 # Built like upstream's own image: praxis-ai links the system OpenSSL
 # dynamically, so the musl binary must not be static, and the builder and
@@ -17,9 +16,10 @@ COPY crates ./crates
 RUN cargo build --release --locked -p praxis-gateway
 FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-credential-broker"
-RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc
+RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc \
+    && mkdir /etc/praxis-credential-broker
 COPY --from=build /src/target/release/praxis-gateway /usr/local/bin/praxis-gateway
-COPY --chmod=0644 praxis.yaml praxis-anthropic.yaml /etc/praxis/
+COPY --chmod=0644 praxis.yaml /etc/praxis/
 COPY --chmod=0755 scripts/praxis-gateway-entrypoint /usr/local/libexec/praxis-gateway-entrypoint
 USER 65532:65532
 ENTRYPOINT ["/bin/sh", "/usr/local/libexec/praxis-gateway-entrypoint"]

@@ -30,6 +30,9 @@ tokio.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
+praxis-test-utils = { git = "https://github.com/cgwalters-forge/ai", rev = "1f0b72d624fcdddec9c74a3a08b14836936131c0", default-features = false, features = ["openai-responses"] }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
