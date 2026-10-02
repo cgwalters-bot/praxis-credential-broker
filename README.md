@@ -6,7 +6,7 @@
 > [INTERNALS.md](INTERNALS.md) for architecture, security, operations, and
 > development details.
 
-A reference implementation for using stock [Praxis AI](https://github.com/praxis-proxy/ai)
+A reference implementation for using [Praxis AI](https://github.com/praxis-proxy/ai)
 with the ChatGPT Codex Responses endpoint, authenticated through `codex login`.
 
 ## Run published images
@@ -19,7 +19,8 @@ ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main
 ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:main
 ```
 
-The gateway image is stock Praxis with this repository's routes built in.
+The gateway image is Praxis AI, built from source with this repository's
+filters, and with its routes built in.
 
 Client API-key authentication is required by default. Create and export a
 client API key (at least 32 bytes), initialize the Podman secrets, then

@@ -1,0 +1,16 @@
+[package]
+name = "praxis-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# praxis-ai's minimum.
+rust-version = "1.96"
+
+[dependencies]
+# cgwalters-forge/ai is praxis-ai with changes proposed for upstream: the
+# public token.* metadata keys, token.model, and a token_rate_limit fix for
+# two instances on one request.
+praxis-ai = { package = "praxis-ai-proxy", git = "https://github.com/cgwalters-forge/ai", rev = "1f0b72d624fcdddec9c74a3a08b14836936131c0", default-features = false, features = ["openai-responses", "token-rate-limit-filter"] }
+praxis-core = { package = "praxis-proxy-core", version = "0.7" }
+praxis-filter = { package = "praxis-proxy-filter", version = "0.7", default-features = false }
+tracing = "0.1"

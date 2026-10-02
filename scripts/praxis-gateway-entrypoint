@@ -26,4 +26,4 @@ case "${PRAXIS_ANTHROPIC_GATEWAY:-disabled}" in
         exit 2
         ;;
 esac
-exec praxis-ai --config "$config" "$@"
+exec praxis-gateway --config "$config" "$@"

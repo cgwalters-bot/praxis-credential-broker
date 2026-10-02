@@ -12,8 +12,9 @@ client -> Praxis (gateway image) -> credential-proxy -> fixed chatgpt.com Codex 
                                  provider-codex
 ```
 
-Praxis is the stock Praxis AI binary with this repository's routes baked into
-the image; the optional Anthropic routes on the same listener are described
+Praxis is `praxis-gateway` (`crates/praxis-gateway`): Praxis AI built from
+source as a library, with its full filter registry plus this repository's own
+filters, and with this repository's routes baked into the image; the optional Anthropic routes on the same listener are described
 [below](#anthropic-messages-gateway).
 
 There are three credential classes:
@@ -100,7 +101,7 @@ does not prompt for, remove, or otherwise modify an existing client secret.
 The optional Anthropic gateway (`PRAXIS_ANTHROPIC_GATEWAY=enabled`, strictly
 `enabled` or `disabled`, default `disabled`) serves Claude Code in gateway
 mode with a Claude subscription OAuth token from `claude setup-token`. It is
-plain stock Praxis configuration, with no broker code involved, served by the
+plain Praxis configuration, with no broker code involved, served by the
 same Praxis listener as Responses and selected by path prefix:
 
 ```text
@@ -114,7 +115,7 @@ Claude Code         -> /v1/messages        -> api.anthropic.com (client's own OA
 ### Gateway image and route table
 
 `Containerfile.gateway` builds `ghcr.io/cgwalters-bot/praxis-credential-broker-gateway`
-from the pinned stock Praxis image with `praxis.yaml`, `praxis-anthropic.yaml`
+from source with `praxis.yaml`, `praxis-anthropic.yaml`
 and `scripts/praxis-gateway-entrypoint` baked in, so a deployment needs the
 image, its secrets and a published port, and nothing from a checkout. The
 entrypoint runs `praxis.yaml` by default, or `praxis-anthropic.yaml` when
@@ -480,8 +481,12 @@ containers with `podman create --secret`.
 
 ## Pinned dependencies and publishing
 
-Stock Praxis, the base of the gateway image, is pinned in `Containerfile.gateway` to
-`ghcr.io/praxis-proxy/ai@sha256:ccd46f8772eebcbde2f41ad35c3234d23463b8314a5865083e32baf31eddd1a8`.
+The gateway builds Praxis AI from cgwalters-forge/ai and Praxis core from
+cgwalters-forge/praxis, both pinned by commit in `Cargo.toml` and locked in
+`Cargo.lock`, with the `openai-responses` and experimental
+`token-rate-limit-filter` features. The forks carry changes written to go
+upstream; see their merged pull requests. `Containerfile.gateway` builds it
+like upstream's own image, on Alpine.
 The Codex provider uses the official `codex-login` source at
 `0dfb28edb9305fcae4ab006fb6b7b196cbdbac28`.
 
