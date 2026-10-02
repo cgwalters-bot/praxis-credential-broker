@@ -7,10 +7,29 @@ license.workspace = true
 rust-version = "1.96"
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+hex = "0.4"
+http.workspace = true
+jsonwebtoken = "9"
 # cgwalters-forge/ai is praxis-ai with changes proposed for upstream: the
 # public token.* metadata keys, token.model, and a token_rate_limit fix for
 # two instances on one request.
 praxis-ai = { package = "praxis-ai-proxy", git = "https://github.com/cgwalters-forge/ai", rev = "1f0b72d624fcdddec9c74a3a08b14836936131c0", default-features = false, features = ["openai-responses", "token-rate-limit-filter"] }
+praxis-ai-filters = { git = "https://github.com/cgwalters-forge/ai", rev = "1f0b72d624fcdddec9c74a3a08b14836936131c0", default-features = false }
 praxis-core = { package = "praxis-proxy-core", version = "0.7" }
 praxis-filter = { package = "praxis-proxy-filter", version = "0.7", default-features = false }
+rand = "0.9"
+# praxis-ai's version; the TLS provider is the one praxis-ai installs.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = { package = "yaml_serde", version = "0.10" }
+sha2 = "0.10"
+tokio.workspace = true
 tracing = "0.1"
+
+[dev-dependencies]
+axum = "0.8"
+base64 = "0.22"
+tempfile = "3"
