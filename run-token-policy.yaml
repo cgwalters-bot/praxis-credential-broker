@@ -1,0 +1,25 @@
+# Which GitHub Actions jobs may register runs, and so use the broker's own
+# credentials (the "injected" routes in praxis.yaml). The gateway reads it
+# from /etc/praxis-credential-broker/run-token-policy.yaml; without that
+# file no run can register, and only pass-through requests are served.
+#
+# This example matches no token: copy it, name the workflows and the
+# repository or owner ids that may register runs, and mount the copy there
+# (PRAXIS_RUN_TOKEN_POLICY for native-pod.sh, a drop-in for Quadlet).
+#
+# Exact job_workflow_ref claims that may register runs.
+workflows:
+  - "example-owner/example-repo/.github/workflows/agent.yml@refs/heads/main"
+# Pin the repository (or owner) by id: names can be re-registered.
+repository_ids: [0]
+# Optional, with these defaults:
+# owner_ids: []
+# entry_workflows: only the job's own workflow
+# events: [workflow_dispatch]
+# audience: praxis-credential-broker
+# jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+# How long a run lasts. Past 6h, also lengthen the window of the per-run caps
+# (the `run` rules in praxis.yaml), or the cap starts sliding mid-run.
+# max_secs: 21600
+# Requests of one run in flight at once.
+# concurrency: 4

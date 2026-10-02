@@ -6,6 +6,9 @@ mod filter;
 mod oidc;
 mod runs;
 
+#[cfg(test)]
+mod integration_tests;
+
 use filter::RunTokenFilter;
 use praxis_filter::{FilterFactory, FilterRegistry, SecurityClass};
 use std::sync::Arc;
