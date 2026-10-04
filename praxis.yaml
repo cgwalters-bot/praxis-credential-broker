@@ -7,6 +7,7 @@
 #   /anthropic/v1/messages             Anthropic Messages, with
 #   /anthropic/v1/messages/count_tokens    exact paths only
 #   /v1/runs (prefix)                  run registration, answered by run_token
+#   /usage (exact), GET                local broker usage, answered by run_token
 #
 # Each route that reaches a provider has a credential mode, given per
 # cluster in run_token's `credentials` below:
@@ -122,6 +123,8 @@ filter_chains:
           - path_prefix: "/v1/responses"
             cluster: inference-backend
           - path_prefix: "/v1/runs"
+            cluster: run-endpoints
+          - path: "/usage"
             cluster: run-endpoints
           - path: "/anthropic/v1/messages"
             headers:
@@ -307,7 +310,7 @@ filter_chains:
             endpoints: ["api.anthropic.com:443"]
             tls:
               sni: "api.anthropic.com"
-          # Never connected to: run_token answers every /v1/runs request.
+          # Never connected to: run_token answers /v1/runs and /usage locally.
           - name: run-endpoints
             endpoints: ["127.0.0.1:9"]
 # The Responses filter makes Praxis read each request body in full before any
