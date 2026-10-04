@@ -5,6 +5,7 @@
 mod filter;
 mod oidc;
 mod runs;
+mod usage;
 
 #[cfg(test)]
 mod integration_tests;

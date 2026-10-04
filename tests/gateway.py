@@ -145,6 +145,9 @@ ANTHROPIC_CASES = [(f"/anthropic: {name}", "POST", "/anthropic" + path, *rest)
 # Responses and the run endpoints next to /anthropic, and every way found to
 # cross from one prefix into another.
 SHARED_CASES = [
+    ("local usage without authentication", "GET", "/usage", [], 200, None),
+    ("local usage wrong method", "POST", "/usage", [], 405, None),
+    ("usage route is exact", "GET", "/usage/", [], 404, None),
     ("Responses with a run token", "POST", "/v1/responses", [B], 200, RESPONSES),
     ("Responses with a run token in x-run-token", "POST", "/v1/responses", [R], 200, RESPONSES),
     ("Responses without a run token", "POST", "/v1/responses", [], 401, None),
@@ -202,12 +205,20 @@ DENY_BODIES = {
 
 # What each fake Messages upstream reports, which token_count meters.
 MESSAGES_USAGE = {"input_tokens": 40, "cache_read_input_tokens": 20, "output_tokens": 30}
+USAGE_HEADERS = json.loads((TESTDATA / "usage-headers.json").read_text())
 
 
 class Upstream(BaseHTTPRequestHandler):
     """Records what the gateway forwards and answers like the Messages API."""
 
     protocol_version = "HTTP/1.1"
+
+    def end_headers(self):
+        provider = "codex" if self.server.cluster == RESPONSES else "anthropic"
+        for name, value in USAGE_HEADERS[provider].items():
+            if name.startswith(("anthropic-ratelimit-unified-", "x-codex-")):
+                self.send_header(name, value)
+        super().end_headers()
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length") or 0))
@@ -481,6 +492,37 @@ def run_stream(port, seen, check, run_token):
         })
 
 
+def run_usage(port, seen, check, run_token):
+    """The local snapshot exposes broker totals and typed window observations."""
+    before = len(seen)
+    resp = request(port, "/usage", [], b"", method="GET")
+    text = resp.read().decode()
+    usage = json.loads(text)
+    check.report("local broker usage snapshot", {
+        "status": resp.status == 200,
+        "upstream contacted": len(seen) == before,
+        "schema": usage["schema"] == "praxis-broker-usage/v1",
+        "no Anthropic counts": usage["anthropic"]["counts"]["tokens"]["total"] > 0,
+        "Anthropic 5h": usage["anthropic"]["unified_5h"]["utilization"] == 0.42,
+        "Anthropic 7d": usage["anthropic"]["unified_7d"]["status"] == "allowed_warning",
+        "Codex primary": usage["codex"]["primary"]["used_percent"] == 42.5,
+        "Codex secondary": usage["codex"]["secondary"]["window_minutes"] == 10080,
+        "observation time": usage["codex"]["primary"]["observed_at"] > 0,
+        "secret in snapshot": not check.leaks(text) and run_token not in text and "SYNTHETIC" not in text,
+    })
+    for path, headers in [
+        ("/anthropic/v1/messages", [C]),
+        ("/anthropic/v1/messages/count_tokens", [P, ("x-run-token", run_token)]),
+    ]:
+        resp = request(port, path, headers,
+                       b'{"model":"claude-synthetic","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}')
+        resp.read()
+    resp = request(port, "/usage", [], b"", method="GET")
+    check.report("pass-through and count_tokens leave broker usage unchanged", {
+        "snapshot changed": json.loads(resp.read()) == usage,
+    })
+
+
 def run_body_limits(port, seen, check, run_token):
     """Bodies up to the Messages API limit are forwarded, larger ones are not."""
     head = b'{"model":"claude-synthetic","max_tokens":1,"messages":[{"role":"user","content":"'
@@ -616,6 +658,7 @@ def main():
             run_stream(praxis_port, seen, check, run_token)
             run_body_limits(praxis_port, seen, check, run_token)
             run_h2c(praxis_port, seen, check, run_token)
+            run_usage(praxis_port, seen, check, run_token)
             logs = podman("logs", CONTAINER)
             logs = re.sub(r"\x1b\[[0-9;]*m", "", logs.stdout + logs.stderr)
             inspect = podman("inspect", CONTAINER).stdout

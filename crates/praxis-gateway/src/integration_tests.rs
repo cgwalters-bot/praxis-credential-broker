@@ -89,17 +89,37 @@ fn sse(events: Vec<String>) -> Response<Body> {
             yield Ok::<_, std::io::Error>(bytes::Bytes::from(event));
         }
     };
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    window_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    )
 }
 
 fn json_response(value: &Value) -> Response<Body> {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(value.to_string()))
-        .unwrap()
+    window_headers(
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap(),
+    )
+}
+
+fn window_headers(mut response: Response<Body>) -> Response<Body> {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("../testdata/usage-headers.json")).unwrap();
+    for provider in ["anthropic", "codex"] {
+        for (name, value) in fixtures[provider].as_object().unwrap() {
+            if name.starts_with("anthropic-ratelimit-unified-") || name.starts_with("x-codex-") {
+                response.headers_mut().insert(
+                    http::HeaderName::try_from(name.as_str()).unwrap(),
+                    value.as_str().unwrap().parse().unwrap(),
+                );
+            }
+        }
+    }
+    response
 }
 
 async fn fake_responses(
@@ -382,6 +402,77 @@ impl Harness {
     /// An injected Messages request: the placeholder and a run token.
     async fn injected(&self, token: Option<&str>) -> (StatusCode, String) {
         self.message(PLACEHOLDER, token).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broker_usage_is_local_and_only_observes_injected_inference() {
+    let h = Harness::start(false, |_| {}).await;
+    let response = h.call(Method::GET, "/usage", &[], None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let empty: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(empty["schema"], "praxis-broker-usage/v1");
+    assert!(empty["anthropic"]["unified_5h"].is_null());
+    assert!(empty["codex"]["primary"].is_null());
+    for (method, path, status) in [
+        (Method::POST, "/usage", StatusCode::METHOD_NOT_ALLOWED),
+        (Method::GET, "/usage/", StatusCode::NOT_FOUND),
+        (Method::GET, "/usagex", StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(h.call(method, path, &[], None).await.status(), status);
+    }
+    assert_eq!(h.upstream.calls(), 0);
+    assert_eq!(h.message(CALLER_OAUTH, None).await.0, StatusCode::OK);
+    let response = h.call(Method::GET, "/usage", &[], None).await;
+    let after: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(after, empty);
+
+    let h = Harness::with_policy().await;
+    let token = h.run(42).await;
+    let count = h
+        .call(
+            Method::POST,
+            "/anthropic/v1/messages/count_tokens",
+            &[("authorization", PLACEHOLDER), ("x-run-token", &token)],
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(count.status(), StatusCode::OK);
+    count.bytes().await.unwrap();
+    let response = h.call(Method::GET, "/usage", &[], None).await;
+    let after: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert!(after["anthropic"]["unified_5h"].is_null());
+    assert_eq!(after["anthropic"]["counts"]["requests"], 0);
+    assert_eq!(h.respond(Some(&token), "", false).await.0, StatusCode::OK);
+    assert_eq!(h.injected(Some(&token)).await.0, StatusCode::OK);
+    let calls = h.upstream.calls();
+    let response = h.call(Method::GET, "/usage?ignored=true", &[], None).await;
+    let after: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(h.upstream.calls(), calls);
+    assert_eq!(after["anthropic"]["counts"]["requests"], 1);
+    assert_eq!(
+        after["anthropic"]["counts"]["tokens"]["total"],
+        MESSAGES_TOTAL
+    );
+    assert_eq!(after["codex"]["counts"]["requests"], 1);
+    assert_eq!(after["codex"]["counts"]["tokens"]["total"], RESPONSES_TOTAL);
+    assert_eq!(after["anthropic"]["unified_5h"]["utilization"], 0.42);
+    assert_eq!(
+        after["anthropic"]["unified_7d"]["status"],
+        "allowed_warning"
+    );
+    assert_eq!(after["codex"]["primary"]["used_percent"], 42.5);
+    assert_eq!(after["codex"]["secondary"]["window_minutes"], 10080);
+    assert!(after["codex"]["primary"]["observed_at"].as_u64().unwrap() > 0);
+    let serialized = after.to_string();
+    for secret in [
+        token.as_str(),
+        BROKER_TOKEN,
+        CALLER_OAUTH,
+        "SYNTHETIC-SECRET",
+        "SYNTHETIC-PROMPT",
+    ] {
+        assert!(!serialized.contains(secret));
     }
 }
 
