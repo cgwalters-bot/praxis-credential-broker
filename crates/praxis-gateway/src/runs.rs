@@ -37,7 +37,7 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    fn add(&mut self, other: &Tokens) {
+    pub(crate) fn add(&mut self, other: &Tokens) {
         self.input = self.input.saturating_add(other.input);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.output = self.output.saturating_add(other.output);

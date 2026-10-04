@@ -35,6 +35,7 @@
 use crate::{
     oidc::{DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy},
     runs::{Admission, Limits, Refusal, RegisterError, RunKey, Runs, TOKEN_PREFIX, Tokens, Usage},
+    usage::{BrokerUsage, Provider},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -195,6 +196,7 @@ enum RunEndpoints {
 
 pub struct RunTokenFilter {
     runs: Arc<Runs>,
+    usage: Arc<BrokerUsage>,
     token_headers: Vec<HeaderName>,
     public_paths: HashSet<String>,
     usage_free_paths: HashSet<String>,
@@ -205,6 +207,8 @@ pub struct RunTokenFilter {
 /// What a request was admitted as, for its usage once the response ends.
 struct Metered {
     mode: CredentialMode,
+    provider: Option<Provider>,
+    success: bool,
     /// Holds the run's concurrency slot until the response ends.
     admission: Option<Admission>,
 }
@@ -239,6 +243,7 @@ impl RunTokenFilter {
         };
         Ok(Box::new(Self {
             runs: Runs::named(&config.registry),
+            usage: BrokerUsage::named(&config.registry),
             token_headers,
             public_paths: config.public_paths,
             usage_free_paths: config.usage_free_paths,
@@ -456,7 +461,7 @@ impl HttpFilter for RunTokenFilter {
     }
 
     fn produces_terminal_response(&self) -> bool {
-        !matches!(self.endpoints, RunEndpoints::Absent)
+        true
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -468,6 +473,13 @@ impl HttpFilter for RunTokenFilter {
         ctx: &mut HttpFilterContext<'_>,
     ) -> Result<FilterAction, FilterError> {
         let path = ctx.request.uri.path();
+        if path == "/usage" {
+            return Ok(if ctx.request.method == Method::GET {
+                json(200, &self.usage.snapshot())
+            } else {
+                reject(405, "method not allowed\n")
+            });
+        }
         let usage_free = self.usage_free_paths.contains(path);
         if path == RUNS_PATH || path.starts_with("/v1/runs/") {
             return Ok(match &self.endpoints {
@@ -547,7 +559,17 @@ impl HttpFilter for RunTokenFilter {
                 Some(admission)
             }
         };
-        ctx.extensions.insert(Metered { mode, admission });
+        let provider = if mode == CredentialMode::Injected && !usage_free {
+            Provider::for_cluster(ctx.cluster.as_deref())
+        } else {
+            None
+        };
+        ctx.extensions.insert(Metered {
+            mode,
+            provider,
+            success: false,
+            admission,
+        });
         Ok(FilterAction::Continue)
     }
 
@@ -559,12 +581,16 @@ impl HttpFilter for RunTokenFilter {
             .response_header
             .as_ref()
             .is_some_and(|r| r.status.is_success());
-        if let Some(admission) = ctx
-            .extensions
-            .get_mut::<Metered>()
-            .and_then(|metered| metered.admission.as_mut())
-        {
-            admission.success = success;
+        if let Some(metered) = ctx.extensions.get_mut::<Metered>() {
+            metered.success = success;
+            if let Some(admission) = metered.admission.as_mut() {
+                admission.success = success;
+            }
+            if let Some(provider) = metered.provider
+                && let Some(response) = ctx.response_header.as_ref()
+            {
+                self.usage.capture(provider, &response.headers);
+            }
         }
         Ok(FilterAction::Continue)
     }
@@ -581,6 +607,10 @@ impl HttpFilter for RunTokenFilter {
                 warn!("response usage too large for token_count to capture");
             }
             log_usage(ctx, metered.mode, reported.as_ref());
+            if let Some(provider) = metered.provider {
+                self.usage
+                    .settle(provider, reported.as_ref(), metered.success);
+            }
             if let Some(admission) = metered.admission {
                 admission.settle(reported);
             }

@@ -27,6 +27,7 @@ published as `127.0.0.1:18080`:
 | `/anthropic/v1/messages`, `/anthropic/v1/messages/count_tokens` (exact), with the placeholder | `POST` | `anthropic` | injected | the broker's Claude token |
 | the same paths, with any other `Authorization` | `POST` | `anthropic-pass-through` | pass-through | the caller's own |
 | `/v1/runs` (prefix) | see [run tokens](#run-tokens) | answered by `run_token` | | |
+| `/usage` (exact) | `GET` | answered locally by `run_token` | none needed | none |
 
 Any other path gets 404. Upstream, `/anthropic/v1/...` is rewritten to
 `/v1/...` and the query string is kept, so Claude Code uses
@@ -179,7 +180,7 @@ it is when each filter runs, and all of them see the raw path:
    `..`, so with a prefix such as `/anthropic/v1/`, a request for
    `/anthropic/v1/../api/oauth/...` would spend the token on account
    endpoints.
-5. `run_token` answers `/v1/runs`, refuses duplicate `Authorization`
+5. `run_token` answers `/v1/runs` and `/usage`, refuses duplicate `Authorization`
    headers, applies the cluster's credential mode, and removes the run token
    headers (`x-run-token`, and `Authorization` unless the mode is
    pass-through).
@@ -202,7 +203,7 @@ it is when each filter runs, and all of them see the raw path:
    `anthropic` cluster.
 10. `load_balancer` connects to `api.anthropic.com:443` with TLS and SNI, or
     to credential-proxy. The `run-endpoints` cluster, which only exists so
-    that the router routes `/v1/runs` to `run_token`, is never connected
+    that the router routes `/v1/runs` and `/usage` to `run_token`, is never connected
     to.
 
 The 403 bodies are fixed JSON in the Messages error shape and carry neither
@@ -425,6 +426,39 @@ output, and `total`, which the caps count), and `models`, the same
 `tokens` by the model upstream named.
 
 ## Metering and caps
+
+### Broker usage endpoint
+
+`GET /usage` is an **unauthenticated read** on the existing gateway listener:
+anyone who can reach it can read aggregate broker usage and subscription limits.
+It returns `praxis-broker-usage/v1` JSON without contacting a provider or admitting
+a run. Other methods get 405; `/usage/` and other nonexact paths get 404.
+The existing placeholder-deny filter still applies before this local route.
+
+`anthropic.counts` and `codex.counts` contain cumulative `requests` with reported
+usage, `unmetered` successful completed responses without usage, and `tokens` in
+the run-record shape. Counts use the same `reported_usage` from `token_count` as
+run records, for injected inference only. Pass-through, health checks, local
+endpoints and `count_tokens` do not contribute. Incomplete/disconnected responses
+are not settled here; these are observed totals, not rate-limit reservations.
+
+Response headers from injected inference (including upstream errors) update
+`anthropic.unified_5h`, `anthropic.unified_7d`, `codex.primary` and `codex.secondary`.
+Each window is initially null and holds its latest valid observation plus
+`observed_at` (Unix seconds). Anthropic fields are `utilization` (0–1), `reset`
+(Unix seconds) and allowlisted `status` (`allowed`, `allowed_warning`, `rejected`);
+Codex fields are `used_percent` (0–100), `window_minutes` and
+`reset_after_seconds`. Only the corresponding unified-5h/7d and primary/secondary
+header names are parsed. Missing or invalid fields are null in a new observation;
+an entirely absent/invalid window leaves the prior observation and timestamp
+intact. Windows update independently and may be stale; these passive observations
+are neither a fresh provider query nor the broker's configured caps.
+
+The bounded state has two counters and four window slots per named run registry,
+survives configuration reloads, and resets on process restart (`started_at` names
+the start of that state). It stores no credentials, arbitrary headers, prompt
+content, model dimensions or run identifiers. Header fixtures in testdata use
+synthetic values in the provider header shapes.
 
 Subscription inference has no per-token bill, so without a cap only a job's
 timeout bounds what an agent spends. The gateway therefore meters every
