@@ -19,6 +19,7 @@ use praxis_test_utils::{ProxyGuard, free_port, start_proxy_with_registry, test_s
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use serde_yaml::Value as Yaml;
+use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,6 +30,12 @@ const PRAXIS_YAML: &str = include_str!("../../../praxis.yaml");
 /// The per-run cap the tests set, and what each request reserves against it.
 const RUN_MAX_TOKENS: u64 = 150;
 const RUN_RESERVED_TOKENS: u64 = 10;
+/// The operators of the test tokens file: one admitted to Responses only,
+/// one to injected Messages only.
+const OPERATOR: &str = "interactive";
+const OPERATOR_TOKEN: &str = "praxis-operator-SYNTHETIC-OPERATOR-TOKEN";
+const CLAUDE_OPERATOR: &str = "interactive-claude";
+const CLAUDE_OPERATOR_TOKEN: &str = "praxis-operator-SYNTHETIC-CLAUDE-OPERATOR-TOKEN";
 const PLACEHOLDER: &str = "Bearer praxis-substitute:anthropic";
 /// The broker's Claude token, as the tests configure credential_injection.
 const BROKER_TOKEN: &str = "sk-ant-oat01-SYNTHETIC-BROKER-TOKEN";
@@ -245,8 +252,8 @@ struct Harness {
 impl Harness {
     /// Serve praxis.yaml on a free port, every cluster pointed at a fake
     /// upstream of its own, run_token on a registry of its own, the test
-    /// registration policy if `with_policy`, a per-run cap of
-    /// `RUN_MAX_TOKENS`, and `tweak` applied to each filter.
+    /// registration policy and operator tokens file if `with_policy`, a
+    /// per-run cap of `RUN_MAX_TOKENS`, and `tweak` applied to each filter.
     async fn start(with_policy: bool, tweak: impl Fn(&mut Yaml)) -> Self {
         praxis_ai::install_crypto_provider();
         let _ = tracing_subscriber::fmt()
@@ -270,6 +277,22 @@ impl Harness {
             });
             std::fs::write(&policy_file, policy.to_string()).unwrap();
         }
+        let tokens_file = policy.path().join("operator-tokens.yaml");
+        if with_policy {
+            let operator = |name: &str, token: &str, cluster: &str| {
+                json!({
+                    "name": name,
+                    "token_sha256": hex::encode(Sha256::digest(token)),
+                    "clusters": [cluster],
+                    "concurrency": 2,
+                })
+            };
+            let tokens = json!({"operators": [
+                operator(OPERATOR, OPERATOR_TOKEN, RESPONSES),
+                operator(CLAUDE_OPERATOR, CLAUDE_OPERATOR_TOKEN, INJECTED),
+            ]});
+            std::fs::write(&tokens_file, tokens.to_string()).unwrap();
+        }
         let registry = format!("test-{}", hex::encode(rand::random::<[u8; 8]>()));
         let mut config: Yaml = serde_yaml::from_str(PRAXIS_YAML).unwrap();
         let listeners = config["listeners"].as_sequence_mut().unwrap();
@@ -290,6 +313,7 @@ impl Harness {
             if filter["filter"] == "run_token" {
                 filter["registry"] = Yaml::from(registry.clone());
                 filter["registration"]["policy_file"] = Yaml::from(policy_file.to_str().unwrap());
+                filter["operators"]["tokens_file"] = Yaml::from(tokens_file.to_str().unwrap());
             }
             for rule in rules_named(filter, "run") {
                 rule["capacity"] = Yaml::from(RUN_MAX_TOKENS);
@@ -721,6 +745,119 @@ async fn pass_through_forwards_the_callers_credential_and_is_only_metered() {
     let (status, _) = h.message(&auth, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(h.upstream.calls(), n);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_token_is_admitted_for_its_clusters_and_metered_by_name() {
+    let h = Harness::with_policy().await;
+    let broker_usage = async || {
+        let response = h.call(Method::GET, "/usage", &[], None).await;
+        serde_json::from_slice::<Value>(&response.bytes().await.unwrap()).unwrap()
+    };
+    // Listed before it has used anything.
+    assert_eq!(broker_usage().await["operators"][OPERATOR]["requests"], 0);
+
+    let (status, body) = h.respond(Some(OPERATOR_TOKEN), "", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("response.completed"));
+    // Upstream never got the token: credential-proxy adds Codex's.
+    assert_eq!(h.upstream.clusters(), [RESPONSES]);
+    assert_eq!(h.upstream.seen("authorization"), [None]);
+    assert_eq!(h.upstream.seen("x-run-token"), [None]);
+    let usage = broker_usage().await;
+    let counts = json!({
+        "requests": 1,
+        "unmetered": 0,
+        "tokens": {"input": 40, "cache_read": 30, "output": 30, "reasoning": 5, "total": RESPONSES_TOTAL},
+    });
+    assert_eq!(usage["operators"][OPERATOR], counts);
+    assert_eq!(usage["operators"][CLAUDE_OPERATOR]["requests"], 0);
+    assert_eq!(usage["codex"]["counts"], counts);
+    assert!(!usage.to_string().contains(OPERATOR_TOKEN));
+
+    // It is not a run: it reads no run record and finishes nothing.
+    for method in [Method::GET, Method::DELETE] {
+        let (status, _) = h.runs(method, "/v1/runs/self", OPERATOR_TOKEN).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let calls = h.upstream.calls();
+    // Only the clusters its entry names: not the broker's Claude token,
+    // wherever the token is put.
+    let (status, _) = h.injected(Some(OPERATOR_TOKEN)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Nor a provider credential on the pass-through route, in any case.
+    let auth = format!("Bearer {OPERATOR_TOKEN}");
+    for auth in [auth.clone(), auth.to_uppercase()] {
+        let (status, _) = h.message(&auth, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{auth}");
+    }
+    // Only the whole token, and a run token's header takes precedence
+    // over it as over any Authorization.
+    for wrong in [
+        "praxis-operator-",
+        "praxis-operator-SYNTHETIC-OPERATOR-TOKEN-2",
+    ] {
+        let (status, _) = h.respond(Some(wrong), "", true).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{wrong}");
+    }
+    let response = h
+        .call(
+            Method::POST,
+            "/v1/responses",
+            &[("authorization", &auth), ("x-run-token", "praxis-run-0000")],
+            Some(json!({"model": "gpt-test", "input": ""})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        h.upstream.calls(),
+        calls,
+        "refused requests reached upstream"
+    );
+
+    // The per-identity cap is the operator's own: one more request fits
+    // and overshoots it, the next is refused, and a run is not.
+    let (status, _) = h.respond(Some(OPERATOR_TOKEN), "", false).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = h.respond(Some(OPERATOR_TOKEN), "", true).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    let token = h.run(1).await;
+    let (status, _) = h.respond(Some(&token), "", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let usage = broker_usage().await;
+    assert_eq!(usage["operators"][OPERATOR]["requests"], 2);
+    assert_eq!(usage["codex"]["counts"]["requests"], 3);
+    assert_eq!(h.usage(&token).await["requests"], 1);
+
+    // An operator for the broker's Claude token sends its own in
+    // x-run-token, next to the placeholder, and gets only that route.
+    let (status, body) = h.injected(Some(CLAUDE_OPERATOR_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        h.upstream.seen("authorization").last().unwrap().as_deref(),
+        Some(BROKER_AUTHORIZATION)
+    );
+    assert_eq!(h.upstream.seen("x-run-token").last().unwrap(), &None);
+    let (status, _) = h.respond(Some(CLAUDE_OPERATOR_TOKEN), "", true).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let usage = broker_usage().await;
+    assert_eq!(
+        usage["operators"][CLAUDE_OPERATOR]["tokens"]["total"],
+        MESSAGES_TOTAL
+    );
+    assert_eq!(usage["anthropic"]["counts"]["requests"], 1);
+    assert_eq!(usage["operators"][OPERATOR]["requests"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_tokens_file_an_operator_token_is_refused() {
+    let h = Harness::start(false, |_| {}).await;
+    let (status, _) = h.respond(Some(OPERATOR_TOKEN), "", true).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let response = h.call(Method::GET, "/usage", &[], None).await;
+    let usage: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(usage["operators"], json!({}));
+    assert_eq!(h.upstream.calls(), 0);
 }
 
 /// Praxis AI's own startup validation, which the test harness skips,

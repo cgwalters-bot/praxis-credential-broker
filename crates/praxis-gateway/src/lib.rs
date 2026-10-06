@@ -1,9 +1,10 @@
 //! Praxis AI, built with this repository's own filters added to its
-//! registry: `run_token`, for per-run bearer tokens. Usage parsing and the
+//! registry: `run_token`, for per-run bearer tokens and operator tokens. Usage parsing and the
 //! caps, per window and per run, are praxis-ai's own `token_count` and
 //! `token_rate_limit`.
 mod filter;
 mod oidc;
+mod operators;
 mod runs;
 mod usage;
 

@@ -15,6 +15,9 @@ gateway_image=${PRAXIS_GATEWAY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-bro
 # Where the gateway reads the run registration policy (run-token-policy.yaml).
 policy_target=/etc/praxis-credential-broker/run-token-policy.yaml
 policy=
+# And who holds an operator token (operator-tokens.yaml), if anyone.
+operators_target=/etc/praxis-credential-broker/operator-tokens.yaml
+operators=
 if [[ $mode == up ]]; then
     for old in PRAXIS_CLIENT_AUTH_MODE PRAXIS_ANTHROPIC_GATEWAY; do
         if [[ -n ${!old+set} ]]; then
@@ -23,14 +26,18 @@ if [[ $mode == up ]]; then
         fi
     done
     policy=${PRAXIS_RUN_TOKEN_POLICY-}
-    if [[ -n $policy ]]; then
-        [[ -f $policy ]] || { echo "PRAXIS_RUN_TOKEN_POLICY must name your copy of run-token-policy.yaml" >&2; exit 2; }
+    operators=${PRAXIS_OPERATOR_TOKENS-}
+    for mounted in "PRAXIS_RUN_TOKEN_POLICY run-token-policy.yaml $policy" \
+        "PRAXIS_OPERATOR_TOKENS operator-tokens.yaml $operators"; do
+        read -r variable example file <<<"$mounted"
+        [[ -n $file ]] || continue
+        [[ -f $file ]] || { echo "$variable must name your copy of $example" >&2; exit 2; }
         # The gateway runs as 65532, which reads it as "other".
-        [[ $(stat -L -c %A "$policy") == ???????r?? ]] || {
-            echo "PRAXIS_RUN_TOKEN_POLICY must be world-readable (chmod 0644); it holds no secrets" >&2
+        [[ $(stat -L -c %A "$file") == ???????r?? ]] || {
+            echo "$variable must be world-readable (chmod 0644); it holds no secrets" >&2
             exit 2
         }
-    fi
+    done
 fi
 
 mounts() {
@@ -182,6 +189,9 @@ if [[ $mode == up ]]; then
     policy_mount=()
     if [[ -n $policy ]]; then
         policy_mount=(--volume "$(realpath "$policy"):$policy_target:ro,Z")
+    fi
+    if [[ -n $operators ]]; then
+        policy_mount+=(--volume "$(realpath "$operators"):$operators_target:ro,Z")
     fi
     podman create "${common[@]}" --name praxis-credential-broker-praxis --no-healthcheck \
         --secret "$anthropic_secret,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \

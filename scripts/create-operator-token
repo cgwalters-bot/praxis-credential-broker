@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Mint an operator token (see operator-tokens.yaml): write it to TOKEN_FILE,
+# readable only by its owner, and print the entry for the gateway's tokens
+# file, which holds only the token's SHA-256. The token itself is never
+# printed and never on a command line.
+set -euo pipefail
+usage="usage: create-operator-token NAME CLUSTER[,CLUSTER...] [TOKEN_FILE]"
+name=${1:?$usage}
+clusters=${2:?$usage}
+file=${3:-${XDG_CONFIG_HOME:-$HOME/.config}/praxis-credential-broker/operator-token-$name}
+[[ $name =~ ^[a-z0-9-]{1,64}$ ]] || { echo "NAME must be 1 to 64 of a-z, 0-9 and '-'" >&2; exit 2; }
+[[ $clusters =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || { echo "$usage" >&2; exit 2; }
+umask 077
+mkdir -p "$(dirname "$file")"
+# Never replace a token something may still be using, nor write one to
+# anything that is not a new file.
+[[ ! -e $file && ! -L $file ]] || { echo "$file already exists" >&2; exit 1; }
+set -o noclobber
+random=$(openssl rand -hex 32)
+[[ $random =~ ^[0-9a-f]{64}$ ]] || { echo "CSPRNG output was not 64 lowercase hex digits" >&2; exit 1; }
+# No trailing newline: clients send the file's contents as they are.
+printf 'praxis-operator-%s' "$random" > "$file"
+unset random
+# A token nothing names is of no use, and would block minting it again.
+hash=$(sha256sum < "$file") || { rm -f "$file"; exit 1; }
+echo "Wrote the token to $file; add this entry to the gateway's operator-tokens.yaml:" >&2
+cat <<ENTRY
+  - name: "$name"
+    token_sha256: "${hash%% *}"
+    clusters: [${clusters//,/, }]
+ENTRY

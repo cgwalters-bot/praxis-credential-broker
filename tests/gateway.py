@@ -41,6 +41,9 @@ CONTAINER = "praxis-credential-broker-test-gateway"
 SECRET = "praxis-credential-broker-test-anthropic-oauth"
 TOKEN_FILE = "/run/secrets/anthropic/oauth-token"
 POLICY_FILE = "/etc/praxis-credential-broker/run-token-policy.yaml"
+OPERATORS_FILE = "/etc/praxis-credential-broker/operator-tokens.yaml"
+# The one operator of the test tokens file, for Responses only.
+OPERATOR_TOKEN = "praxis-operator-SYNTHETIC-OPERATOR-TOKEN-0123456789abcdef"
 TOKEN = "sk-ant-oat01-SYNTHETIC-TEST-TOKEN-0123456789abcdef"
 PLACEHOLDER = "Bearer praxis-substitute:anthropic"
 INJECTED = ["Bearer " + TOKEN]
@@ -72,6 +75,7 @@ P = ("Authorization", PLACEHOLDER)
 R = ("x-run-token", RUN_TOKEN)
 C = ("Authorization", CLIENT_OAUTH)
 B = ("Authorization", "Bearer " + RUN_TOKEN)
+O = ("Authorization", "Bearer " + OPERATOR_TOKEN)
 
 # (name, method, path, request headers as pairs, expected status, cluster)
 # A request for a cluster must reach that cluster's upstream exactly once and
@@ -151,6 +155,12 @@ SHARED_CASES = [
     ("Responses with a run token", "POST", "/v1/responses", [B], 200, RESPONSES),
     ("Responses with a run token in x-run-token", "POST", "/v1/responses", [R], 200, RESPONSES),
     ("Responses without a run token", "POST", "/v1/responses", [], 401, None),
+    ("Responses with an operator token", "POST", "/v1/responses", [O], 200, RESPONSES),
+    ("Responses with an operator token in x-run-token", "POST", "/v1/responses",
+     [("x-run-token", OPERATOR_TOKEN)], 200, RESPONSES),
+    ("Responses with an operator token nobody holds", "POST", "/v1/responses",
+     [("authorization", "Bearer " + OPERATOR_TOKEN + "0")], 401, None),
+    ("operator token as a pass-through credential", "POST", "/anthropic/v1/messages", [O], 400, None),
     ("Responses with another bearer token", "POST", "/v1/responses", [C], 401, None),
     ("Responses with a query string", "POST", "/v1/responses?stream=true", [B], 200, RESPONSES),
     ("Responses keeps a client anthropic-beta and x-api-key", "POST", "/v1/responses",
@@ -359,12 +369,16 @@ def check_filter_order(check):
 
 
 def container_args(config_path, policy_path, with_secret=True):
-    """The praxis container's settings in native-pod.sh, on the host network."""
+    """The praxis container's settings in native-pod.sh, on the host network,
+    with the operator tokens file next to the policy if there is one."""
+    operators_path = policy_path.with_name("operator-tokens.yaml")
     args = ["--network", "host", "--user", "65532:65532", "--read-only", "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "--no-healthcheck",
             "--volume", f"{config_path}:/etc/praxis/praxis.yaml:ro,Z",
             "--volume", f"{policy_path}:{POLICY_FILE}:ro,Z"]
+    if operators_path.exists():
+        args += ["--volume", f"{operators_path}:{OPERATORS_FILE}:ro,Z"]
     if with_secret:
         args += ["--secret", f"{SECRET},target={TOKEN_FILE},uid=65532,gid=65532,mode=0400"]
     return args + [IMAGE]
@@ -408,6 +422,7 @@ def forwarded_checks(cluster, path, headers, body, hit, run_token):
         "body changed": hit["body_sha256"] == hashlib.sha256(body).hexdigest(),
         "token sent to the wrong upstream": cluster == ANTHROPIC or TOKEN not in str(hit["headers"]),
         "run token forwarded": run_token not in str(hit["headers"]),
+        "operator token forwarded": OPERATOR_TOKEN not in str(hit["headers"]),
         "x-run-token forwarded": "x-run-token" not in up,
     }
     if cluster == ANTHROPIC:
@@ -508,6 +523,9 @@ def run_usage(port, seen, check, run_token):
         "Codex primary": usage["codex"]["primary"]["used_percent"] == 42.5,
         "Codex secondary": usage["codex"]["secondary"]["window_minutes"] == 10080,
         "observation time": usage["codex"]["primary"]["observed_at"] > 0,
+        # Its two successful Responses requests, and no other caller's.
+        "operator not counted by name": {name: counts["requests"] + counts["unmetered"]
+                                         for name, counts in usage["operators"].items()} == {"interactive": 2},
         "secret in snapshot": not check.leaks(text) and run_token not in text and "SYNTHETIC" not in text,
     })
     for path, headers in [
@@ -643,7 +661,11 @@ def main():
         policy_path = Path(tmp) / "run-token-policy.yaml"
         policy_path.write_text(json.dumps({"workflows": [WORKFLOW], "repository_ids": [7],
                                            "jwks_url": f"http://127.0.0.1:{jwks.server_address[1]}/jwks"}))
-        for path in (config_path, policy_path):
+        operators_path = Path(tmp) / "operator-tokens.yaml"
+        operators_path.write_text(json.dumps({"operators": [{
+            "name": "interactive", "token_sha256": hashlib.sha256(OPERATOR_TOKEN.encode()).hexdigest(),
+            "clusters": [RESPONSES]}]}))
+        for path in (config_path, policy_path, operators_path):
             path.chmod(0o644)
         # Podman 4 (Ubuntu's, in CI) has no secret create --replace.
         podman("secret", "rm", "--ignore", SECRET, check=False)
@@ -653,7 +675,7 @@ def main():
             podman("run", "--detach", "--name", CONTAINER, *container_args(config_path, policy_path))
             wait_ready(praxis_port, CONTAINER)
             run_token = register_run(praxis_port, 1)
-            check.secrets.append(run_token)
+            check.secrets += [run_token, OPERATOR_TOKEN]
             run_cases(praxis_port, seen, check, run_token, ANTHROPIC_CASES + SHARED_CASES)
             run_stream(praxis_port, seen, check, run_token)
             run_body_limits(praxis_port, seen, check, run_token)

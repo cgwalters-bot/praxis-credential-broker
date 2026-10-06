@@ -18,7 +18,10 @@
 //!   It is admitted against the run's lifetime and concurrency, and the run
 //!   becomes the request's [`AuthenticatedIdentity`], so that a
 //!   `token_rate_limit` rule later in the chain (`key:
-//!   authenticated_subject`) caps each run's tokens.
+//!   authenticated_subject`) caps each run's tokens. With `operators`
+//!   configured, an operator token (see [`crate::operators`]) in that
+//!   header is admitted instead, for the clusters its entry names, as an
+//!   identity of its own.
 //! - `pass-through`: the caller's own `Authorization` goes upstream as it
 //!   is, and no run token is needed or looked for.
 //!
@@ -34,6 +37,7 @@
 //! first, and the two must agree on which route a request takes.
 use crate::{
     oidc::{DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy},
+    operators::{self, Operators},
     runs::{Admission, Limits, Refusal, RegisterError, RunKey, Runs, TOKEN_PREFIX, Tokens, Usage},
     usage::{BrokerUsage, Provider},
 };
@@ -145,6 +149,16 @@ struct Config {
     usage_cors_origins: HashSet<String>,
     /// Serve the run endpoints on this chain.
     registration: Option<RegistrationConfig>,
+    /// Admit operator tokens to injected routes.
+    operators: Option<OperatorsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorsConfig {
+    /// Who holds an operator token, and for which clusters (see
+    /// [`crate::operators`]). Without this file there are none.
+    tokens_file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +238,14 @@ pub struct RunTokenFilter {
     credentials: HashMap<String, CredentialMode>,
     usage_cors_origins: HashSet<String>,
     endpoints: RunEndpoints,
+    operators: Operators,
+}
+
+/// Who an injected request was admitted for. Either holds one of its
+/// holder's concurrency slots until the response ends.
+enum Caller {
+    Run(Admission),
+    Operator(operators::Slot),
 }
 
 /// What a request was admitted as, for its usage once the response ends.
@@ -231,8 +253,8 @@ struct Metered {
     mode: CredentialMode,
     provider: Option<Provider>,
     success: bool,
-    /// Holds the run's concurrency slot until the response ends.
-    admission: Option<Admission>,
+    /// Whose request it is, unless it is pass-through.
+    caller: Option<Caller>,
 }
 
 impl RunTokenFilter {
@@ -263,15 +285,31 @@ impl RunTokenFilter {
                 None => RunEndpoints::Unconfigured,
             },
         };
+        let injected = config
+            .credentials
+            .iter()
+            .filter(|(_, mode)| **mode == CredentialMode::Injected)
+            .map(|(cluster, _)| cluster.as_str())
+            .collect();
+        let operators = match &config.operators {
+            None => Operators::default(),
+            Some(operators) => Operators::load(&operators.tokens_file, &injected)
+                .map_err(|e| format!("{FILTER_NAME}: {e}"))?,
+        };
+        let usage = BrokerUsage::named(&config.registry);
+        for operator in operators.names() {
+            usage.declare_operator(operator);
+        }
         Ok(Box::new(Self {
             runs: Runs::named(&config.registry),
-            usage: BrokerUsage::named(&config.registry),
+            usage,
             token_headers,
             public_paths: config.public_paths,
             usage_free_paths: config.usage_free_paths,
             credentials: config.credentials,
             usage_cors_origins: config.usage_cors_origins,
             endpoints,
+            operators,
         }))
     }
 
@@ -292,6 +330,35 @@ impl RunTokenFilter {
 
     fn run_of(&self, headers: &HeaderMap, now: Instant) -> Option<RunKey> {
         self.runs.authenticate(self.token(headers)?.1, now)
+    }
+
+    /// Admit an injected request for `cluster` by the token it carries: an
+    /// operator's, or else an active run's. The subject is who it is for.
+    fn admit(&self, headers: &HeaderMap, cluster: &str) -> Result<(String, Caller), FilterAction> {
+        let unauthenticated = || reject(401, "client authentication required\n");
+        let (_, token) = self.token(headers).ok_or_else(unauthenticated)?;
+        if let Some(operator) = self.operators.authenticate(token) {
+            return match operator.admit(cluster) {
+                Ok(slot) => Ok((operator.subject(), Caller::Operator(slot))),
+                Err(operators::Refusal::Forbidden) => {
+                    Err(reject(403, "this operator token is not for this route\n"))
+                }
+                Err(operators::Refusal::Busy) => Err(reject(
+                    429,
+                    "too many requests in flight for this operator\n",
+                )),
+            };
+        }
+        let now = Instant::now();
+        let key = self
+            .runs
+            .authenticate(token, now)
+            .ok_or_else(unauthenticated)?;
+        match self.runs.admit(key, now) {
+            Ok(admission) => Ok((key.subject(), Caller::Run(admission))),
+            Err(Refusal::Closed) => Err(unauthenticated()),
+            Err(Refusal::Busy) => Err(reject(429, "too many requests in flight for this run\n")),
+        }
     }
 
     /// Answer `/usage`: the broker's usage, or the preflight a browser sends
@@ -561,12 +628,10 @@ impl HttpFilter for RunTokenFilter {
                 .extend(self.token_headers.iter().cloned());
             return Ok(FilterAction::Continue);
         }
-        let Some(mode) = ctx
-            .cluster
-            .as_deref()
-            .and_then(|cluster| self.credentials.get(cluster))
-            .copied()
-        else {
+        let Some((cluster, mode)) = ctx.cluster.as_deref().and_then(|cluster| {
+            let mode = self.credentials.get(cluster)?;
+            Some((cluster, *mode))
+        }) else {
             warn!(cluster = ?ctx.cluster, "no credential mode for this route");
             return Ok(reject(500, "internal error\n"));
         };
@@ -575,44 +640,50 @@ impl HttpFilter for RunTokenFilter {
             !(mode == CredentialMode::PassThrough && **name == header::AUTHORIZATION)
         });
         ctx.request_headers_to_remove.extend(remove.cloned());
-        let admission = match mode {
+        let caller = match mode {
             CredentialMode::PassThrough => {
-                // Never send a run token to the provider as a credential, in
-                // any spelling of the scheme.
-                let authorization = ctx.request.headers.get(header::AUTHORIZATION);
-                if authorization.is_some_and(|v| {
-                    v.as_bytes()
-                        .to_ascii_lowercase()
-                        .windows(TOKEN_PREFIX.len())
-                        .any(|w| w == TOKEN_PREFIX.as_bytes())
-                }) {
+                // Never send a run or operator token to the provider as a
+                // credential, in any spelling of the scheme.
+                let authorization = ctx
+                    .request
+                    .headers
+                    .get(header::AUTHORIZATION)
+                    .map(|v| v.as_bytes().to_ascii_lowercase())
+                    .unwrap_or_default();
+                let holds = |prefix: &str| {
+                    authorization
+                        .windows(prefix.len())
+                        .any(|w| w == prefix.as_bytes())
+                };
+                if holds(TOKEN_PREFIX) {
                     return Ok(reject(400, "a run token belongs in x-run-token here\n"));
+                }
+                if holds(operators::TOKEN_PREFIX) {
+                    return Ok(reject(
+                        400,
+                        "an operator token is not a provider credential\n",
+                    ));
                 }
                 None
             }
             CredentialMode::Injected => {
-                let Some(key) = self.run_of(&ctx.request.headers, Instant::now()) else {
-                    return Ok(reject(401, "client authentication required\n"));
-                };
-                let mut admission = match self.runs.admit(key, Instant::now()) {
-                    Ok(admission) => admission,
-                    Err(Refusal::Closed) => {
-                        return Ok(reject(401, "client authentication required\n"));
-                    }
-                    Err(Refusal::Busy) => {
-                        return Ok(reject(429, "too many requests in flight for this run\n"));
-                    }
+                let (subject, mut caller) = match self.admit(&ctx.request.headers, cluster) {
+                    Ok(admitted) => admitted,
+                    Err(refusal) => return Ok(refusal),
                 };
                 let identity = AuthenticatedIdentity::new(
-                    key.subject(),
+                    subject,
                     iter::empty(),
                     iter::empty(),
                     iter::empty(),
                 )
-                .ok_or_else(|| format!("{FILTER_NAME}: empty run subject"))?;
+                .ok_or_else(|| format!("{FILTER_NAME}: empty subject"))?;
                 ctx.extensions.insert(identity);
-                admission.usage_free = usage_free;
-                Some(admission)
+                match &mut caller {
+                    Caller::Run(admission) => admission.usage_free = usage_free,
+                    Caller::Operator(slot) => slot.usage_free = usage_free,
+                }
+                Some(caller)
             }
         };
         let provider = if mode == CredentialMode::Injected && !usage_free {
@@ -624,7 +695,7 @@ impl HttpFilter for RunTokenFilter {
             mode,
             provider,
             success: false,
-            admission,
+            caller,
         });
         Ok(FilterAction::Continue)
     }
@@ -639,7 +710,7 @@ impl HttpFilter for RunTokenFilter {
             .is_some_and(|r| r.status.is_success());
         if let Some(metered) = ctx.extensions.get_mut::<Metered>() {
             metered.success = success;
-            if let Some(admission) = metered.admission.as_mut() {
+            if let Some(Caller::Run(admission)) = metered.caller.as_mut() {
                 admission.success = success;
             }
             if let Some(provider) = metered.provider
@@ -667,8 +738,14 @@ impl HttpFilter for RunTokenFilter {
                 self.usage
                     .settle(provider, reported.as_ref(), metered.success);
             }
-            if let Some(admission) = metered.admission {
-                admission.settle(reported);
+            match metered.caller {
+                Some(Caller::Run(admission)) => admission.settle(reported),
+                Some(Caller::Operator(slot)) if !slot.usage_free => self.usage.settle_operator(
+                    slot.operator().name(),
+                    reported.as_ref(),
+                    metered.success,
+                ),
+                Some(Caller::Operator(_)) | None => {}
             }
         }
         Ok(FilterAction::Continue)
@@ -687,6 +764,16 @@ mod tests {
             ("{}", false),
             ("credentials: {a: passthrough}", false),
             ("credentials: {a: pass_through}", false),
+            // No tokens file, no operators; nor is anything else there.
+            (
+                "{credentials: {a: injected}, operators: {tokens_file: /nonexistent/tokens}}",
+                true,
+            ),
+            ("{credentials: {a: injected}, operators: {}}", false),
+            (
+                "{credentials: {a: injected}, operators: {tokens_file: /dev/null, tokens: []}}",
+                false,
+            ),
         ];
         for (yaml, ok) in cases {
             let config: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();

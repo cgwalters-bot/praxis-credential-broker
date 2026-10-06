@@ -1,0 +1,25 @@
+# Who may use the broker's own credentials (the "injected" routes in
+# praxis.yaml) without a registered run: people, each with a long-lived
+# operator token, such as for an interactive agent on a workstation. The
+# gateway reads it from /etc/praxis-credential-broker/operator-tokens.yaml;
+# without that file there are no operators.
+#
+# It holds only the SHA-256 of each token, so it is not a secret, but
+# whoever can write it can use the broker's credentials. Mint a token and
+# its entry with scripts/create-operator-token (only its random tokens are
+# safe behind a hash), and mount your copy there (PRAXIS_OPERATOR_TOKENS for
+# native-pod.sh, a drop-in for Quadlet). The gateway reads it when it
+# starts: removing an entry and restarting the gateway revokes its token.
+#
+# This example matches no token.
+operators:
+  # Lowercase letters, digits and "-": what /usage and the logs call it.
+  # Anyone who can reach the gateway can read it there.
+  - name: example
+    # Of the whole token, "praxis-operator-" included, in hex.
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    # The injected clusters of praxis.yaml it may use: inference-backend
+    # (Codex Responses) and anthropic (Claude Messages).
+    clusters: [inference-backend]
+    # Optional: requests in flight at once.
+    # concurrency: 8
