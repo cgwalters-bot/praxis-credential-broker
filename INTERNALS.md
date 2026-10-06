@@ -433,6 +433,17 @@ output, and `total`, which the caps count), and `models`, the same
 anyone who can reach it can read aggregate broker usage and subscription limits.
 It returns `praxis-broker-usage/v1` JSON without contacting a provider or admitting
 a run. Other methods get 405; `/usage/` and other nonexact paths get 404.
+
+A browser lets a page on another origin read it only for the origins in
+`run_token`'s `usage_cors_origins`, by default the review dashboard's,
+`https://cgwalters-forge.github.io`. A request from one of them, matched
+exactly against its `Origin`, gets `Access-Control-Allow-Origin` naming it, and
+its `OPTIONS` preflight gets 204 with `Access-Control-Allow-Methods: GET,
+OPTIONS` and, when it asks for Private Network Access (a public page reading a
+private address), `Access-Control-Allow-Private-Network: true`. Any other
+origin gets the JSON without those headers and 403 for a preflight, and
+`Access-Control-Allow-Credentials` is never sent. This restricts web pages
+only: the endpoint itself stays readable by anything that reaches the listener.
 The existing placeholder-deny filter still applies before this local route.
 
 `anthropic.counts` and `codex.counts` contain cumulative `requests` with reported
