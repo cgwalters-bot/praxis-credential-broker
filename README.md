@@ -165,6 +165,35 @@ its run's cap gets 429. Injecting a subscription token at a gateway is
 undocumented by Anthropic; read the risks in
 [INTERNALS.md](INTERNALS.md#risks) first.
 
+## Interactive agents: operator tokens
+
+A person's own agent, such as an interactive OpenCode or Codex on a
+workstation, has no CI job to register a run with. The deployment can name
+operators instead, each with a long-lived token that is admitted wherever a
+run token is, for the injected clusters its entry lists:
+
+```sh
+bash scripts/create-operator-token me inference-backend
+# writes ~/.config/praxis-credential-broker/operator-token-me (mode 0600) and
+# prints the entry, with only the token's SHA-256, for operator-tokens.yaml
+```
+
+Put that entry in your copy of `operator-tokens.yaml`, point
+`PRAXIS_OPERATOR_TOKENS` at it for `native-pod.sh up` (under Quadlet, a
+[drop-in](INTERNALS.md#quadlet) mounts it), and restart the pod. The client sends the token as its API key; OpenCode can read it
+from the file, so the token is in no configuration:
+
+```json
+"options": {
+  "baseURL": "http://127.0.0.1:18080/v1",
+  "apiKey": "{file:~/.config/praxis-credential-broker/operator-token-me}"
+}
+```
+
+An operator is capped like a run (20M tokens per API in a sliding 6 hours),
+and `GET /usage` counts what it used under `operators`, by its name. See
+[INTERNALS.md](INTERNALS.md#operator-tokens) for what the token can do.
+
 ## Interactive Claude Code: pass-through
 
 A Claude Code that is logged in itself (`claude auth login`) can use the

@@ -296,8 +296,9 @@ recreate the pod. `reset-secrets` removes this secret along with the others.
   upgrading, since the beta set changes between releases.
 - **Client headers in logs.** On a malformed request Praxis logs the raw
   request bytes at error level, including the client's own `Authorization`.
-  For a pass-through caller that is its own Claude credential, so the pod
-  logs need the same care as the credentials. A well-formed request's
+  For a pass-through caller that is its own Claude credential, and for an
+  operator its long-lived token, so the pod logs need the same care as the
+  credentials. A well-formed request's
   headers are not logged; the tests check that neither the broker's token,
   a pass-through credential nor a run token reaches the logs.
 - **Pass-through is an open relay to Anthropic** for anyone who can reach
@@ -408,6 +409,51 @@ expires, and another run's token is useless to it once that run ends. A
 tailnet peer without a registered run's token can't use the broker's
 credentials at all.
 
+### Operator tokens
+
+A run token needs a CI job. For a person's own agent on a workstation, the
+deployment can mount `/etc/praxis-credential-broker/operator-tokens.yaml`,
+a copy of `operator-tokens.yaml`, naming up to 16 operators. Each entry has
+a `name`, the `token_sha256` of its token, the injected `clusters` the
+token may use (`inference-backend`, `anthropic`), and optionally its
+`concurrency` (default 8). `scripts/create-operator-token NAME CLUSTERS`
+mints a token (`praxis-operator-` and 64 hex digits) into a file only its
+owner can read and prints the entry; the token is never printed. Use only
+tokens it minted: the hash protects a random token, not one a person chose.
+The gateway reads the file when it starts, and does not start with a
+malformed one; without the file there are no operators. It mounts as
+`PRAXIS_OPERATOR_TOKENS` for `native-pod.sh up`, or a drop-in for Quadlet.
+
+An operator token is accepted where a run token is, in the same headers,
+and removed before the request goes upstream. What it grants:
+
+- requests to the injected routes of the clusters its entry lists, with the
+  broker's credential for them, and 403 on any other injected route;
+- as the identity `operator:NAME`, which the per-run `token_rate_limit`
+  rules cap like any run: 20M tokens per API, but in a sliding 6 hours
+  rather than once, since an operator does not end;
+- nothing else: it reads and finishes no run (`/v1/runs/self` gets 401),
+  registers none, and is refused as a pass-through credential (400), so it
+  is never sent to a provider.
+
+It does not expire. To revoke one, remove its entry and restart the gateway:
+editing the file alone changes nothing, since Praxis watches `praxis.yaml`
+and the files a filter declares, and `run_token` declares none; and a
+reload that fails keeps the old operators. After the restart, the
+`operator tokens loaded` line in the log names the operators the gateway
+has. (A reload of `praxis.yaml` does read the file again. Like any reload
+it resets the token caps, an operator's included, as under
+[Metering and caps](#metering-and-caps), and it starts the operators'
+in-flight counts afresh, so one may briefly exceed its `concurrency`.) The
+gateway holds only the hash, so the
+tokens file is not a secret, but **whoever can write it can use the
+broker's credentials**, like the registration policy; and whoever can read
+a token file can spend that operator's budget until it is revoked. Its use
+is counted under `operators` in `GET /usage` and logged as `run=operator:NAME`
+in the `request usage` lines, apart from every run. `/usage` is
+unauthenticated, so an operator's name and counts are readable by anyone
+who reaches the listener.
+
 ### Usage records
 
 `GET /v1/runs/self` with the run token returns the run's usage record;
@@ -448,7 +494,8 @@ The existing placeholder-deny filter still applies before this local route.
 
 `anthropic.counts` and `codex.counts` contain cumulative `requests` with reported
 usage, `unmetered` successful completed responses without usage, and `tokens` in
-the run-record shape. Counts use the same `reported_usage` from `token_count` as
+the run-record shape. `operators` has the same counts for each operator the
+tokens file names, by its name, from zero; a provider's counts include them. Counts use the same `reported_usage` from `token_count` as
 run records, for injected inference only. Pass-through, health checks, local
 endpoints and `count_tokens` do not contribute. Incomplete/disconnected responses
 are not settled here; these are observed totals, not rate-limit reservations.
@@ -468,9 +515,11 @@ window is null. Windows update independently and may be stale; these passive obs
 are neither a fresh provider query nor the broker's configured caps.
 
 The bounded state has two counters and four window slots per named run registry,
-survives configuration reloads, and resets on process restart (`started_at` names
-the start of that state). It stores no credentials, arbitrary headers, prompt
-content, model dimensions or run identifiers. Header fixtures in testdata use
+and a counter per operator (at most 64 names, across reloads of the tokens file).
+It survives configuration reloads, and resets on process restart (`started_at`
+names the start of that state). It stores no credentials, arbitrary headers,
+prompt content, model dimensions or run identifiers; operators' names are the
+deployment's own. Header fixtures in testdata use
 synthetic values in the provider header shapes.
 
 Subscription inference has no per-token bill, so without a cap only a job's
@@ -548,6 +597,15 @@ registration policy is one:
 Volume=%h/.config/praxis-credential-broker/run-token-policy.yaml:/etc/praxis-credential-broker/run-token-policy.yaml:ro,Z
 ```
 
+The operator tokens file, if the deployment has operators, is another, on
+the same container:
+
+```ini
+# ~/.config/containers/systemd/praxis-credential-broker-praxis.container.d/operator-tokens.conf
+[Container]
+Volume=%h/.config/praxis-credential-broker/operator-tokens.yaml:/etc/praxis-credential-broker/operator-tokens.yaml:ro,Z
+```
+
 and publishing on the host's tailnet address as well is another, checked
 before the pod binds it. These commands run on the host, before Podman binds
 the address; they deliberately avoid a dependency on `tailscaled.service`,
@@ -565,8 +623,9 @@ ExecStartPre=/usr/bin/tailscale wait --timeout=30s
 ExecStartPre=/usr/bin/tailscale ip --4 --assert=100.64.0.1
 ```
 
-Every tailnet peer that can reach the port can then use pass-through and
-register runs if it holds an allowed job's OIDC token, and nothing else;
+Every tailnet peer that can reach the port can then use pass-through,
+register runs if it holds an allowed job's OIDC token, and use the injected
+routes of an operator whose token it holds, and nothing else;
 restrict the port with the tailnet policy anyway.
 
 Upgrading units from before the run tokens: the gateway now refuses to

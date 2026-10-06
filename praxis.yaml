@@ -18,7 +18,10 @@
 #                 and Messages sent with the placeholder
 #                 (counting tokens is admitted but neither capped nor
 #                 charged)
-#                 `Authorization: Bearer praxis-substitute:anthropic`
+#                 `Authorization: Bearer praxis-substitute:anthropic`.
+#                 An operator token, if the deployment names any, is
+#                 admitted in a run token's place for the clusters its
+#                 entry lists
 #   pass-through  the caller's own Authorization, forwarded and never
 #                 stored: Messages with any other Authorization
 #
@@ -156,6 +159,10 @@ filter_chains:
         usage_free_paths: ["/anthropic/v1/messages/count_tokens"]
         registration:
           policy_file: /etc/praxis-credential-broker/run-token-policy.yaml
+        # Long-lived tokens for people; none unless the deployment mounts
+        # this file (operator-tokens.yaml is the example).
+        operators:
+          tokens_file: /etc/praxis-credential-broker/operator-tokens.yaml
         credentials:
           inference-backend: injected
           anthropic: injected

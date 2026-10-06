@@ -3,10 +3,11 @@ use crate::runs::{Tokens, Usage};
 use http::HeaderMap;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tracing::warn;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Provider {
@@ -29,6 +30,17 @@ struct Counts {
     requests: u64,
     unmetered: u64,
     tokens: Tokens,
+}
+
+impl Counts {
+    fn settle(&mut self, usage: Option<&Usage>, success: bool) {
+        if let Some(usage) = usage {
+            self.requests = self.requests.saturating_add(1);
+            self.tokens.add(&usage.tokens);
+        } else if success {
+            self.unmetered = self.unmetered.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -75,6 +87,9 @@ pub(crate) struct Snapshot {
     started_at: u64,
     anthropic: Anthropic,
     codex: Codex,
+    /// What each operator token used, by its operator's name. Its provider's
+    /// `counts` include it.
+    operators: BTreeMap<String, Counts>,
 }
 
 impl Default for Snapshot {
@@ -84,6 +99,7 @@ impl Default for Snapshot {
             started_at: unix_time(),
             anthropic: Anthropic::default(),
             codex: Codex::default(),
+            operators: BTreeMap::new(),
         }
     }
 }
@@ -92,9 +108,13 @@ impl Default for Snapshot {
 pub(crate) struct BrokerUsage(Mutex<Snapshot>);
 
 // Like the run registry, configuration reloads retain the named state. Each
-// registry has exactly two counters and four window slots, never per-client keys.
+// registry has exactly two counters and four window slots, and a counter per
+// operator a tokens file named, never per-client keys.
 static REGISTRIES: LazyLock<Mutex<HashMap<String, Arc<BrokerUsage>>>> =
     LazyLock::new(Mutex::default);
+
+/// Operators a snapshot lists: those of a few generations of tokens file.
+const MAX_LISTED_OPERATORS: usize = 4 * crate::operators::MAX_OPERATORS;
 
 fn unix_time() -> u64 {
     SystemTime::now()
@@ -127,11 +147,34 @@ impl BrokerUsage {
             Provider::Anthropic => &mut state.anthropic.counts,
             Provider::Codex => &mut state.codex.counts,
         };
-        if let Some(usage) = usage {
-            counts.requests = counts.requests.saturating_add(1);
-            counts.tokens.add(&usage.tokens);
-        } else if success {
-            counts.unmetered = counts.unmetered.saturating_add(1);
+        counts.settle(usage, success);
+    }
+
+    /// List `operator` in the snapshot, at zero until it uses something.
+    /// Operators removed from the tokens file stay listed until a restart,
+    /// so the map never outgrows `MAX_LISTED_OPERATORS`.
+    pub(crate) fn declare_operator(&self, operator: &str) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.operators.contains_key(operator) {
+            return;
+        }
+        if state.operators.len() >= MAX_LISTED_OPERATORS {
+            warn!(
+                operator,
+                "too many operators since the gateway started; this one's usage is not counted by name"
+            );
+            return;
+        }
+        state
+            .operators
+            .insert(operator.to_owned(), Counts::default());
+    }
+
+    /// Count a response to a declared operator's request.
+    pub(crate) fn settle_operator(&self, operator: &str, usage: Option<&Usage>, success: bool) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(counts) = state.operators.get_mut(operator) {
+            counts.settle(usage, success);
         }
     }
 
@@ -309,6 +352,42 @@ mod tests {
         headers.append("x-codex-primary-used-percent", "1".parse().unwrap());
         headers.append("x-codex-primary-used-percent", "2".parse().unwrap());
         assert!(codex_window(&headers, "primary", 1).is_none());
+    }
+
+    #[test]
+    fn operators_are_counted_by_name_once_declared() {
+        let usage = BrokerUsage::default();
+        let reported = Usage {
+            tokens: Tokens {
+                input: 3,
+                total: 3,
+                ..Tokens::default()
+            },
+            model: None,
+        };
+        usage.declare_operator("me");
+        usage.settle_operator("me", Some(&reported), true);
+        usage.settle_operator("me", None, true);
+        usage.settle_operator("me", None, false);
+        // Declaring again keeps the counts; an undeclared name is not kept.
+        usage.declare_operator("me");
+        usage.settle_operator("stranger", Some(&reported), true);
+        for i in 0..2 * MAX_LISTED_OPERATORS {
+            usage.declare_operator(&format!("o{i}"));
+        }
+        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        let operators = snapshot["operators"].as_object().unwrap();
+        assert_eq!(operators.len(), MAX_LISTED_OPERATORS);
+        assert!(!operators.contains_key("stranger"));
+        assert_eq!(
+            operators["me"],
+            serde_json::json!({
+                "requests": 1,
+                "unmetered": 1,
+                "tokens": {"input": 3, "cache_read": 0, "output": 0, "reasoning": 0, "total": 3},
+            })
+        );
+        assert_eq!(snapshot["codex"]["counts"]["requests"], 0);
     }
 
     #[test]
