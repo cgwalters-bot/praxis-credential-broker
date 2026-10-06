@@ -472,15 +472,21 @@ response and caps injected use with praxis-ai's own filters:
   logs one line per response with the mode, cluster, run, model and
   counts, and nothing that names a credential: `request usage`, or
   `request without usage` for a response that reports none, such as an
-  error or `count_tokens`.
+  error or `count_tokens`. `token_count` only reads a response whose
+  `content-type` says it is JSON or an event stream, and the Codex backend
+  streams its events without one, so credential-proxy names a successful
+  response that has no type `text/event-stream`. The recorded stream in
+  `crates/praxis-gateway/testdata` pins the real event shape, and
+  `just test-pod`'s mock omits the header as the backend does.
 - **Per-run caps.** A `token_rate_limit` rule keyed on the run
   (`key: authenticated_subject`) caps each run at 20M tokens over a 6-hour
   window, which spans a whole run. There is one per API, because a
   condition can't select "injected" across both: so a run that uses both
   APIs gets the cap on each, though a run normally uses one. It reserves
   10k tokens per request, refuses with 429 before anything goes upstream,
-  and reconciles with what `token_count` recorded. A run can overshoot its
-  cap by the output of its requests in flight.
+  and reconciles with what `token_count` recorded: a response's `total`,
+  which counts cached input in full. A run can overshoot its cap by the
+  output of its requests in flight.
 - **Windows.** Another `token_rate_limit` per API caps all injected use at
   100M tokens in a sliding 5-hour window, the providers' usage-limit window:
   each is a subscription with a limit of its own. One run can use up a

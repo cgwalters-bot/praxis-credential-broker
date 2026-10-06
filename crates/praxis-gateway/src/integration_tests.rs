@@ -44,6 +44,13 @@ const CLUSTERS: [&str; 4] = [RESPONSES, INJECTED, PASS_THROUGH, "run-endpoints"]
 /// Usage the fake upstream reports, and what a run record makes of it.
 const RESPONSES_USAGE: &str = r#"{"input_tokens":70,"input_tokens_details":{"cached_tokens":30},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":100}"#;
 const RESPONSES_TOTAL: u64 = 100;
+/// A stream chatgpt.com's Codex backend sent on 2026-10-05, its ids
+/// replaced: 16 tokens in, none of them cached, and 5 out. Its usage also
+/// attributes the tokens to each message, which `token_count` must not
+/// mistake for the totals.
+const RECORDED_STREAM: &str = include_str!("../testdata/codex-responses-stream.sse");
+/// The `input` the fake Responses upstream answers with `RECORDED_STREAM`.
+const RECORDED_INPUT: &str = "recorded";
 const MESSAGES_TOTAL: u64 = 90;
 
 /// What the fake upstreams received, in order.
@@ -134,6 +141,12 @@ async fn fake_responses(
         return json_response(
             &json!({"id": "r", "object": "response", "model": "gpt-test", "usage": usage}),
         );
+    }
+    if request["input"] == RECORDED_INPUT {
+        return sse(RECORDED_STREAM
+            .split_inclusive("\n\n")
+            .map(str::to_owned)
+            .collect());
     }
     let mut events = vec![
         "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-test\"}}\n\n".to_owned(),
@@ -669,6 +682,29 @@ async fn injected_requests_without_a_valid_run_token_are_refused() {
     // The health check needs no token (and the fake doesn't record it).
     let response = h.call(Method::GET, "/healthz", &[], None).await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_codex_stream_is_metered() {
+    let h = Harness::with_policy().await;
+    let token = h.run(1).await;
+    let (status, body) = h.respond(Some(&token), RECORDED_INPUT, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, RECORDED_STREAM);
+    let usage = h.usage(&token).await;
+    assert_eq!(
+        (&usage["requests"], &usage["unmetered"]),
+        (&json!(1), &json!(0))
+    );
+    let tokens = json!({"input": 16, "cache_read": 0, "output": 5, "reasoning": 0, "total": 21});
+    assert_eq!(usage["tokens"], tokens);
+    assert_eq!(usage["models"], json!({"gpt-6.1-sol": tokens}));
+    let response = h.call(Method::GET, "/usage", &[], None).await;
+    let broker: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        broker["codex"]["counts"],
+        json!({"requests": 1, "unmetered": 0, "tokens": tokens})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
