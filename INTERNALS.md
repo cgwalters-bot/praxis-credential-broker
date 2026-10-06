@@ -451,7 +451,9 @@ Codex fields are `used_percent` (0–100), `window_minutes` and
 `reset_after_seconds`. Only the corresponding unified-5h/7d and primary/secondary
 header names are parsed. Missing or invalid fields are null in a new observation;
 an entirely absent/invalid window leaves the prior observation and timestamp
-intact. Windows update independently and may be stale; these passive observations
+intact. Codex reports a window the plan lacks with `window_minutes: 0` (a plan
+with only a weekly limit has it as `primary` and a zero `secondary`), and such a
+window is null. Windows update independently and may be stale; these passive observations
 are neither a fresh provider query nor the broker's configured caps.
 
 The bounded state has two counters and four window slots per named run registry,

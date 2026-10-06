@@ -151,11 +151,16 @@ impl BrokerUsage {
                 }
             }
             Provider::Codex => {
-                if let Some(window) = codex_window(headers, "primary", now) {
-                    state.codex.primary = Some(window);
-                }
-                if let Some(window) = codex_window(headers, "secondary", now) {
-                    state.codex.secondary = Some(window);
+                let Codex {
+                    primary, secondary, ..
+                } = &mut state.codex;
+                for (slot, name) in [(primary, "primary"), (secondary, "secondary")] {
+                    match codex_window(headers, name, now) {
+                        // A window the plan does not have comes as zeros.
+                        Some(window) if window.window_minutes == Some(0) => *slot = None,
+                        Some(window) => *slot = Some(window),
+                        None => {}
+                    }
                 }
             }
         }
@@ -264,6 +269,23 @@ mod tests {
         assert_eq!(usage.snapshot().codex.secondary.unwrap(), secondary);
         usage.capture_at(Provider::Codex, &HeaderMap::new(), 40);
         assert_eq!(usage.snapshot().codex.primary.unwrap().observed_at, 30);
+        // As chatgpt.com answered on 2026-10-05, for a plan whose only
+        // window is the weekly one.
+        let mut weekly_only = HeaderMap::new();
+        for (name, value) in [
+            ("x-codex-primary-used-percent", "19"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-primary-reset-after-seconds", "575839"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+            ("x-codex-secondary-reset-after-seconds", "0"),
+        ] {
+            weekly_only.insert(name, value.parse().unwrap());
+        }
+        usage.capture_at(Provider::Codex, &weekly_only, 50);
+        let codex = usage.snapshot().codex;
+        assert_eq!(codex.primary.unwrap().window_minutes, Some(10080));
+        assert_eq!(codex.secondary, None);
     }
 
     #[test]
