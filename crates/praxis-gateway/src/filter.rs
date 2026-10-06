@@ -63,6 +63,18 @@ use tracing::{info, warn};
 pub const FILTER_NAME: &str = "run_token";
 const RUNS_PATH: &str = "/v1/runs";
 const RUN_SELF_PATH: &str = "/v1/runs/self";
+const USAGE_PATH: &str = "/usage";
+/// Where the review dashboard is served from.
+const DEFAULT_USAGE_ORIGIN: &str = "https://cgwalters-forge.github.io";
+const USAGE_METHODS: HeaderValue = HeaderValue::from_static("GET, OPTIONS");
+/// How long a browser may reuse a preflight answer, in seconds.
+const PREFLIGHT_MAX_AGE: HeaderValue = HeaderValue::from_static("600");
+/// Private Network Access: a public page asks before it reads a private
+/// address, and proceeds only if told it may.
+const REQUEST_PRIVATE_NETWORK: HeaderName =
+    HeaderName::from_static("access-control-request-private-network");
+const ALLOW_PRIVATE_NETWORK: HeaderName =
+    HeaderName::from_static("access-control-allow-private-network");
 const DEFAULT_REGISTRY: &str = "default";
 const DEFAULT_MAX_SECS: u64 = 6 * 3600;
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -73,6 +85,10 @@ const DEFAULT_EVENT: &str = "workflow_dispatch";
 
 fn default_registry() -> String {
     DEFAULT_REGISTRY.to_owned()
+}
+
+fn default_usage_origins() -> HashSet<String> {
+    HashSet::from([DEFAULT_USAGE_ORIGIN.to_owned()])
 }
 
 fn default_token_headers() -> Vec<String> {
@@ -122,6 +138,11 @@ struct Config {
     usage_free_paths: HashSet<String>,
     /// The credential mode of each cluster the router may pick.
     credentials: HashMap<String, CredentialMode>,
+    /// The origins, each exactly as a browser sends it in `Origin`, whose
+    /// pages may read `/usage`. Anything else that can reach the listener
+    /// can read it too; this only decides which web pages a browser lets.
+    #[serde(default = "default_usage_origins")]
+    usage_cors_origins: HashSet<String>,
     /// Serve the run endpoints on this chain.
     registration: Option<RegistrationConfig>,
 }
@@ -201,6 +222,7 @@ pub struct RunTokenFilter {
     public_paths: HashSet<String>,
     usage_free_paths: HashSet<String>,
     credentials: HashMap<String, CredentialMode>,
+    usage_cors_origins: HashSet<String>,
     endpoints: RunEndpoints,
 }
 
@@ -248,6 +270,7 @@ impl RunTokenFilter {
             public_paths: config.public_paths,
             usage_free_paths: config.usage_free_paths,
             credentials: config.credentials,
+            usage_cors_origins: config.usage_cors_origins,
             endpoints,
         }))
     }
@@ -269,6 +292,38 @@ impl RunTokenFilter {
 
     fn run_of(&self, headers: &HeaderMap, now: Instant) -> Option<RunKey> {
         self.runs.authenticate(self.token(headers)?.1, now)
+    }
+
+    /// Answer `/usage`: the broker's usage, or the preflight a browser sends
+    /// before it lets a page read it. Only an allowed origin gets the CORS
+    /// headers, and never the one for credentials: the read needs none.
+    fn serve_usage(&self, request: &Request) -> FilterAction {
+        let origin = request.headers.get(header::ORIGIN).filter(|origin| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| self.usage_cors_origins.contains(origin))
+        });
+        // Either answer depends on who asks.
+        let mut headers =
+            HeaderMap::from_iter([(header::VARY, HeaderValue::from_static("origin"))]);
+        if let Some(origin) = origin {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        }
+        match request.method {
+            Method::GET => json_with(200, &self.usage.snapshot(), headers),
+            Method::OPTIONS if origin.is_some() => {
+                headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, USAGE_METHODS);
+                headers.insert(header::ACCESS_CONTROL_MAX_AGE, PREFLIGHT_MAX_AGE);
+                if request.headers.contains_key(REQUEST_PRIVATE_NETWORK) {
+                    headers.insert(ALLOW_PRIVATE_NETWORK, HeaderValue::from_static("true"));
+                }
+                FilterAction::TerminalResponse(Box::new(
+                    TerminalResponse::new(204).with_headers(headers),
+                ))
+            }
+            Method::OPTIONS => reject(403, "origin not allowed\n"),
+            _ => reject(405, "method not allowed\n"),
+        }
     }
 
     async fn serve_runs(&self, registrar: Option<&Registrar>, request: &Request) -> FilterAction {
@@ -386,14 +441,19 @@ fn reject(status: u16, message: &'static str) -> FilterAction {
 }
 
 fn json(status: u16, value: &impl serde::Serialize) -> FilterAction {
+    json_with(status, value, HeaderMap::new())
+}
+
+/// A JSON response with `headers` besides its content type.
+fn json_with(status: u16, value: &impl serde::Serialize, mut headers: HeaderMap) -> FilterAction {
     let body = match serde_json::to_vec(value) {
         Ok(body) => body,
         Err(_) => return reject(500, "internal error\n"),
     };
-    let headers = HeaderMap::from_iter([(
+    headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
-    )]);
+    );
     FilterAction::TerminalResponse(Box::new(
         TerminalResponse::new(status)
             .with_headers(headers)
@@ -473,12 +533,8 @@ impl HttpFilter for RunTokenFilter {
         ctx: &mut HttpFilterContext<'_>,
     ) -> Result<FilterAction, FilterError> {
         let path = ctx.request.uri.path();
-        if path == "/usage" {
-            return Ok(if ctx.request.method == Method::GET {
-                json(200, &self.usage.snapshot())
-            } else {
-                reject(405, "method not allowed\n")
-            });
+        if path == USAGE_PATH {
+            return Ok(self.serve_usage(ctx.request));
         }
         let usage_free = self.usage_free_paths.contains(path);
         if path == RUNS_PATH || path.starts_with("/v1/runs/") {

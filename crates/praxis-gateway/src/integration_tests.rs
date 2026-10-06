@@ -490,6 +490,89 @@ async fn broker_usage_is_local_and_only_observes_injected_inference() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn only_an_allowed_origins_pages_may_read_usage() {
+    const DASHBOARD: &str = "https://cgwalters-forge.github.io";
+    const ALLOW_ORIGIN: &str = "access-control-allow-origin";
+    const ALLOW_METHODS: &str = "access-control-allow-methods";
+    const ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
+    const REQUEST_PRIVATE_NETWORK: (&str, &str) =
+        ("access-control-request-private-network", "true");
+    let h = Harness::start(false, |filter| {
+        if filter["filter"] == "run_token" {
+            filter["usage_cors_origins"] =
+                serde_yaml::from_str("[\"http://localhost:8000\"]").unwrap();
+        }
+    })
+    .await;
+    // The configured origins replace the default one.
+    let response = h
+        .call(Method::GET, "/usage", &[("origin", DASHBOARD)], None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(ALLOW_ORIGIN));
+
+    let h = Harness::start(false, |_| {}).await;
+    const OTHER: &str = "https://example.com";
+    // Origins are compared whole: a longer one is another site.
+    const LOOKALIKE: &str = "https://cgwalters-forge.github.io.example.com";
+    const METHODS: Option<&str> = Some("GET, OPTIONS");
+    // (method, origin, asks for private network access, status,
+    // allow-origin, allow-methods, allow-private-network)
+    let cases = [
+        (Method::GET, None, false, 200, None, None, None),
+        (
+            Method::GET,
+            Some(DASHBOARD),
+            false,
+            200,
+            Some(DASHBOARD),
+            None,
+            None,
+        ),
+        (Method::GET, Some(OTHER), false, 200, None, None, None),
+        (Method::GET, Some(LOOKALIKE), false, 200, None, None, None),
+        (
+            Method::OPTIONS,
+            Some(DASHBOARD),
+            false,
+            204,
+            Some(DASHBOARD),
+            METHODS,
+            None,
+        ),
+        (
+            Method::OPTIONS,
+            Some(DASHBOARD),
+            true,
+            204,
+            Some(DASHBOARD),
+            METHODS,
+            Some("true"),
+        ),
+        (Method::OPTIONS, Some(OTHER), true, 403, None, None, None),
+        (Method::OPTIONS, None, false, 403, None, None, None),
+    ];
+    for (method, from, private, status, origin, methods, private_network) in cases {
+        let case = format!("{method} from {from:?}, private network {private}");
+        let mut headers = Vec::new();
+        headers.extend(from.map(|origin| ("origin", origin)));
+        headers.extend(private.then_some(REQUEST_PRIVATE_NETWORK));
+        let response = h.call(method, "/usage", &headers, None).await;
+        assert_eq!(response.status().as_u16(), status, "{case}");
+        let header = |name: &str| response.headers().get(name).map(|v| v.to_str().unwrap());
+        assert_eq!(header(ALLOW_ORIGIN), origin, "{case}");
+        assert_eq!(header(ALLOW_METHODS), methods, "{case}");
+        assert_eq!(header(ALLOW_PRIVATE_NETWORK), private_network, "{case}");
+        // The read needs no credentials, so none may be sent with it.
+        assert_eq!(header("access-control-allow-credentials"), None, "{case}");
+        if status != 403 {
+            assert_eq!(header("vary"), Some("origin"), "{case}");
+        }
+    }
+    assert_eq!(h.upstream.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn streamed_responses_and_messages_are_metered_and_capped_per_run() {
     let h = Harness::with_policy().await;
     let token = h.run(1).await;
@@ -577,6 +660,29 @@ async fn streamed_responses_and_messages_are_metered_and_capped_per_run() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = h.injected(Some(&token)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_codex_stream_is_metered() {
+    let h = Harness::with_policy().await;
+    let token = h.run(1).await;
+    let (status, body) = h.respond(Some(&token), RECORDED_INPUT, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, RECORDED_STREAM);
+    let usage = h.usage(&token).await;
+    assert_eq!(
+        (&usage["requests"], &usage["unmetered"]),
+        (&json!(1), &json!(0))
+    );
+    let tokens = json!({"input": 16, "cache_read": 0, "output": 5, "reasoning": 0, "total": 21});
+    assert_eq!(usage["tokens"], tokens);
+    assert_eq!(usage["models"], json!({"gpt-6.1-sol": tokens}));
+    let response = h.call(Method::GET, "/usage", &[], None).await;
+    let broker: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        broker["codex"]["counts"],
+        json!({"requests": 1, "unmetered": 0, "tokens": tokens})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -682,29 +788,6 @@ async fn injected_requests_without_a_valid_run_token_are_refused() {
     // The health check needs no token (and the fake doesn't record it).
     let response = h.call(Method::GET, "/healthz", &[], None).await;
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_recorded_codex_stream_is_metered() {
-    let h = Harness::with_policy().await;
-    let token = h.run(1).await;
-    let (status, body) = h.respond(Some(&token), RECORDED_INPUT, true).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, RECORDED_STREAM);
-    let usage = h.usage(&token).await;
-    assert_eq!(
-        (&usage["requests"], &usage["unmetered"]),
-        (&json!(1), &json!(0))
-    );
-    let tokens = json!({"input": 16, "cache_read": 0, "output": 5, "reasoning": 0, "total": 21});
-    assert_eq!(usage["tokens"], tokens);
-    assert_eq!(usage["models"], json!({"gpt-6.1-sol": tokens}));
-    let response = h.call(Method::GET, "/usage", &[], None).await;
-    let broker: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
-    assert_eq!(
-        broker["codex"]["counts"],
-        json!({"requests": 1, "unmetered": 0, "tokens": tokens})
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

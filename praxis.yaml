@@ -7,7 +7,8 @@
 #   /anthropic/v1/messages             Anthropic Messages, with
 #   /anthropic/v1/messages/count_tokens    exact paths only
 #   /v1/runs (prefix)                  run registration, answered by run_token
-#   /usage (exact), GET                local broker usage, answered by run_token
+#   /usage (exact), GET                local broker usage, answered by run_token,
+#                                      with CORS for the review dashboard
 #
 # Each route that reaches a provider has a credential mode, given per
 # cluster in run_token's `credentials` below:
