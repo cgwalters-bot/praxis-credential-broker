@@ -34,6 +34,10 @@ const AGENT_SOCKET: &str = "/run/praxis-credentials/agent.sock";
 const CHANNEL_SECRET: &str = "/run/secrets/channel/agent-channel-key";
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+/// What a successful Codex response is when it does not say: the backend
+/// streams its events with no `content-type` at all, and Praxis's
+/// `token_count` reads the usage only of a response that names its type.
+const UNNAMED_RESPONSE_TYPE: &str = "text/event-stream";
 
 #[derive(Clone)]
 struct App {
@@ -380,15 +384,28 @@ fn forward(
 ) -> Response<Body> {
     let status = response.status();
     let mut b = Response::builder().status(status);
-    for (n, v) in response.headers() {
-        if !hop(n) && n != header::SET_COOKIE {
-            b = b.header(n, v)
-        }
+    for (n, v) in &response_headers(status, response.headers()) {
+        b = b.header(n, v)
     }
     let mut stream = response.bytes_stream();
     let body = async_stream::stream! { let mut total=0; let _permit=permit; loop { match timeout(idle, stream.next()).await { Ok(Some(Ok(chunk))) => { total += chunk.len(); if total > max { yield Err(io::Error::other("response limit exceeded")); break } yield Ok(chunk) }, Ok(Some(Err(_))) => { yield Err(io::Error::other("upstream stream failed")); break }, Ok(None) => break, Err(_) => { yield Err(io::Error::other("upstream idle timeout")); break } } } };
     b.body(Body::from_stream(body))
         .unwrap_or_else(|_| simple(StatusCode::BAD_GATEWAY, "response error\n"))
+}
+/// The headers of an upstream response that go back to the client.
+fn response_headers(status: StatusCode, upstream: &http::HeaderMap) -> http::HeaderMap {
+    let mut headers: http::HeaderMap = upstream
+        .iter()
+        .filter(|(n, _)| !hop(n) && *n != header::SET_COOKIE)
+        .map(|(n, v)| (n.clone(), v.clone()))
+        .collect();
+    if status.is_success() && !headers.contains_key(header::CONTENT_TYPE) {
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static(UNNAMED_RESPONSE_TYPE),
+        );
+    }
+    headers
 }
 fn hop(n: &HeaderName) -> bool {
     matches!(
@@ -468,6 +485,47 @@ mod tests {
             assert!(hop(&HeaderName::from_bytes(name.as_bytes()).unwrap()));
         }
         assert!(!hop(&HeaderName::from_static("content-type")));
+    }
+    #[test]
+    fn a_successful_response_that_names_no_type_is_an_event_stream() {
+        // As chatgpt.com answered a streamed request on 2026-10-05: the
+        // subscription windows and no content-type.
+        let recorded = http::HeaderMap::from_iter([
+            (
+                HeaderName::from_static("x-codex-primary-used-percent"),
+                http::HeaderValue::from_static("19"),
+            ),
+            (header::SET_COOKIE, http::HeaderValue::from_static("a=b")),
+            (
+                header::TRANSFER_ENCODING,
+                http::HeaderValue::from_static("chunked"),
+            ),
+        ]);
+        let json = http::HeaderMap::from_iter([(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        )]);
+        let cases = [
+            (StatusCode::OK, &recorded, Some(UNNAMED_RESPONSE_TYPE)),
+            (StatusCode::OK, &json, Some("application/json")),
+            (StatusCode::TOO_MANY_REQUESTS, &recorded, None),
+        ];
+        for (status, upstream, expected) in cases {
+            let headers = response_headers(status, upstream);
+            assert_eq!(
+                headers
+                    .get(header::CONTENT_TYPE)
+                    .map(|v| v.to_str().unwrap()),
+                expected,
+                "{status}"
+            );
+            assert!(!headers.contains_key(header::SET_COOKIE));
+            assert!(!headers.contains_key(header::TRANSFER_ENCODING));
+        }
+        assert_eq!(
+            response_headers(StatusCode::OK, &recorded)["x-codex-primary-used-percent"],
+            "19"
+        );
     }
     #[test]
     fn upstream_path_is_not_client_selectable() {

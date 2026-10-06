@@ -21,7 +21,9 @@ class Handler(BaseHTTPRequestHandler):
         self.server.observed.append(present)
         self.send_response(200)
         streaming = self.headers.get('accept') == 'text/event-stream'
-        self.send_header('content-type', 'text/event-stream' if streaming else 'application/json')
+        # Like the Codex backend, the stream does not say what it is.
+        if not streaming:
+            self.send_header('content-type', 'application/json')
         self.end_headers()
         self.wfile.write((b'event: response.output_text.delta\ndata: {"delta":"synthetic"}\n\nevent: response.function_call_arguments.delta\ndata: {"item_id":"call_synthetic","delta":"{}"}\n\n' + COMPLETED if streaming else b'{"id":"synthetic",' + USAGE + b'}'))
     def do_GET(self):
