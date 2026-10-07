@@ -354,7 +354,7 @@ impl RunTokenFilter {
             .runs
             .authenticate(token, now)
             .ok_or_else(unauthenticated)?;
-        match self.runs.admit(key, now) {
+        match self.runs.admit(&key, now) {
             Ok(admission) => Ok((key.subject(), Caller::Run(admission))),
             Err(Refusal::Closed) => Err(unauthenticated()),
             Err(Refusal::Busy) => Err(reject(429, "too many requests in flight for this run\n")),
@@ -403,7 +403,7 @@ impl RunTokenFilter {
             (RUN_SELF_PATH, &Method::GET) => {
                 match self
                     .run_of(&request.headers, now)
-                    .and_then(|key| self.runs.record(key, now))
+                    .and_then(|key| self.runs.record(&key, now))
                 {
                     Some(record) => json(200, &record),
                     None => reject(401, "client authentication required\n"),
@@ -412,7 +412,7 @@ impl RunTokenFilter {
             (RUN_SELF_PATH, &Method::DELETE) => {
                 match self
                     .run_of(&request.headers, now)
-                    .and_then(|key| self.runs.finish(key, now))
+                    .and_then(|key| self.runs.finish(&key, now))
                 {
                     Some(record) => json(200, &record),
                     None => reject(401, "client authentication required\n"),

@@ -314,15 +314,15 @@ impl Runs {
         self.state(now).tokens.get(&token_hash(token)).copied()
     }
 
-    pub fn record(&self, key: RunKey, now: Instant) -> Option<RunRecord> {
-        self.state(now).runs.get(&key).map(|run| run.record.clone())
+    pub fn record(&self, key: &RunKey, now: Instant) -> Option<RunRecord> {
+        self.state(now).runs.get(key).map(|run| run.record.clone())
     }
 
     /// End a run: it admits no more requests and its record is final, apart
     /// from requests still in flight. Finishing it again returns the record.
-    pub fn finish(&self, key: RunKey, now: Instant) -> Option<RunRecord> {
+    pub fn finish(&self, key: &RunKey, now: Instant) -> Option<RunRecord> {
         let mut state = self.state(now);
-        let run = state.runs.get_mut(&key)?;
+        let run = state.runs.get_mut(key)?;
         if run.record.state == RunState::Active {
             run.record.state = RunState::Finished;
             run.record.finished_at_unix = Some(unix_now());
@@ -332,9 +332,9 @@ impl Runs {
     }
 
     /// Admit a request of an active run within its concurrency.
-    pub fn admit(self: &Arc<Self>, key: RunKey, now: Instant) -> Result<Admission, Refusal> {
+    pub fn admit(self: &Arc<Self>, key: &RunKey, now: Instant) -> Result<Admission, Refusal> {
         let mut state = self.state(now);
-        let run = state.runs.get_mut(&key).ok_or(Refusal::Closed)?;
+        let run = state.runs.get_mut(key).ok_or(Refusal::Closed)?;
         if run.record.state != RunState::Active {
             return Err(Refusal::Closed);
         }
@@ -344,16 +344,16 @@ impl Runs {
         run.in_flight += 1;
         Ok(Admission {
             runs: Arc::clone(self),
-            key,
+            key: *key,
             success: false,
             usage_free: false,
             settled: false,
         })
     }
 
-    fn settle(&self, key: RunKey, outcome: Outcome) {
+    fn settle(&self, key: &RunKey, outcome: Outcome) {
         let mut state = lock(&self.state);
-        let Some(run) = state.runs.get_mut(&key) else {
+        let Some(run) = state.runs.get_mut(key) else {
             return;
         };
         run.in_flight = run.in_flight.saturating_sub(1);
@@ -420,7 +420,7 @@ impl Admission {
             }
             None => Outcome::Failed,
         };
-        self.runs.settle(self.key, outcome);
+        self.runs.settle(&self.key, outcome);
     }
 }
 
@@ -435,7 +435,7 @@ impl Drop for Admission {
         } else {
             Outcome::Failed
         };
-        self.runs.settle(self.key, outcome);
+        self.runs.settle(&self.key, outcome);
     }
 }
 
@@ -544,7 +544,7 @@ mod tests {
         let runs = Arc::new(Runs::default());
         let now = Instant::now();
         let (lost, key) = register(&runs, 1, now);
-        runs.admit(key, now).unwrap().settle(used(300, None));
+        runs.admit(&key, now).unwrap().settle(used(300, None));
         // Other limits in the retry are ignored: the run keeps its own.
         let shorter = Limits {
             ttl: Duration::from_secs(1),
@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(runs.authenticate(&token, now), Some(key));
         assert_eq!(runs.authenticate(&lost, now), None);
         // Not once the run has ended.
-        runs.finish(key, now);
+        runs.finish(&key, now);
         assert_eq!(
             runs.register(identity(1), limits(), now),
             Err(RegisterError::AlreadyRegistered)
@@ -575,14 +575,14 @@ mod tests {
         let now = Instant::now();
         let (_, key) = register(&runs, 1, now);
         for (total, model) in [(100, Some("a")), (20, Some("b")), (3, Some("a")), (4, None)] {
-            runs.admit(key, now).unwrap().settle(used(total, model));
+            runs.admit(&key, now).unwrap().settle(used(total, model));
         }
         // More models than a record keeps count only in the totals.
         for i in 0..MAX_MODELS {
             let model = format!("extra-{i}");
-            runs.admit(key, now).unwrap().settle(used(1, Some(&model)));
+            runs.admit(&key, now).unwrap().settle(used(1, Some(&model)));
         }
-        let record = runs.record(key, now).unwrap();
+        let record = runs.record(&key, now).unwrap();
         assert_eq!(
             (record.requests, record.tokens.total),
             (4 + MAX_MODELS as u64, 127 + MAX_MODELS as u64)
@@ -599,13 +599,13 @@ mod tests {
         let runs = Arc::new(Runs::default());
         let now = Instant::now();
         let (_, key) = register(&runs, 1, now);
-        let a = runs.admit(key, now).unwrap();
-        let _b = runs.admit(key, now).unwrap();
-        assert_eq!(runs.admit(key, now).err(), Some(Refusal::Busy));
+        let a = runs.admit(&key, now).unwrap();
+        let _b = runs.admit(&key, now).unwrap();
+        assert_eq!(runs.admit(&key, now).err(), Some(Refusal::Busy));
         drop(a);
-        let c = runs.admit(key, now).unwrap();
+        let c = runs.admit(&key, now).unwrap();
         drop(c);
-        let record = runs.record(key, now).unwrap();
+        let record = runs.record(&key, now).unwrap();
         assert_eq!((record.requests, record.unmetered), (0, 0));
     }
 
@@ -616,7 +616,7 @@ mod tests {
         let (_, key) = register(&runs, 1, now);
         // (upstream answered with success, settled or dropped)
         for (success, settled) in [(false, true), (true, true), (false, false), (true, false)] {
-            let mut admission = runs.admit(key, now).unwrap();
+            let mut admission = runs.admit(&key, now).unwrap();
             admission.success = success;
             if settled {
                 admission.settle(None);
@@ -627,7 +627,7 @@ mod tests {
         // A request that uses no tokens counts as neither, even if
         // upstream reported some or the response ended early.
         for settled in [true, false] {
-            let mut admission = runs.admit(key, now).unwrap();
+            let mut admission = runs.admit(&key, now).unwrap();
             (admission.success, admission.usage_free) = (true, true);
             if settled {
                 admission.settle(used(5, None));
@@ -635,7 +635,7 @@ mod tests {
                 drop(admission);
             }
         }
-        let record = runs.record(key, now).unwrap();
+        let record = runs.record(&key, now).unwrap();
         assert_eq!(
             (record.requests, record.unmetered, record.tokens.total),
             (0, 2, 0)
@@ -648,17 +648,17 @@ mod tests {
         let runs = Arc::new(Runs::default());
         let now = Instant::now();
         let (token, key) = register(&runs, 1, now);
-        let in_flight = runs.admit(key, now).unwrap();
-        let record = runs.finish(key, now).unwrap();
+        let in_flight = runs.admit(&key, now).unwrap();
+        let record = runs.finish(&key, now).unwrap();
         assert_eq!(record.state, RunState::Finished);
         assert!(record.finished_at_unix.is_some());
-        assert_eq!(runs.finish(key, now).unwrap(), record);
+        assert_eq!(runs.finish(&key, now).unwrap(), record);
         // The token still names the run, for its record, but admits nothing.
         assert_eq!(runs.authenticate(&token, now), Some(key));
-        assert_eq!(runs.admit(key, now).err(), Some(Refusal::Closed));
+        assert_eq!(runs.admit(&key, now).err(), Some(Refusal::Closed));
         // A request admitted before the finish is still recorded.
         in_flight.settle(used(5, None));
-        assert_eq!(runs.record(key, now).unwrap().tokens.total, 5);
+        assert_eq!(runs.record(&key, now).unwrap().tokens.total, 5);
         assert_eq!(
             runs.register(identity(1), limits(), now),
             Err(RegisterError::AlreadyRegistered)
@@ -667,12 +667,12 @@ mod tests {
         let (token, key) = register(&runs, 2, now);
         let expired = now + Duration::from_secs(600);
         assert_eq!(runs.authenticate(&token, expired), Some(key));
-        assert_eq!(runs.record(key, expired).unwrap().state, RunState::Expired);
-        assert_eq!(runs.admit(key, expired).err(), Some(Refusal::Closed));
+        assert_eq!(runs.record(&key, expired).unwrap().state, RunState::Expired);
+        assert_eq!(runs.admit(&key, expired).err(), Some(Refusal::Closed));
         // Forgotten after the retention period, so the registry stays bounded.
         let forgotten = expired + RETENTION;
         assert!(runs.authenticate(&token, forgotten).is_none());
-        assert!(runs.record(key, forgotten).is_none());
+        assert!(runs.record(&key, forgotten).is_none());
         assert!(lock(&runs.state).tokens.is_empty());
     }
 }
