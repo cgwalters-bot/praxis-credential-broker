@@ -251,6 +251,14 @@ wait_ready() {
 http_status() {
     curl --silent --output /dev/null --write-out '%{http_code}' "$@"
 }
+# Whether one line of $logs has every argument. Each grep reads to the end:
+# in long logs, one that left at its first match would end the pipe under
+# its writer, which pipefail takes for a failure, and a check that the logs
+# lack something would pass on it.
+logged() {
+    local lines=$logs word
+    for word; do lines=$(grep -F -- "$word" <<<"$lines") || return 1; done
+}
 test_pod=praxis-credential-broker-test
 test_socket=praxis-credential-broker-test-socket
 test_client=praxis-credential-broker-test-client
@@ -384,11 +392,11 @@ python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert x["state"] == "fi
 test "$(http_status -H "Authorization: Bearer $run_token" -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses)" = 401
 logs=$(podman pod logs "$test_pod")
 for secret in synthetic-agent-channel-012345678901234567890123 caller-value-must-not-reach-upstream "$test_anthropic_token" "$run_token" "$lost_token" "$jwt"; do
-    printf '%s' "$logs" | grep -Fq "$secret" && exit 1
+    logged "$secret" && exit 1
 done
-printf '%s' "$logs" | grep -F 'run usage' | grep -Fq 'finished'
-printf '%s' "$logs" | grep -F 'request usage' | grep -Fq injected
-printf '%s' "$logs" | grep -Fq unproven && exit 1
+logged 'run usage' 'finished'
+logged 'request usage' injected
+logged unproven && exit 1
 podman inspect "$test_pod-praxis" | grep -Fq "$test_anthropic_token" && exit 1
 
 # Second pass: a per-run cap of 150 tokens, which the second response
@@ -424,10 +432,10 @@ usage=$(curl --fail --silent http://127.0.0.1:18081/usage)
 python3 -c 'import json,sys; x=json.loads(sys.argv[1]); u=x["unproven_runs"]; assert (u["registered"], u["refused"], u["requests"], u["tokens"]["total"]) == (2, 1, 2, 200), u; assert x["codex"]["counts"]["requests"] == 4, x' "$usage"
 logs=$(podman pod logs "$test_pod")
 for secret in "$run_token" "$unproven_token"; do
-    printf '%s' "$logs" | grep -Fq "$secret" && exit 1
+    logged "$secret" && exit 1
 done
-printf '%s' "$logs" | grep -Fq 'WITHOUT PROOF'
-printf '%s' "$logs" | grep -F 'unproven run registered' | grep -Fq 'unproven-run:pod-run'
-printf '%s' "$logs" | grep -F 'request usage' | grep -Fq 'unproven-run:pod-run'
-printf '%s' "$logs" | grep -F 'run usage' | grep -F 'pod-run' | grep -Fq 'finished'
+logged 'WITHOUT PROOF'
+logged 'unproven run registered' 'unproven-run:pod-run'
+logged 'request usage' 'unproven-run:pod-run'
+logged 'run usage' 'pod-run' 'finished'
 echo 'Synthetic native Podman pod checks passed.'
