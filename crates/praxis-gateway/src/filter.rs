@@ -39,7 +39,10 @@
 //! router matches a header against any of its values, conditions against the
 //! first, and the two must agree on which route a request takes.
 use crate::{
-    oidc::{DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy},
+    oidc::{
+        AnyWorkflow, CalledWorkflow, DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy,
+        present,
+    },
     operators::{self, Operators},
     runs::{
         Admission, Limits, MAX_UNPROVEN_RUNS, Quota, Refusal, RegisterError, RunKey, RunName, Runs,
@@ -209,8 +212,18 @@ struct PolicyFile {
     /// Entry workflows (`workflow_ref`) that may call the job's workflow;
     /// by default only the job's own.
     entry_workflows: Option<HashSet<String>>,
-    #[serde(default = "default_events")]
-    events: HashSet<String>,
+    /// Events that may start a workflow of `workflows`; `workflow_dispatch`
+    /// if left out.
+    #[serde(default, deserialize_with = "present")]
+    events: Option<HashSet<String>>,
+    /// Workflows admitted wherever they run, such as a reusable workflow
+    /// called from another repository. Off unless present.
+    #[serde(default)]
+    called_workflows: Vec<CalledWorkflow>,
+    /// Admit every workflow of some repositories, or of all. Off unless
+    /// present.
+    #[serde(default, deserialize_with = "present")]
+    any_workflow: Option<AnyWorkflow>,
     /// How long a run lasts. The window of the `token_rate_limit` rule that
     /// caps runs must be at least this long.
     #[serde(default = "default_max_secs")]
@@ -605,22 +618,30 @@ impl Registrar {
             Err(e) => return Err(path_error(&e)),
         };
         let file: PolicyFile = serde_yaml::from_str(&text).map_err(|e| path_error(&e))?;
+        // These narrow `workflows` and no other entry.
+        let narrows_workflows = file.events.is_some() || file.entry_workflows.is_some();
         let policy = Policy {
             audience: file.audience,
             workflows: file.workflows,
             repository_ids: file.repository_ids,
             owner_ids: file.owner_ids,
             entry_workflows: file.entry_workflows,
-            events: file.events,
+            events: file.events.unwrap_or_else(default_events),
+            called_workflows: file.called_workflows,
+            any_workflow: file.any_workflow,
         };
-        // A policy for registration without proof only names no workflow,
-        // and then nothing about one either.
-        let proves = !(file.unproven.is_some()
-            && policy.workflows.is_empty()
-            && policy.repository_ids.is_empty()
-            && policy.owner_ids.is_empty());
-        if proves {
+        // A policy for registration without proof only has no entry that
+        // admits a token, and then nothing about one either.
+        let proves = policy.proves();
+        if proves || file.unproven.is_none() {
             policy.validate().map_err(|e| path_error(&e))?;
+        }
+        // Beside only the entries that have events of their own, a reader
+        // would take these for a limit on them, which they are not.
+        if proves && !policy.names_workflows() && narrows_workflows {
+            return Err(path_error(
+                &"events and entry_workflows apply to `workflows` only; give called_workflows and any_workflow their own events",
+            ));
         }
         if file.max_secs == 0 || file.concurrency == 0 {
             return Err(path_error(&"max_secs and concurrency must be positive"));
@@ -643,6 +664,25 @@ impl Registrar {
                 max_registrations = quota.max,
                 window_secs = quota.window.as_secs(),
                 "runs register WITHOUT PROOF: any client that reaches the listener can use the broker's credentials"
+            );
+        }
+        for called in &policy.called_workflows {
+            warn!(
+                policy_file = %path.display(),
+                workflow = %called.workflow,
+                git_ref = called.git_ref.as_deref().unwrap_or_default(),
+                sha = called.sha.as_deref().unwrap_or_default(),
+                any_caller = called.callers.any,
+                "runs register for a workflow called from other repositories"
+            );
+        }
+        if let Some(any) = &policy.any_workflow {
+            warn!(
+                policy_file = %path.display(),
+                any_repository = any.repositories.any,
+                owner_ids = ?any.repositories.owner_ids,
+                repository_ids = ?any.repositories.repository_ids,
+                "runs register for ANY WORKFLOW of the admitted repositories"
             );
         }
         let client = reqwest::Client::builder()
@@ -1059,6 +1099,102 @@ mod tests {
                 Some(r#"{"workflows": ["w"], "unproven": {"max_registrations": 8}}"#),
                 Err(()),
             ),
+            // The entries that are off unless present, alone, beside
+            // `workflows` and beside registration without proof.
+            (
+                "any workflow of an owner",
+                Some(r#"{"any_workflow": {"repositories": {"owner_ids": [7]}}}"#),
+                Ok(true),
+            ),
+            (
+                "any workflow and a named one",
+                Some(
+                    r#"{"workflows": ["w"], "owner_ids": [7], "any_workflow": {"repositories": {"any": true}}}"#,
+                ),
+                Ok(true),
+            ),
+            (
+                "a called workflow and unproven",
+                Some(
+                    r#"{"called_workflows": [{"workflow": "o/r/w.yml", "ref": "refs/heads/main", "callers": {"any": true}}], "unproven": {"max_registrations": 8}}"#,
+                ),
+                Ok(true),
+            ),
+            (
+                "any workflow of nobody",
+                Some(r#"{"any_workflow": {"repositories": {}}}"#),
+                Err(()),
+            ),
+            (
+                "any workflow, unknown field",
+                Some(r#"{"any_workflow": {"repositories": {"any": true}, "owner_ids": [7]}}"#),
+                Err(()),
+            ),
+            (
+                "a called workflow at no ref",
+                Some(
+                    r#"{"called_workflows": [{"workflow": "o/r/w.yml", "callers": {"any": true}}]}"#,
+                ),
+                Err(()),
+            ),
+            // An entry that is wrong is refused beside ones that are not.
+            (
+                "unproven, any workflow of nobody",
+                Some(
+                    r#"{"any_workflow": {"repositories": {}}, "unproven": {"max_registrations": 8}}"#,
+                ),
+                Err(()),
+            ),
+            (
+                "a named workflow, a called one at no ref",
+                Some(
+                    r#"{"workflows": ["w"], "owner_ids": [7], "called_workflows": [{"workflow": "o/r/w.yml", "callers": {"any": true}}]}"#,
+                ),
+                Err(()),
+            ),
+            // Nor do they stand in for the ids `workflows` needs.
+            (
+                "names only, any workflow",
+                Some(
+                    r#"{"workflows": ["w"], "any_workflow": {"repositories": {"owner_ids": [7]}}}"#,
+                ),
+                Err(()),
+            ),
+            (
+                "no called workflows",
+                Some(r#"{"called_workflows": []}"#),
+                Err(()),
+            ),
+            // The events beside `workflows` are its own, and are refused
+            // where they would be taken for a limit on another entry.
+            (
+                "any workflow under the events of workflows",
+                Some(
+                    r#"{"any_workflow": {"repositories": {"owner_ids": [7]}}, "events": ["workflow_dispatch"]}"#,
+                ),
+                Err(()),
+            ),
+            (
+                "a called workflow under entry workflows",
+                Some(
+                    r#"{"called_workflows": [{"workflow": "o/r/w.yml", "ref": "refs/heads/main", "callers": {"any": true}}], "entry_workflows": ["w"]}"#,
+                ),
+                Err(()),
+            ),
+            (
+                "each entry with events of its own",
+                Some(
+                    r#"{"workflows": ["w"], "owner_ids": [7], "events": ["push"], "any_workflow": {"repositories": {"owner_ids": [8]}, "events": ["workflow_dispatch"]}}"#,
+                ),
+                Ok(true),
+            ),
+            // A key with nothing under it is not the wider setting.
+            ("any workflow of nothing", Some("any_workflow:\n"), Err(())),
+            (
+                "no events at all",
+                Some("workflows: [w]\nowner_ids: [7]\nevents:\n"),
+                Err(()),
+            ),
         ];
         for (name, contents, expected) in cases {
             let path = dir.path().join(name);
@@ -1089,6 +1225,8 @@ mod tests {
             ("valid", true, None),
             ("unproven too", true, Some(hour(8))),
             ("unproven only", false, Some(two_hours)),
+            ("any workflow of an owner", true, None),
+            ("a called workflow and unproven", true, Some(hour(8))),
         ] {
             let registrar = Registrar::load(&dir.path().join(name)).unwrap().unwrap();
             assert_eq!(

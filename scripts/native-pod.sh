@@ -282,11 +282,16 @@ printf '%s' "$test_anthropic_token" | podman secret create --replace "$test_anth
 # The registration policy for a test workflow, whose OIDC tokens are signed
 # by the test-only key whose key set the mock serves, and for the second
 # pass praxis.yaml with a per-run cap of 150 tokens and that policy with
-# `unproven`, admitting two registrations without proof.
+# `unproven`, admitting two registrations without proof, and with the
+# entries that admit a reusable workflow called from the test owner's
+# repositories and any workflow of another owner's.
 test_workflow=owner/repo/.github/workflows/agent.yml@refs/heads/main
-python3 - "$root/praxis.yaml" "$test_dir" "$test_workflow" <<'PY'
+called_workflow=lib/agentic/.github/workflows/job.yml
+caller=owner/repo/.github/workflows/caller.yml@refs/heads/main
+called_claims="{\"job_workflow_ref\": \"$called_workflow@refs/heads/main\", \"workflow_ref\": \"$caller\"}"
+python3 - "$root/praxis.yaml" "$test_dir" "$test_workflow" "$called_workflow" <<'PY'
 import json, sys
-source, target, workflow = sys.argv[1:]
+source, target, workflow, called = sys.argv[1:]
 config = open(source).read()
 old = 'capacity: 20000000\n            reserved_tokens: 10000'
 assert config.count(old) == 2, old
@@ -294,15 +299,20 @@ open(f'{target}/praxis.yaml', 'w').write(config.replace(old, 'capacity: 150\n   
 policy = {'workflows': [workflow], 'repository_ids': [7], 'jwks_url': 'http://127.0.0.1:18081/jwks'}
 open(f'{target}/run-token-policy.yaml', 'w').write(json.dumps(policy))
 policy['unproven'] = {'max_registrations': 2}
+policy['called_workflows'] = [{'workflow': called, 'ref': 'refs/heads/main', 'callers': {'owner_ids': [70]}}]
+policy['any_workflow'] = {'repositories': {'owner_ids': [71]}}
 open(f'{target}/unproven-policy.yaml', 'w').write(json.dumps(policy))
 PY
 chmod 0755 "$test_dir"
 chmod 0644 "$test_dir"/*
+# An OIDC token of run $1 of workflow $2, with the claims of the JSON
+# object $3, if any, over its own.
 test_jwt() {
-    local header payload signature
+    local header payload signature claims=${3:-}
+    [[ -n $claims ]] || claims='{}'
     b64url() { python3 -c 'import base64,sys; print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).rstrip(b"=").decode())'; }
     header=$(printf '{"alg":"RS256","typ":"JWT","kid":"praxis-test-key"}' | b64url)
-    payload=$(python3 -c 'import json,sys,time,uuid; now=int(time.time()); print(json.dumps({"iss": "https://token.actions.githubusercontent.com", "aud": "praxis-credential-broker", "iat": now, "nbf": now, "exp": now + 300, "jti": str(uuid.uuid4()), "repository": "owner/repo", "repository_id": "7", "repository_owner_id": "70", "run_id": sys.argv[1], "run_attempt": "1", "job_workflow_ref": sys.argv[2], "workflow_ref": sys.argv[2], "event_name": "workflow_dispatch"}))' "$1" "$2" | tr -d '\n' | b64url)
+    payload=$(python3 -c 'import json,sys,time,uuid; now=int(time.time()); print(json.dumps({"iss": "https://token.actions.githubusercontent.com", "aud": "praxis-credential-broker", "iat": now, "nbf": now, "exp": now + 300, "jti": str(uuid.uuid4()), "repository": "owner/repo", "repository_id": "7", "repository_owner_id": "70", "run_id": sys.argv[1], "run_attempt": "1", "job_workflow_ref": sys.argv[2], "workflow_ref": sys.argv[2], "event_name": "workflow_dispatch", **json.loads(sys.argv[3])}))' "$1" "$2" "$claims" | tr -d '\n' | b64url)
     signature=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign "$root/crates/praxis-gateway/testdata/oidc-test-key.pem" -binary | b64url)
     printf '%s.%s.%s' "$header" "$payload" "$signature"
 }
@@ -367,6 +377,11 @@ test "$(http_status -H 'Authorization: Bearer caller-value-must-not-reach-upstre
 test "$(http_status -H 'Authorization: Bearer praxis-substitute:anthropic' -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/anthropic/v1/messages/count_tokens)" = 401
 mock_counters '{"calls": 0, "observed": []}'
 test "$(http_status -X POST -H "Authorization: Bearer $(test_jwt 1 owner/repo/.github/workflows/devspace.yml@refs/heads/main)" http://127.0.0.1:18081/v1/runs)" = 403
+# Nor may a reusable workflow called from the test repository, or a
+# workflow of another repository: the policy has neither `called_workflows`
+# nor `any_workflow`.
+test "$(http_status -X POST -H "Authorization: Bearer $(test_jwt 1 "$test_workflow" "$called_claims")" http://127.0.0.1:18081/v1/runs)" = 403
+test "$(http_status -X POST -H "Authorization: Bearer $(test_jwt 1 "$test_workflow" '{"repository_id": "80", "repository_owner_id": "71"}')" http://127.0.0.1:18081/v1/runs)" = 403
 jwt=$(test_jwt 1 "$test_workflow")
 registration=$(curl --fail --silent -X POST -H "Authorization: Bearer $jwt" http://127.0.0.1:18081/v1/runs)
 run_token=$(python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert x["usage"]["run_id"] == 1, x; print(x["token"])' "$registration")
@@ -397,6 +412,8 @@ done
 logged 'run usage' 'finished'
 logged 'request usage' injected
 logged unproven && exit 1
+logged 'ANY WORKFLOW' && exit 1
+logged 'called from other repositories' && exit 1
 podman inspect "$test_pod-praxis" | grep -Fq "$test_anthropic_token" && exit 1
 
 # Second pass: a per-run cap of 150 tokens, which the second response
@@ -430,11 +447,38 @@ python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert (x["proof"], x["r
 test "$(http_status -H "Authorization: Bearer $unproven_token" -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses)" = 401
 usage=$(curl --fail --silent http://127.0.0.1:18081/usage)
 python3 -c 'import json,sys; x=json.loads(sys.argv[1]); u=x["unproven_runs"]; assert (u["registered"], u["refused"], u["requests"], u["tokens"]["total"]) == (2, 1, 2, 200), u; assert x["codex"]["counts"]["requests"] == 4, x' "$usage"
+# The policy's other entries: the called workflow registers from the test
+# repository and any workflow of owner 71, each a run with a cap of its own
+# whose record says what admitted it; a token no entry admits gets 403.
+registration=$(curl --fail --silent -X POST -H "Authorization: Bearer $(test_jwt 4 "$test_workflow" "$called_claims")" http://127.0.0.1:18081/v1/runs)
+called_token=$(python3 -c 'import json,sys; x=json.loads(sys.argv[1]); u=x["usage"]; assert (u["proof"], u["admitted_by"], u["workflow_ref"], u["entry_workflow_ref"], u["repository"]) == ("github-oidc", "called_workflows", sys.argv[2] + "@refs/heads/main", sys.argv[3], "owner/repo"), u; print(x["token"])' "$registration" "$called_workflow" "$caller")
+registration=$(curl --fail --silent -X POST -H "Authorization: Bearer $(test_jwt 5 other/tool/.github/workflows/ci.yml@refs/heads/topic '{"repository": "other/tool", "repository_id": "80", "repository_owner_id": "71", "event_name": "push"}')" http://127.0.0.1:18081/v1/runs)
+python3 -c 'import json,sys; u=json.loads(sys.argv[1])["usage"]; assert (u["admitted_by"], u["repository_owner_id"], u["event_name"]) == ("any_workflow", 71, "push"), u' "$registration"
+for claims in \
+    "{\"job_workflow_ref\": \"$called_workflow@refs/heads/topic\", \"workflow_ref\": \"$caller\"}" \
+    "{\"job_workflow_ref\": \"evil/agentic/.github/workflows/job.yml@refs/heads/main\", \"workflow_ref\": \"$caller\"}" \
+    "{\"job_workflow_ref\": \"$called_workflow@refs/heads/main\", \"workflow_ref\": \"$caller\", \"repository_owner_id\": \"72\"}" \
+    '{"repository_id": "90", "repository_owner_id": "72"}'; do
+    test "$(http_status -X POST -H "Authorization: Bearer $(test_jwt 6 "$test_workflow" "$claims")" http://127.0.0.1:18081/v1/runs)" = 403
+done
+for _ in 1 2; do
+    stream=$(curl --fail --silent -H "Authorization: Bearer $called_token" -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"model":"synthetic"}' http://127.0.0.1:18081/v1/responses); case "$stream" in *response.completed*) ;; *) exit 1;; esac
+done
+test "$(http_status -H "Authorization: Bearer $called_token" -H 'Content-Type: application/json' --data '{"model":"synthetic"}' http://127.0.0.1:18081/v1/responses)" = 429
+usage=$(curl --fail --silent -X DELETE -H "Authorization: Bearer $called_token" http://127.0.0.1:18081/v1/runs/self)
+python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert (x["admitted_by"], x["state"], x["requests"], x["tokens"]["total"]) == ("called_workflows", "finished", 2, 200), x' "$usage"
+test "$(http_status -H "Authorization: Bearer $called_token" -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses)" = 401
+# They are no runs without proof: that count is as it was.
+python3 -c 'import json,sys,urllib.request; x=json.load(urllib.request.urlopen("http://127.0.0.1:18081/usage")); assert (x["unproven_runs"]["registered"], x["unproven_runs"]["requests"], x["codex"]["counts"]["requests"]) == (2, 2, 6), x'
 logs=$(podman pod logs "$test_pod")
-for secret in "$run_token" "$unproven_token"; do
+for secret in "$run_token" "$unproven_token" "$called_token"; do
     logged "$secret" && exit 1
 done
 logged 'WITHOUT PROOF'
+logged 'ANY WORKFLOW'
+logged 'called from other repositories'
+logged 'run registered' 'github-run:7/4/1' called_workflows "$called_workflow@refs/heads/main" "$caller"
+logged 'request usage' 'github-run:7/4/1'
 logged 'unproven run registered' 'unproven-run:pod-run'
 logged 'request usage' 'unproven-run:pod-run'
 logged 'run usage' 'pod-run' 'finished'

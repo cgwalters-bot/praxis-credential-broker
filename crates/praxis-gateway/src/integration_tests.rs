@@ -5,7 +5,10 @@
 //! provider window and per run by its `token_rate_limit`, keyed on the run
 //! that `run_token` authenticates.
 use crate::{
-    oidc::testing::{OWNER_ID, REPOSITORY_ID, TEST_JWKS, WORKFLOW, jwt},
+    oidc::testing::{
+        CALLED, CALLED_SHA, CALLER, OWNER_ID, REPOSITORY_ID, TEST_JWKS, WORKFLOW, called_at, jwt,
+        with,
+    },
     runs::RECORD_SCHEMA,
 };
 use axum::{
@@ -59,6 +62,10 @@ const RECORDED_STREAM: &str = include_str!("../testdata/codex-responses-stream.s
 /// The `input` the fake Responses upstream answers with `RECORDED_STREAM`.
 const RECORDED_INPUT: &str = "recorded";
 const MESSAGES_TOTAL: u64 = 90;
+/// The ref `permissive_policy` admits the called workflow at, and the owner
+/// whose every workflow it admits.
+const MAIN: &str = "refs/heads/main";
+const OTHER_OWNER_ID: u64 = 71;
 
 /// What the fake upstreams received, in order.
 #[derive(Default)]
@@ -268,6 +275,32 @@ fn unproven_policy(max: u64) -> Value {
     let mut policy = proving_policy();
     policy["unproven"] = json!({"max_registrations": max});
     policy
+}
+
+/// `proving_policy` that also admits `CALLED` at its main branch from the
+/// test owner's repositories, and any workflow of another owner's.
+fn permissive_policy() -> Value {
+    let mut policy = proving_policy();
+    policy["called_workflows"] = json!([{
+        "workflow": CALLED,
+        "ref": MAIN,
+        "callers": {"owner_ids": [OWNER_ID]},
+    }]);
+    policy["any_workflow"] = json!({"repositories": {"owner_ids": [OTHER_OWNER_ID]}});
+    policy
+}
+
+/// What a token of a workflow in a repository of `OTHER_OWNER_ID` says.
+fn other_owners(event: &str) -> Value {
+    let workflow = "other/tool/.github/workflows/ci.yml@refs/heads/topic";
+    json!({
+        "repository": "other/tool",
+        "repository_id": "80",
+        "repository_owner_id": OTHER_OWNER_ID.to_string(),
+        "job_workflow_ref": workflow,
+        "workflow_ref": workflow,
+        "event_name": event,
+    })
 }
 
 impl Harness {
@@ -1462,4 +1495,320 @@ async fn a_policy_for_registration_without_proof_only_takes_no_oidc_token() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, _) = h.register_with(&[("x-run-id", "next")]).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// Every token the committed kind of policy refuses, by what it says beyond
+/// the test workflow's own run: (name, claims).
+fn tokens_a_naming_policy_refuses() -> Vec<(&'static str, Value)> {
+    let unlisted =
+        json!({"repository": "third/tool", "repository_id": "90", "repository_owner_id": "72"});
+    vec![
+        (
+            "a reusable workflow called from the same repository",
+            called_at(MAIN),
+        ),
+        (
+            "the named workflow called by another",
+            json!({"workflow_ref": CALLER}),
+        ),
+        (
+            "the named workflow called from elsewhere",
+            json!({"repository": "other/tool"}),
+        ),
+        ("another owner's workflow", other_owners("push")),
+        (
+            "an owner nothing lists",
+            with(other_owners("push"), &unlisted),
+        ),
+        (
+            "another event",
+            json!({"event_name": "pull_request_target"}),
+        ),
+        (
+            "another ref",
+            json!({"job_workflow_ref": "owner/repo/.github/workflows/agent.yml@refs/heads/evil"}),
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_new_entries_every_such_token_is_refused_as_before() {
+    let h = Harness::with_policy().await;
+    for (run, (name, claims)) in (10..).zip(tokens_a_naming_policy_refuses()) {
+        let response = h
+            .call(
+                Method::POST,
+                "/v1/runs",
+                &[("authorization", &format!("Bearer {}", jwt(run, &claims)))],
+                None,
+            )
+            .await;
+        assert_eq!(
+            (response.status(), response.text().await.unwrap().as_str()),
+            (StatusCode::FORBIDDEN, "workflow may not register runs\n"),
+            "{name}"
+        );
+    }
+    // And what it admits says which entry did.
+    let (status, body) = h.register(&jwt(1, &json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["usage"]["admitted_by"], "workflows");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_new_entry_admits_what_it_names_with_the_same_statuses() {
+    let h = Harness::start_with(Some(permissive_policy()), |_| {}).await;
+    let now = crate::runs::unix_now();
+    let fork =
+        json!({"job_workflow_ref": format!("evil/agentic/.github/workflows/job.yml@{MAIN}")});
+    let unlisted =
+        json!({"repository": "third/tool", "repository_id": "90", "repository_owner_id": "72"});
+    let (created, forbidden, unauthorized) = (
+        StatusCode::CREATED,
+        StatusCode::FORBIDDEN,
+        StatusCode::UNAUTHORIZED,
+    );
+    // (name, what the token says, status, the entry that admitted it)
+    let cases = [
+        ("the named workflow", json!({}), created, Some("workflows")),
+        (
+            "the called workflow",
+            called_at(MAIN),
+            created,
+            Some("called_workflows"),
+        ),
+        (
+            "the called workflow on any event",
+            with(called_at(MAIN), &json!({"event_name": "push"})),
+            created,
+            Some("called_workflows"),
+        ),
+        (
+            "any workflow of the other owner",
+            other_owners("push"),
+            created,
+            Some("any_workflow"),
+        ),
+        // Called from that owner's repository, any workflow is its own.
+        (
+            "the called workflow at another ref, from the other owner",
+            with(other_owners("push"), &called_at("refs/heads/topic")),
+            created,
+            Some("any_workflow"),
+        ),
+        (
+            "the called workflow at another ref",
+            called_at("refs/heads/topic"),
+            forbidden,
+            None,
+        ),
+        (
+            "a fork of the called workflow",
+            with(called_at(MAIN), &fork),
+            forbidden,
+            None,
+        ),
+        (
+            "the called workflow from an owner nothing lists",
+            with(called_at(MAIN), &unlisted),
+            forbidden,
+            None,
+        ),
+        (
+            "a workflow of an owner nothing lists",
+            with(other_owners("push"), &unlisted),
+            forbidden,
+            None,
+        ),
+        (
+            "another workflow of the named one's repository",
+            json!({"job_workflow_ref": "owner/repo/.github/workflows/devspace.yml@refs/heads/main"}),
+            forbidden,
+            None,
+        ),
+        (
+            "another issuer",
+            with(other_owners("push"), &json!({"iss": "https://example.com"})),
+            unauthorized,
+            None,
+        ),
+        (
+            "another audience",
+            with(called_at(MAIN), &json!({"aud": "someone-else"})),
+            unauthorized,
+            None,
+        ),
+        (
+            "expired",
+            with(
+                other_owners("push"),
+                &json!({"exp": now - 600, "iat": now - 900, "nbf": now - 900}),
+            ),
+            unauthorized,
+            None,
+        ),
+    ];
+    for (run, (name, claims, expected, admitted_by)) in (10..).zip(cases) {
+        let (status, body) = h.register(&jwt(run, &claims)).await;
+        assert_eq!(status, expected, "{name}");
+        assert_eq!(body["usage"]["admitted_by"].as_str(), admitted_by, "{name}");
+    }
+    assert_eq!(h.upstream.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_a_new_entry_admits_is_capped_metered_and_ended_like_any_other() {
+    let h = Harness::start_with(Some(permissive_policy()), |_| {}).await;
+    // (what the token says, the run's record of who it is)
+    let admitted = [
+        (
+            called_at(MAIN),
+            json!({
+                "proof": "github-oidc",
+                "admitted_by": "called_workflows",
+                "repository": "owner/repo",
+                "repository_id": REPOSITORY_ID,
+                "repository_owner_id": OWNER_ID,
+                "run_id": 1,
+                "run_attempt": 1,
+                "check_run_id": null,
+                "workflow_ref": format!("{CALLED}@{MAIN}"),
+                "workflow_sha": CALLED_SHA,
+                "entry_workflow_ref": CALLER,
+                "event_name": "workflow_dispatch",
+                "actor": "someone",
+            }),
+        ),
+        (
+            other_owners("push"),
+            json!({
+                "proof": "github-oidc",
+                "admitted_by": "any_workflow",
+                "repository": "other/tool",
+                "repository_id": 80,
+                "repository_owner_id": OTHER_OWNER_ID,
+                "run_id": 1,
+                "run_attempt": 1,
+                "check_run_id": null,
+                "workflow_ref": "other/tool/.github/workflows/ci.yml@refs/heads/topic",
+                "workflow_sha": null,
+                "entry_workflow_ref": "other/tool/.github/workflows/ci.yml@refs/heads/topic",
+                "event_name": "push",
+                "actor": null,
+            }),
+        ),
+    ];
+    for (claims, identity) in admitted {
+        let token = jwt(1, &claims);
+        let (status, body) = h.register(&token).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let run_token = body["token"].as_str().unwrap().to_owned();
+        let record = &body["usage"];
+        for (name, value) in identity.as_object().unwrap() {
+            assert_eq!(&record[name], value, "{name}");
+        }
+        assert_eq!(
+            record["expires_at_unix"].as_u64().unwrap()
+                - record["registered_at_unix"].as_u64().unwrap(),
+            21600,
+            "the default max_secs"
+        );
+        // Once per job: another token of the same job gets no second cap.
+        assert_eq!(h.register(&jwt(1, &claims)).await.0, StatusCode::CONFLICT);
+        // Each run has a cap of its own, which the second response
+        // overshoots and token_rate_limit then enforces.
+        for _ in 0..2 {
+            let (status, body) = h.respond(Some(&run_token), "", false).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, _) = h.respond(Some(&run_token), "", false).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let usage = h.usage(&run_token).await;
+        assert_eq!(
+            (
+                &usage["requests"],
+                &usage["tokens"]["total"],
+                &usage["admitted_by"]
+            ),
+            (
+                &json!(2),
+                &json!(2 * RESPONSES_TOTAL),
+                &identity["admitted_by"]
+            )
+        );
+        let (status, ended) = h.runs(Method::DELETE, "/v1/runs/self", &run_token).await;
+        assert_eq!(
+            (status, &ended["state"]),
+            (StatusCode::OK, &json!("finished"))
+        );
+        let (status, _) = h.respond(Some(&run_token), "", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // Neither counts as a run without proof.
+    assert!(h.broker_usage().await.get("unproven_runs").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_new_entries_change_nothing_for_unproven_runs_or_operator_tokens() {
+    let mut policy = permissive_policy();
+    policy["unproven"] = json!({"max_registrations": 1});
+    let h = Harness::start_with(Some(policy), |_| {}).await;
+    // A token is a claim of proof and is judged as one: a refused or bad
+    // one never falls back to registering without proof, and uses none of
+    // that quota.
+    let refused = jwt(1, &called_at("refs/heads/topic"));
+    let auth = format!("Bearer {refused}");
+    let operator = format!("Bearer {OPERATOR_TOKEN}");
+    let attempts: [(Headers, StatusCode); 4] = [
+        (
+            &[("authorization", &auth), ("x-run-id", "job-1")],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &[("authorization", "Bearer not.a.jwt"), ("x-run-id", "job-1")],
+            StatusCode::UNAUTHORIZED,
+        ),
+        // An operator token registers nothing, however permissive the policy.
+        (&[("authorization", &operator)], StatusCode::UNAUTHORIZED),
+        (
+            &[("authorization", &operator), ("x-run-id", "job-1")],
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (headers, expected) in attempts {
+        let (status, _) = h.register_with(headers).await;
+        assert_eq!(status, expected, "{headers:?}");
+    }
+    let unproven = h.unproven_run("job-1").await;
+    let (status, _) = h.register_with(&[("x-run-id", "job-2")]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // Proven runs are outside that quota, whichever entry admits them, and
+    // a record says which kind of run it is of.
+    let (status, body) = h.register(&jwt(1, &called_at(MAIN))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let called = body["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (&body["usage"]["proof"], &body["usage"]["admitted_by"]),
+        (&json!("github-oidc"), &json!("called_workflows"))
+    );
+    let record = h.usage(&unproven).await;
+    assert_eq!(record["proof"], "none");
+    assert!(record.get("admitted_by").is_none());
+    // An operator token is still admitted to its cluster and to no run.
+    for token in [unproven.as_str(), called.as_str(), OPERATOR_TOKEN] {
+        let (status, body) = h.respond(Some(token), "", false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, _) = h.runs(Method::GET, "/v1/runs/self", OPERATOR_TOKEN).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let broker = h.broker_usage().await;
+    assert_eq!(
+        (
+            &broker["unproven_runs"]["registered"],
+            &broker["unproven_runs"]["requests"],
+            &broker["operators"][OPERATOR]["requests"],
+            &broker["codex"]["counts"]["requests"],
+        ),
+        (&json!(1), &json!(1), &json!(1), &json!(3))
+    );
 }

@@ -78,7 +78,40 @@ pub struct RunIdentity {
     /// Tells the jobs of one run apart, such as a matrix's.
     pub check_run_id: Option<u64>,
     pub jti: String,
+    /// The `job_workflow_ref` claim: the workflow that runs the job.
     pub workflow_ref: String,
+    /// The `job_workflow_sha` claim: the commit of that workflow.
+    pub workflow_sha: Option<String>,
+    /// The `workflow_ref` claim: the workflow the run started from, which
+    /// for a reusable workflow is its caller.
+    pub entry_workflow_ref: String,
+    pub repository_owner_id: u64,
+    pub event_name: String,
+    pub actor: Option<String>,
+    pub admitted_by: Admitted,
+}
+
+/// The form of policy entry that admitted a run's OIDC token, by its key
+/// in the policy file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Admitted {
+    /// A workflow the policy names, in its own repository.
+    Workflows,
+    /// A named workflow run from a repository `callers` admits.
+    CalledWorkflows,
+    /// Any workflow of a repository the policy admits.
+    AnyWorkflow,
+}
+
+impl Admitted {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflows => "workflows",
+            Self::CalledWorkflows => "called_workflows",
+            Self::AnyWorkflow => "any_workflow",
+        }
+    }
 }
 
 impl RunIdentity {
@@ -206,6 +239,12 @@ pub enum Proof {
         run_attempt: u64,
         check_run_id: Option<u64>,
         workflow_ref: String,
+        workflow_sha: Option<String>,
+        entry_workflow_ref: String,
+        repository_owner_id: u64,
+        event_name: String,
+        actor: Option<String>,
+        admitted_by: Admitted,
     },
     /// Nothing: `run` is whatever the caller said.
     #[serde(rename = "none")]
@@ -213,8 +252,10 @@ pub enum Proof {
 }
 
 /// A run's usage record, returned to its job and logged when it ends. It
-/// holds identifiers, model names and numbers only, so it can go in a run
-/// footer as is.
+/// holds identifiers, model names and numbers and, for a proven run, names
+/// from its token (repository, refs, actor). Under a policy that admits
+/// more than it lists, whoever it admits chose those: escape them where
+/// they are rendered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RunRecord {
     pub schema: &'static str,
@@ -354,9 +395,19 @@ impl Runs {
             return Err(RegisterError::Full);
         }
         info!(
+            run = %key.subject(),
             run_id = identity.run_id,
             run_attempt = identity.run_attempt,
-            repository = %identity.repository,
+            // Quoted and escaped: under a permissive policy these are
+            // names the party being recorded chose.
+            repository = ?identity.repository,
+            repository_owner_id = identity.repository_owner_id,
+            workflow_ref = ?identity.workflow_ref,
+            workflow_sha = ?identity.workflow_sha,
+            entry_workflow_ref = ?identity.entry_workflow_ref,
+            event_name = ?identity.event_name,
+            actor = ?identity.actor,
+            admitted_by = identity.admitted_by.as_str(),
             ttl_secs = limits.ttl.as_secs(),
             "run registered"
         );
@@ -367,6 +418,12 @@ impl Runs {
             run_attempt: identity.run_attempt,
             check_run_id: identity.check_run_id,
             workflow_ref: identity.workflow_ref,
+            workflow_sha: identity.workflow_sha,
+            entry_workflow_ref: identity.entry_workflow_ref,
+            repository_owner_id: identity.repository_owner_id,
+            event_name: identity.event_name,
+            actor: identity.actor,
+            admitted_by: identity.admitted_by,
         };
         let record = state.insert(key, proof, Some(identity.jti), hash, limits, now);
         Ok((token, record))
@@ -594,6 +651,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const WORKFLOW: &str = "owner/repo/.github/workflows/agent.yml@refs/heads/main";
+
     fn limits() -> Limits {
         Limits {
             ttl: Duration::from_secs(600),
@@ -609,7 +668,13 @@ mod tests {
             run_attempt: 1,
             check_run_id: None,
             jti: format!("jti-{run_id}"),
-            workflow_ref: "owner/repo/.github/workflows/agent.yml@refs/heads/main".into(),
+            workflow_ref: WORKFLOW.into(),
+            workflow_sha: None,
+            entry_workflow_ref: WORKFLOW.into(),
+            repository_owner_id: 70,
+            event_name: "workflow_dispatch".into(),
+            actor: None,
+            admitted_by: Admitted::Workflows,
         }
     }
 
