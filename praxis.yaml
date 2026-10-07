@@ -157,6 +157,9 @@ filter_chains:
         public_paths: ["/healthz"]
         # Counting tokens uses none: admitted for the run, charged nothing.
         usage_free_paths: ["/anthropic/v1/messages/count_tokens"]
+        # Which jobs may register runs is the deployment's file, and so is
+        # whether a run may register without proof (its `unproven`, off
+        # unless the file has it).
         registration:
           policy_file: /etc/praxis-credential-broker/run-token-policy.yaml
         # Long-lived tokens for people; none unless the deployment mounts

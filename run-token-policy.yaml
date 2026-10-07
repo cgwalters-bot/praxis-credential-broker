@@ -23,3 +23,20 @@ repository_ids: [0]
 # max_secs: 21600
 # Requests of one run in flight at once.
 # concurrency: 4
+#
+# OFF unless present: also register runs that prove nothing. With it, a
+# POST /v1/runs with no Authorization and an `x-run-id` header registers a
+# run under that name, for ANY client that can reach the listener: the
+# network is then the only gate on the broker's credentials, and the gateway
+# cannot tell a job from its own agent or from any other peer. Read
+# "Registering a run without proof" in INTERNALS.md before uncommenting it.
+# With `unproven` and no `workflows` or ids at all, runs register only so.
+# unproven:
+#   # Required. Registrations without proof admitted in any window, from all
+#   # callers together: each one is a fresh per-run cap, so this bounds how
+#   # many of them an agent that registers runs of its own can mint. At
+#   # most 34 an hour with the default max_secs, since a run is remembered
+#   # for a day after it expires and 1024 such runs are.
+#   max_registrations: 8
+#   # The window, in seconds.
+#   # window_secs: 3600

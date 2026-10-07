@@ -43,6 +43,17 @@ impl Counts {
     }
 }
 
+/// The runs registered without proof, all together.
+#[derive(Clone, Default, Serialize)]
+struct UnprovenRuns {
+    /// Registrations admitted.
+    registered: u64,
+    /// Registrations refused because their quota was used up.
+    refused: u64,
+    #[serde(flatten)]
+    counts: Counts,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Status {
@@ -90,6 +101,10 @@ pub(crate) struct Snapshot {
     /// What each operator token used, by its operator's name. Its provider's
     /// `counts` include it.
     operators: BTreeMap<String, Counts>,
+    /// What the runs registered without proof used, if the deployment
+    /// admits them. Its provider's `counts` include it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unproven_runs: Option<UnprovenRuns>,
 }
 
 impl Default for Snapshot {
@@ -100,6 +115,7 @@ impl Default for Snapshot {
             anthropic: Anthropic::default(),
             codex: Codex::default(),
             operators: BTreeMap::new(),
+            unproven_runs: None,
         }
     }
 }
@@ -108,8 +124,9 @@ impl Default for Snapshot {
 pub(crate) struct BrokerUsage(Mutex<Snapshot>);
 
 // Like the run registry, configuration reloads retain the named state. Each
-// registry has exactly two counters and four window slots, and a counter per
-// operator a tokens file named, never per-client keys.
+// registry has exactly two counters and four window slots, a counter per
+// operator a tokens file named and one for all runs registered without
+// proof, never per-client keys.
 static REGISTRIES: LazyLock<Mutex<HashMap<String, Arc<BrokerUsage>>>> =
     LazyLock::new(Mutex::default);
 
@@ -176,6 +193,33 @@ impl BrokerUsage {
         if let Some(counts) = state.operators.get_mut(operator) {
             counts.settle(usage, success);
         }
+    }
+
+    /// List the runs registered without proof in the snapshot, at zero: the
+    /// deployment admits them. A reload that stops admitting them leaves
+    /// what they used listed until a restart.
+    pub(crate) fn declare_unproven(&self) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.unproven_runs.get_or_insert_default();
+    }
+
+    /// Count a registration without proof: admitted, or refused for quota.
+    pub(crate) fn unproven_registration(&self, admitted: bool) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let runs = state.unproven_runs.get_or_insert_default();
+        let count = if admitted {
+            &mut runs.registered
+        } else {
+            &mut runs.refused
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// Count a response to a request of a run registered without proof.
+    pub(crate) fn settle_unproven(&self, usage: Option<&Usage>, success: bool) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let runs = state.unproven_runs.get_or_insert_default();
+        runs.counts.settle(usage, success);
     }
 
     pub(crate) fn capture(&self, provider: Provider, headers: &HeaderMap) {
@@ -385,6 +429,53 @@ mod tests {
                 "requests": 1,
                 "unmetered": 1,
                 "tokens": {"input": 3, "cache_read": 0, "output": 0, "reasoning": 0, "total": 3},
+            })
+        );
+        assert_eq!(snapshot["codex"]["counts"]["requests"], 0);
+    }
+
+    #[test]
+    fn unproven_runs_are_listed_only_once_admitted_and_counted_together() {
+        let usage = BrokerUsage::default();
+        let reported = Usage {
+            tokens: Tokens {
+                output: 4,
+                total: 4,
+                ..Tokens::default()
+            },
+            model: None,
+        };
+        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        assert!(snapshot.get("unproven_runs").is_none());
+        usage.declare_unproven();
+        assert_eq!(
+            serde_json::to_value(usage.snapshot()).unwrap()["unproven_runs"],
+            serde_json::json!({
+                "registered": 0,
+                "refused": 0,
+                "requests": 0,
+                "unmetered": 0,
+                "tokens": {"input": 0, "cache_read": 0, "output": 0, "reasoning": 0, "total": 0},
+            })
+        );
+        // (admitted, refused) registrations, then one response of each kind.
+        for admitted in [true, true, false] {
+            usage.unproven_registration(admitted);
+        }
+        usage.settle_unproven(Some(&reported), true);
+        usage.settle_unproven(None, true);
+        usage.settle_unproven(None, false);
+        // Declaring again, as a reload does, keeps the counts.
+        usage.declare_unproven();
+        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        assert_eq!(
+            snapshot["unproven_runs"],
+            serde_json::json!({
+                "registered": 2,
+                "refused": 1,
+                "requests": 1,
+                "unmetered": 1,
+                "tokens": {"input": 0, "cache_read": 0, "output": 4, "reasoning": 0, "total": 4},
             })
         );
         assert_eq!(snapshot["codex"]["counts"]["requests"], 0);

@@ -249,12 +249,41 @@ struct Harness {
     _proxy: ProxyGuard,
 }
 
+/// The headers of a request.
+type Headers<'a> = &'a [(&'a str, &'a str)];
+
+/// The registration policy that trusts the test workflow's OIDC tokens.
+fn proving_policy() -> Value {
+    json!({
+        "workflows": [WORKFLOW],
+        "repository_ids": [REPOSITORY_ID],
+        "owner_ids": [OWNER_ID],
+        "concurrency": 2,
+    })
+}
+
+/// `proving_policy` that also admits `max` registrations without proof in
+/// an hour.
+fn unproven_policy(max: u64) -> Value {
+    let mut policy = proving_policy();
+    policy["unproven"] = json!({"max_registrations": max});
+    policy
+}
+
 impl Harness {
-    /// Serve praxis.yaml on a free port, every cluster pointed at a fake
-    /// upstream of its own, run_token on a registry of its own, the test
-    /// registration policy and operator tokens file if `with_policy`, a
-    /// per-run cap of `RUN_MAX_TOKENS`, and `tweak` applied to each filter.
+    /// Serve praxis.yaml with the test registration policy and operator
+    /// tokens file if `with_policy`, or with neither.
     async fn start(with_policy: bool, tweak: impl Fn(&mut Yaml)) -> Self {
+        Self::start_with(with_policy.then(proving_policy), tweak).await
+    }
+
+    /// Serve praxis.yaml on a free port, every cluster pointed at a fake
+    /// upstream of its own, run_token on a registry of its own, `policy`
+    /// as the registration policy and the test operator tokens file if
+    /// there is one, a per-run cap of `RUN_MAX_TOKENS`, and `tweak` applied
+    /// to each filter.
+    async fn start_with(policy: Option<Value>, tweak: impl Fn(&mut Yaml)) -> Self {
+        let with_policy = policy.is_some();
         praxis_ai::install_crypto_provider();
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -265,19 +294,13 @@ impl Harness {
         for cluster in CLUSTERS {
             endpoints.insert(cluster, serve_upstream(&upstream, cluster).await);
         }
-        let policy = tempfile::tempdir().unwrap();
-        let policy_file = policy.path().join("run-token-policy.yaml");
-        if with_policy {
-            let policy = json!({
-                "jwks_url": format!("http://{}/jwks", endpoints[RESPONSES]),
-                "workflows": [WORKFLOW],
-                "repository_ids": [REPOSITORY_ID],
-                "owner_ids": [OWNER_ID],
-                "concurrency": 2,
-            });
-            std::fs::write(&policy_file, policy.to_string()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let policy_file = dir.path().join("run-token-policy.yaml");
+        if let Some(mut contents) = policy {
+            contents["jwks_url"] = format!("http://{}/jwks", endpoints[RESPONSES]).into();
+            std::fs::write(&policy_file, contents.to_string()).unwrap();
         }
-        let tokens_file = policy.path().join("operator-tokens.yaml");
+        let tokens_file = dir.path().join("operator-tokens.yaml");
         if with_policy {
             let operator = |name: &str, token: &str, cluster: &str| {
                 json!({
@@ -334,7 +357,7 @@ impl Harness {
             base: format!("http://{address}"),
             http: Client::new(),
             upstream,
-            _policy: policy,
+            _policy: dir,
             _proxy: proxy,
         }
     }
@@ -375,6 +398,31 @@ impl Harness {
 
     async fn register(&self, jwt: &str) -> (StatusCode, Value) {
         self.runs(Method::POST, "/v1/runs", jwt).await
+    }
+
+    /// Ask to register a run with `headers` only, and so with no proof
+    /// unless they hold one: the status, and the body as text.
+    async fn register_with(&self, headers: Headers<'_>) -> (StatusCode, String) {
+        let response = self.call(Method::POST, "/v1/runs", headers, None).await;
+        (response.status(), response.text().await.unwrap())
+    }
+
+    /// Register a run without proof under `name` and return its token.
+    async fn unproven_run(&self, name: &str) -> String {
+        let (status, body) = self.register_with(&[("x-run-id", name)]).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (&body["usage"]["proof"], &body["usage"]["run"]),
+            (&json!("none"), &json!(name))
+        );
+        body["token"].as_str().unwrap().to_owned()
+    }
+
+    /// The broker's usage, as anyone reads it.
+    async fn broker_usage(&self) -> Value {
+        let response = self.call(Method::GET, "/usage", &[], None).await;
+        serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
     }
 
     /// Register run `run_id` and return its token.
@@ -1144,4 +1192,274 @@ async fn every_spelling_of_an_injected_request_is_capped_and_counting_tokens_is_
         calls,
         "refused requests reached upstream"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_setting_a_registration_without_a_token_is_refused_as_before() {
+    // (the policy, what a registration with no token gets)
+    let deployments = [
+        (
+            Some(proving_policy()),
+            StatusCode::UNAUTHORIZED,
+            "OIDC token required\n",
+        ),
+        (
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "run registration is not configured\n",
+        ),
+    ];
+    for (policy, status, body) in deployments {
+        let proves = policy.is_some();
+        let h = Harness::start_with(policy, |_| {}).await;
+        // Naming a run changes nothing.
+        let requests: [Headers; 3] = [
+            &[],
+            &[("x-run-id", "job-1")],
+            &[("x-run-id", "job-1"), ("x-run-token", "praxis-run-0000")],
+        ];
+        for headers in requests {
+            let refused = h.register_with(headers).await;
+            assert_eq!(refused, (status, body.to_owned()), "{headers:?}");
+        }
+        assert!(h.broker_usage().await.get("unproven_runs").is_none());
+        if proves {
+            // A proven run registers as ever, and its record says so.
+            let (status, body) = h.register(&jwt(1, &json!({}))).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(
+                (&body["usage"]["proof"], &body["usage"]["run_id"]),
+                (&json!("github-oidc"), &json!(1))
+            );
+        }
+        assert_eq!(h.upstream.calls(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_setting_a_run_registers_without_proof_and_is_a_run_like_any_other() {
+    let h = Harness::start_with(Some(unproven_policy(3)), |_| {}).await;
+    let listed = h.broker_usage().await;
+    assert_eq!(
+        (
+            &listed["unproven_runs"]["registered"],
+            &listed["unproven_runs"]["requests"]
+        ),
+        (&json!(0), &json!(0))
+    );
+
+    // Requests that register nothing, and use none of the quota. Anything
+    // in Authorization is a claim of proof and is checked as one.
+    let long = "a".repeat(129);
+    let refusals: [(Headers, StatusCode, &str); 9] = [
+        (
+            &[],
+            StatusCode::BAD_REQUEST,
+            "one x-run-id header required\n",
+        ),
+        (
+            &[("x-run-id", "job-1"), ("x-run-id", "job-2")],
+            StatusCode::BAD_REQUEST,
+            "one x-run-id header required\n",
+        ),
+        (
+            &[("x-run-id", "job 1")],
+            StatusCode::BAD_REQUEST,
+            "invalid x-run-id\n",
+        ),
+        (
+            &[("x-run-id", "../job")],
+            StatusCode::BAD_REQUEST,
+            "invalid x-run-id\n",
+        ),
+        (
+            &[("x-run-id", long.as_str())],
+            StatusCode::BAD_REQUEST,
+            "invalid x-run-id\n",
+        ),
+        // A page whose own host name resolves here asks nothing first,
+        // but its browser still says that it is one.
+        (
+            &[("x-run-id", "job-1"), ("origin", "http://rebound.example")],
+            StatusCode::FORBIDDEN,
+            "a web page may not register a run\n",
+        ),
+        (
+            &[("x-run-id", "job-1"), ("sec-fetch-site", "same-origin")],
+            StatusCode::FORBIDDEN,
+            "a web page may not register a run\n",
+        ),
+        (
+            &[("x-run-id", "job-1"), ("authorization", "Bearer not.a.jwt")],
+            StatusCode::UNAUTHORIZED,
+            "invalid OIDC token\n",
+        ),
+        (
+            &[("x-run-id", "job-1"), ("authorization", "Basic am9i")],
+            StatusCode::UNAUTHORIZED,
+            "OIDC token required\n",
+        ),
+    ];
+    for (headers, status, body) in refusals {
+        let refused = h.register_with(headers).await;
+        assert_eq!(refused, (status, body.to_owned()), "{headers:?}");
+    }
+
+    // Nor can a web page register one: its browser asks first, since the
+    // name is in a header of its own, and is told nothing.
+    let preflight = h
+        .call(
+            Method::OPTIONS,
+            "/v1/runs",
+            &[
+                ("origin", "https://cgwalters-forge.github.io"),
+                ("access-control-request-method", "POST"),
+                ("access-control-request-headers", "x-run-id"),
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(preflight.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(
+        !preflight
+            .headers()
+            .keys()
+            .any(|name| name.as_str().starts_with("access-control-"))
+    );
+
+    // Registration: a run token like any other, for a run of its own kind.
+    let token = h.unproven_run("job-1").await;
+    assert!(token.starts_with("praxis-run-"));
+    // A name registers once, and a proven run is none of its business:
+    // run 1 of the test workflow registers beside the run named "1".
+    let (status, body) = h.register_with(&[("x-run-id", "job-1")]).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::CONFLICT, "run already registered\n")
+    );
+    let other = h.unproven_run("1").await;
+    let proven = h.run(1).await;
+    assert_eq!(h.usage(&proven).await["proof"], "github-oidc");
+
+    // Metering and the cap, as for a proven run: the second request
+    // overshoots the cap and the third is refused, for this run only.
+    for stream in [true, false] {
+        let (status, body) = h.respond(Some(&token), "", stream).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let calls = h.upstream.calls();
+    let (status, _) = h.respond(Some(&token), "", true).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.upstream.calls(), calls);
+    let (status, body) = h.injected(Some(&other)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = h.respond(Some(&proven), "", true).await;
+    assert_eq!(status, StatusCode::OK);
+    // Upstream never got a run token, only the broker's credential.
+    assert_eq!(h.upstream.seen("x-run-token"), [None, None, None, None]);
+    assert_eq!(
+        h.upstream.seen("authorization"),
+        [None, None, Some(BROKER_AUTHORIZATION.into()), None]
+    );
+    let usage = h.usage(&token).await;
+    assert_eq!(
+        (&usage["schema"], &usage["proof"], &usage["run"]),
+        (&json!(RECORD_SCHEMA), &json!("none"), &json!("job-1"))
+    );
+    assert_eq!(
+        (
+            &usage["state"],
+            &usage["requests"],
+            &usage["tokens"]["total"]
+        ),
+        (&json!("active"), &json!(2), &json!(2 * RESPONSES_TOTAL))
+    );
+    // /usage counts the runs without proof together, apart from the
+    // proven run, whose request only its provider's counts include.
+    let broker = h.broker_usage().await;
+    assert_eq!(
+        broker["unproven_runs"],
+        json!({
+            "registered": 2,
+            "refused": 0,
+            "requests": 3,
+            "unmetered": 0,
+            "tokens": {"input": 120, "cache_read": 80, "output": 90, "reasoning": 10, "total": 2 * RESPONSES_TOTAL + MESSAGES_TOTAL},
+        })
+    );
+    assert_eq!(broker["codex"]["counts"]["requests"], 3);
+    assert!(!broker.to_string().contains("job-1"));
+
+    // The quota: the third registration is the last for now, whatever
+    // name the next one chooses. Proven runs are not counted against it.
+    h.unproven_run("job-3").await;
+    for name in ["job-4", "job-5"] {
+        let (status, body) = h.register_with(&[("x-run-id", name)]).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many unproven registrations\n"
+            ),
+            "{name}"
+        );
+    }
+    h.run(2).await;
+    let broker = h.broker_usage().await;
+    assert_eq!(
+        (
+            &broker["unproven_runs"]["registered"],
+            &broker["unproven_runs"]["refused"]
+        ),
+        (&json!(3), &json!(2))
+    );
+
+    // The end: the token admits nothing more but still reads the record,
+    // and the name stays taken.
+    let (status, finished) = h.runs(Method::DELETE, "/v1/runs/self", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (&finished["state"], &finished["run"]),
+        (&json!("finished"), &json!("job-1"))
+    );
+    assert_eq!(h.usage(&token).await, finished);
+    let (status, _) = h.respond(Some(&token), "", true).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = h.register_with(&[("x-run-id", "job-1")]).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // Like any run token, it is never a pass-through credential.
+    let (status, _) = h.message(&format!("Bearer {other}"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // An operator token and pass-through are as they were.
+    let calls = h.upstream.calls();
+    let (status, body) = h.respond(Some(OPERATOR_TOKEN), "", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = h.injected(Some(OPERATOR_TOKEN)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h.runs(Method::GET, "/v1/runs/self", OPERATOR_TOKEN).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = h.message(CALLER_OAUTH, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.upstream.clusters()[calls..], [RESPONSES, PASS_THROUGH]);
+    assert_eq!(
+        h.upstream.seen("authorization")[calls..],
+        [None, Some(CALLER_OAUTH.into())]
+    );
+    let broker = h.broker_usage().await;
+    assert_eq!(broker["operators"][OPERATOR]["requests"], 1);
+    assert_eq!(broker["unproven_runs"]["requests"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_for_registration_without_proof_only_takes_no_oidc_token() {
+    let policy = json!({"unproven": {"max_registrations": 1}});
+    let h = Harness::start_with(Some(policy), |_| {}).await;
+    let (status, _) = h.register(&jwt(1, &json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let token = h.unproven_run("only").await;
+    let (status, body) = h.respond(Some(&token), "", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = h.register_with(&[("x-run-id", "next")]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }

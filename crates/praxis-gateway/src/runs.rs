@@ -8,7 +8,8 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
+    net::IpAddr,
     sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +21,11 @@ pub const TOKEN_PREFIX: &str = "praxis-run-";
 const MAX_RUNS: usize = 4096;
 /// How long a run is remembered after it expires, so it cannot register again.
 const RETENTION: Duration = Duration::from_secs(24 * 3600);
+/// Runs registered without proof that are kept at once, so that they can
+/// never fill the registry and keep proven runs out.
+pub const MAX_UNPROVEN_RUNS: usize = MAX_RUNS / 4;
+/// The longest identifier a run registered without proof may choose.
+pub const MAX_RUN_NAME: usize = 128;
 /// Models a record keeps totals for; usage of any further model only counts
 /// in the run's totals.
 const MAX_MODELS: usize = 16;
@@ -77,7 +83,7 @@ pub struct RunIdentity {
 
 impl RunIdentity {
     fn key(&self) -> RunKey {
-        RunKey {
+        RunKey::Github {
             repository_id: self.repository_id,
             run_id: self.run_id,
             run_attempt: self.run_attempt,
@@ -86,30 +92,82 @@ impl RunIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct RunKey {
-    repository_id: u64,
-    run_id: u64,
-    run_attempt: u64,
-    check_run_id: Option<u64>,
+/// The identifier of a run registered without proof, which its caller
+/// chose: nothing vouches for it. It is short and of letters, digits, `.`,
+/// `_` and `-` only, so it can go in a log line or a subject as it is.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize)]
+pub struct RunName(String);
+
+impl RunName {
+    pub fn new(name: &str) -> Option<Self> {
+        let valid = !name.is_empty()
+            && name.len() <= MAX_RUN_NAME
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        valid.then(|| Self(name.to_owned()))
+    }
+}
+
+/// How many runs may register without proof: `max` in any `window`, from
+/// all callers together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quota {
+    pub max: usize,
+    pub window: Duration,
+}
+
+impl Quota {
+    /// The most runs registered within this quota that are remembered at
+    /// once, when each lasts `ttl`. A quota that keeps this within
+    /// `MAX_UNPROVEN_RUNS` never finds the registry full.
+    pub fn most_remembered(&self, ttl: Duration) -> usize {
+        let remembered = (ttl + RETENTION).as_nanos();
+        let windows = remembered.div_ceil(self.window.as_nanos().max(1));
+        usize::try_from(windows)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(self.max)
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum RunKey {
+    /// A job its GitHub Actions OIDC token named.
+    Github {
+        repository_id: u64,
+        run_id: u64,
+        run_attempt: u64,
+        check_run_id: Option<u64>,
+    },
+    /// A run registered without proof, by the name its caller chose.
+    Unproven(RunName),
 }
 
 impl RunKey {
-    /// The run as an authenticated subject, which budgets are keyed on. It
-    /// names the job by ids only, so it is stable and unique per job.
+    /// The run as an authenticated subject, which budgets are keyed on. A
+    /// proven run's names the job by ids only, so it is stable and unique
+    /// per job. The prefix tells the two kinds apart wherever a subject is
+    /// logged, and keeps a chosen name from ever being a proven run's.
     pub fn subject(&self) -> String {
-        let Self {
-            repository_id,
-            run_id,
-            run_attempt,
-            check_run_id,
-        } = self;
-        match check_run_id {
-            Some(check_run_id) => {
-                format!("github-run:{repository_id}/{run_id}/{run_attempt}/{check_run_id}")
-            }
-            None => format!("github-run:{repository_id}/{run_id}/{run_attempt}"),
+        match self {
+            Self::Github {
+                repository_id,
+                run_id,
+                run_attempt,
+                check_run_id: Some(check_run_id),
+            } => format!("github-run:{repository_id}/{run_id}/{run_attempt}/{check_run_id}"),
+            Self::Github {
+                repository_id,
+                run_id,
+                run_attempt,
+                check_run_id: None,
+            } => format!("github-run:{repository_id}/{run_id}/{run_attempt}"),
+            Self::Unproven(RunName(name)) => format!("unproven-run:{name}"),
         }
+    }
+
+    pub fn is_unproven(&self) -> bool {
+        matches!(self, Self::Unproven(_))
     }
 }
 
@@ -132,6 +190,26 @@ pub enum Refusal {
 pub enum RegisterError {
     AlreadyRegistered,
     Full,
+    /// The quota of registrations without proof is used up for now.
+    OverQuota,
+}
+
+/// What a run registered with, and so which run a record is of.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "proof", rename_all = "kebab-case")]
+pub enum Proof {
+    /// A verified GitHub Actions OIDC token, whose claims these are.
+    GithubOidc {
+        repository: String,
+        repository_id: u64,
+        run_id: u64,
+        run_attempt: u64,
+        check_run_id: Option<u64>,
+        workflow_ref: String,
+    },
+    /// Nothing: `run` is whatever the caller said.
+    #[serde(rename = "none")]
+    Unproven { run: RunName },
 }
 
 /// A run's usage record, returned to its job and logged when it ends. It
@@ -140,12 +218,9 @@ pub enum RegisterError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RunRecord {
     pub schema: &'static str,
-    pub repository: String,
-    pub repository_id: u64,
-    pub run_id: u64,
-    pub run_attempt: u64,
-    pub check_run_id: Option<u64>,
-    pub workflow_ref: String,
+    /// `proof` and, beside it, what names the run.
+    #[serde(flatten)]
+    pub proof: Proof,
     pub state: RunState,
     pub registered_at_unix: u64,
     pub expires_at_unix: u64,
@@ -180,8 +255,10 @@ struct Run {
     record: RunRecord,
     token_hash: [u8; 32],
     /// The id of the OIDC token that registered the run, which may register
-    /// it again to replace a token whose response was lost.
-    jti: String,
+    /// it again to replace a token whose response was lost. A run
+    /// registered without proof has none: nothing could tell its caller
+    /// from another, so it never registers again.
+    jti: Option<String>,
     concurrency: usize,
     expires: Instant,
     retain_until: Instant,
@@ -192,6 +269,9 @@ struct Run {
 struct State {
     runs: HashMap<RunKey, Run>,
     tokens: HashMap<[u8; 32], RunKey>,
+    /// When each registration without proof still inside its quota's
+    /// window was admitted, oldest first.
+    unproven: VecDeque<Instant>,
 }
 
 /// The runs registered with this process, shared by every chain whose
@@ -222,8 +302,14 @@ pub fn unix_now() -> u64 {
 fn log_record(record: &RunRecord) {
     match serde_json::to_string(record) {
         Ok(json) => info!(record = %json, "run usage"),
-        Err(_) => info!(run_id = record.run_id, "run usage unavailable"),
+        Err(_) => info!(run = ?record.proof, "run usage unavailable"),
     }
+}
+
+fn new_token() -> (String, [u8; 32]) {
+    let token = format!("{TOKEN_PREFIX}{}", hex::encode(rand::random::<[u8; 32]>()));
+    let hash = token_hash(&token);
+    (token, hash)
 }
 
 impl Runs {
@@ -250,60 +336,80 @@ impl Runs {
     ) -> Result<(String, RunRecord), RegisterError> {
         let mut state = self.state(now);
         let key = identity.key();
-        let token = format!("{TOKEN_PREFIX}{}", hex::encode(rand::random::<[u8; 32]>()));
-        let hash = token_hash(&token);
+        let (token, hash) = new_token();
         if let Some(run) = state.runs.get_mut(&key) {
-            if run.jti != identity.jti || run.record.state != RunState::Active {
+            if run.jti.as_deref() != Some(identity.jti.as_str())
+                || run.record.state != RunState::Active
+            {
                 return Err(RegisterError::AlreadyRegistered);
             }
             let old = std::mem::replace(&mut run.token_hash, hash);
             let record = run.record.clone();
             state.tokens.remove(&old);
             state.tokens.insert(hash, key);
-            info!(run_id = record.run_id, "run token replaced");
+            info!(run_id = identity.run_id, "run token replaced");
             return Ok((token, record));
         }
         if state.runs.len() >= MAX_RUNS {
             return Err(RegisterError::Full);
         }
-        let registered = unix_now();
-        let record = RunRecord {
-            schema: RECORD_SCHEMA,
+        info!(
+            run_id = identity.run_id,
+            run_attempt = identity.run_attempt,
+            repository = %identity.repository,
+            ttl_secs = limits.ttl.as_secs(),
+            "run registered"
+        );
+        let proof = Proof::GithubOidc {
             repository: identity.repository,
             repository_id: identity.repository_id,
             run_id: identity.run_id,
             run_attempt: identity.run_attempt,
             check_run_id: identity.check_run_id,
             workflow_ref: identity.workflow_ref,
-            state: RunState::Active,
-            registered_at_unix: registered,
-            expires_at_unix: registered.saturating_add(limits.ttl.as_secs()),
-            finished_at_unix: None,
-            requests: 0,
-            unmetered: 0,
-            tokens: Tokens::default(),
-            models: BTreeMap::new(),
         };
+        let record = state.insert(key, proof, Some(identity.jti), hash, limits, now);
+        Ok((token, record))
+    }
+
+    /// Register a run nothing vouches for, under the name its caller chose,
+    /// within `quota`. A name registers once: a second registration is
+    /// refused while the first is remembered, whoever sends it, so no
+    /// caller can take over or re-arm another's run by naming it.
+    pub fn register_unproven(
+        &self,
+        name: RunName,
+        client: Option<IpAddr>,
+        limits: Limits,
+        quota: Quota,
+        now: Instant,
+    ) -> Result<(String, RunRecord), RegisterError> {
+        let mut state = self.state(now);
+        let key = RunKey::Unproven(name.clone());
+        if state.runs.contains_key(&key) {
+            return Err(RegisterError::AlreadyRegistered);
+        }
+        while let Some(oldest) = state.unproven.front()
+            && now.saturating_duration_since(*oldest) >= quota.window
+        {
+            state.unproven.pop_front();
+        }
+        if state.unproven.len() >= quota.max {
+            return Err(RegisterError::OverQuota);
+        }
+        let kept = state.runs.keys().filter(|key| key.is_unproven()).count();
+        if kept >= MAX_UNPROVEN_RUNS || state.runs.len() >= MAX_RUNS {
+            return Err(RegisterError::Full);
+        }
+        state.unproven.push_back(now);
         info!(
-            run_id = record.run_id,
-            run_attempt = record.run_attempt,
-            repository = %record.repository,
+            run = %key.subject(),
+            client = ?client,
             ttl_secs = limits.ttl.as_secs(),
-            "run registered"
+            "unproven run registered"
         );
-        state.tokens.insert(hash, key);
-        state.runs.insert(
-            key,
-            Run {
-                record: record.clone(),
-                token_hash: hash,
-                jti: identity.jti,
-                concurrency: limits.concurrency,
-                expires: now + limits.ttl,
-                retain_until: now + limits.ttl + RETENTION,
-                in_flight: 0,
-            },
-        );
+        let (token, hash) = new_token();
+        let record = state.insert(key, Proof::Unproven { run: name }, None, hash, limits, now);
         Ok((token, record))
     }
 
@@ -311,7 +417,7 @@ impl Runs {
     /// still reads its record, so the job gets it even if the agent finished
     /// the run first, but admits no requests.
     pub fn authenticate(&self, token: &str, now: Instant) -> Option<RunKey> {
-        self.state(now).tokens.get(&token_hash(token)).copied()
+        self.state(now).tokens.get(&token_hash(token)).cloned()
     }
 
     pub fn record(&self, key: &RunKey, now: Instant) -> Option<RunRecord> {
@@ -344,7 +450,7 @@ impl Runs {
         run.in_flight += 1;
         Ok(Admission {
             runs: Arc::clone(self),
-            key: *key,
+            key: key.clone(),
             success: false,
             usage_free: false,
             settled: false,
@@ -374,9 +480,48 @@ enum Outcome {
 }
 
 impl State {
+    /// Add a run that starts now, and return its record.
+    fn insert(
+        &mut self,
+        key: RunKey,
+        proof: Proof,
+        jti: Option<String>,
+        token_hash: [u8; 32],
+        limits: Limits,
+        now: Instant,
+    ) -> RunRecord {
+        let registered = unix_now();
+        let record = RunRecord {
+            schema: RECORD_SCHEMA,
+            proof,
+            state: RunState::Active,
+            registered_at_unix: registered,
+            expires_at_unix: registered.saturating_add(limits.ttl.as_secs()),
+            finished_at_unix: None,
+            requests: 0,
+            unmetered: 0,
+            tokens: Tokens::default(),
+            models: BTreeMap::new(),
+        };
+        self.tokens.insert(token_hash, key.clone());
+        self.runs.insert(
+            key,
+            Run {
+                record: record.clone(),
+                token_hash,
+                jti,
+                concurrency: limits.concurrency,
+                expires: now + limits.ttl,
+                retain_until: now + limits.ttl + RETENTION,
+                in_flight: 0,
+            },
+        );
+        record
+    }
+
     /// Expire runs past their deadline and forget old ones.
     fn prune(&mut self, now: Instant) {
-        let Self { runs, tokens } = self;
+        let Self { runs, tokens, .. } = self;
         for run in runs.values_mut() {
             if run.record.state == RunState::Active && now >= run.expires {
                 run.record.state = RunState::Expired;
@@ -408,6 +553,11 @@ pub struct Admission {
 }
 
 impl Admission {
+    /// Whether the run registered without proof.
+    pub fn is_unproven(&self) -> bool {
+        self.key.is_unproven()
+    }
+
     /// Record what upstream reported for the response.
     pub fn settle(mut self, reported: Option<Usage>) {
         self.settled = true;
@@ -442,6 +592,7 @@ impl Drop for Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn limits() -> Limits {
         Limits {
@@ -559,7 +710,7 @@ mod tests {
             ),
             (600, 300)
         );
-        assert_eq!(runs.authenticate(&token, now), Some(key));
+        assert_eq!(runs.authenticate(&token, now).as_ref(), Some(&key));
         assert_eq!(runs.authenticate(&lost, now), None);
         // Not once the run has ended.
         runs.finish(&key, now);
@@ -654,7 +805,7 @@ mod tests {
         assert!(record.finished_at_unix.is_some());
         assert_eq!(runs.finish(&key, now).unwrap(), record);
         // The token still names the run, for its record, but admits nothing.
-        assert_eq!(runs.authenticate(&token, now), Some(key));
+        assert_eq!(runs.authenticate(&token, now).as_ref(), Some(&key));
         assert_eq!(runs.admit(&key, now).err(), Some(Refusal::Closed));
         // A request admitted before the finish is still recorded.
         in_flight.settle(used(5, None));
@@ -666,7 +817,7 @@ mod tests {
 
         let (token, key) = register(&runs, 2, now);
         let expired = now + Duration::from_secs(600);
-        assert_eq!(runs.authenticate(&token, expired), Some(key));
+        assert_eq!(runs.authenticate(&token, expired).as_ref(), Some(&key));
         assert_eq!(runs.record(&key, expired).unwrap().state, RunState::Expired);
         assert_eq!(runs.admit(&key, expired).err(), Some(Refusal::Closed));
         // Forgotten after the retention period, so the registry stays bounded.
@@ -674,5 +825,186 @@ mod tests {
         assert!(runs.authenticate(&token, forgotten).is_none());
         assert!(runs.record(&key, forgotten).is_none());
         assert!(lock(&runs.state).tokens.is_empty());
+    }
+
+    const QUOTA: Quota = Quota {
+        max: 2,
+        window: Duration::from_secs(60),
+    };
+
+    fn unproven(runs: &Runs, name: &str, now: Instant) -> Result<String, RegisterError> {
+        let name = RunName::new(name).unwrap();
+        runs.register_unproven(name, None, limits(), QUOTA, now)
+            .map(|(token, _)| token)
+    }
+
+    #[test]
+    fn a_chosen_run_name_is_short_and_plain() {
+        let longest = "a".repeat(MAX_RUN_NAME);
+        let too_long = "a".repeat(MAX_RUN_NAME + 1);
+        let cases = [
+            ("job-1", true),
+            ("37530692561.1_retry", true),
+            (longest.as_str(), true),
+            ("", false),
+            (too_long.as_str(), false),
+            ("a b", false),
+            ("a/b", false),
+            ("a:b", false),
+            ("a\nb", false),
+            ("a\"b", false),
+            ("\u{e9}", false),
+        ];
+        for (name, valid) in cases {
+            assert_eq!(RunName::new(name).is_some(), valid, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn an_unproven_run_is_a_run_like_any_other_under_a_subject_of_its_own_kind() {
+        let runs = Arc::new(Runs::default());
+        let now = Instant::now();
+        let token = unproven(&runs, "7", now).unwrap();
+        let key = runs.authenticate(&token, now).unwrap();
+        // Never the subject of a proven run, whatever name is chosen.
+        assert_eq!(key.subject(), "unproven-run:7");
+        assert!(key.is_unproven());
+        let (_, proven) = register(&runs, 7, now);
+        assert!(!proven.is_unproven());
+        // The same lifetime, concurrency and metering as a proven run.
+        let a = runs.admit(&key, now).unwrap();
+        let b = runs.admit(&key, now).unwrap();
+        assert_eq!(runs.admit(&key, now).err(), Some(Refusal::Busy));
+        a.settle(used(100, Some("m")));
+        b.settle(used(20, None));
+        let record = runs.finish(&key, now).unwrap();
+        assert_eq!(runs.admit(&key, now).err(), Some(Refusal::Closed));
+        assert_eq!(
+            (record.state, record.requests, record.tokens.total),
+            (RunState::Finished, 2, 120)
+        );
+        assert_eq!(record.expires_at_unix - record.registered_at_unix, 600);
+        // A record says which kind of run it is of.
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            (&json["proof"], &json["run"]),
+            (&json!("none"), &json!("7"))
+        );
+        assert!(json.get("repository").is_none() && json.get("run_id").is_none());
+        let json = serde_json::to_value(runs.record(&proven, now).unwrap()).unwrap();
+        assert_eq!(
+            (&json["proof"], &json["run_id"], &json["repository"]),
+            (&json!("github-oidc"), &json!(7), &json!("owner/repo"))
+        );
+        assert!(json.get("run").is_none());
+    }
+
+    #[test]
+    fn a_chosen_run_name_registers_once_while_it_is_remembered() {
+        let runs = Arc::new(Runs::default());
+        let now = Instant::now();
+        let token = unproven(&runs, "job", now).unwrap();
+        let key = runs.authenticate(&token, now).unwrap();
+        // Unlike a proven run's, a lost token is not replaced: nothing
+        // tells the caller that lost it from any other.
+        assert_eq!(
+            unproven(&runs, "job", now),
+            Err(RegisterError::AlreadyRegistered)
+        );
+        assert_eq!(runs.authenticate(&token, now), Some(key.clone()));
+        runs.finish(&key, now);
+        assert_eq!(
+            unproven(&runs, "job", now),
+            Err(RegisterError::AlreadyRegistered)
+        );
+        // Refused registrations used none of the quota.
+        let token = unproven(&runs, "other", now).unwrap();
+        let other = runs.authenticate(&token, now).unwrap();
+        let expired = now + Duration::from_secs(600);
+        assert_eq!(
+            runs.record(&other, expired).unwrap().state,
+            RunState::Expired
+        );
+        assert_eq!(
+            unproven(&runs, "other", expired),
+            Err(RegisterError::AlreadyRegistered)
+        );
+        // Once forgotten, the name is free again.
+        assert!(unproven(&runs, "job", expired + RETENTION).is_ok());
+    }
+
+    #[test]
+    fn a_quota_says_how_many_of_its_runs_are_remembered_at_once() {
+        let hour = Duration::from_secs(3600);
+        // (registrations, their window, a run's lifetime, runs remembered)
+        let cases = [
+            // A day's retention and six hours' life: thirty windows.
+            (8, hour, 6 * hour, 240),
+            (34, hour, 6 * hour, 1020),
+            (35, hour, 6 * hour, 1050),
+            // A window in progress counts whole.
+            (1, 7 * hour, 6 * hour, 5),
+            (1, 31 * hour, 6 * hour, 1),
+            (8, Duration::from_secs(60), 6 * hour, 14400),
+            (usize::MAX, hour, hour, usize::MAX),
+        ];
+        for (max, window, ttl, remembered) in cases {
+            let quota = Quota { max, window };
+            assert_eq!(quota.most_remembered(ttl), remembered, "{quota:?}");
+        }
+    }
+
+    #[test]
+    fn unproven_registrations_are_limited_per_window_and_proven_ones_are_not() {
+        // By name, as each filter a reload builds finds the registry: the
+        // quota is the registry's, so a reload does not refill it.
+        let registry = || Runs::named("runs-test-quota");
+        let start = Instant::now();
+        // (seconds since the start, name, admitted)
+        let steps = [
+            (0, "a", true),
+            (10, "b", true),
+            (20, "c", false),
+            (59, "c", false),
+            // "a" has left the window.
+            (60, "c", true),
+            (61, "d", false),
+            (70, "d", true),
+            (71, "e", false),
+        ];
+        for (secs, name, admitted) in steps {
+            let now = start + Duration::from_secs(secs);
+            let expected = if admitted {
+                Ok(())
+            } else {
+                Err(RegisterError::OverQuota)
+            };
+            assert_eq!(
+                unproven(&registry(), name, now).map(drop),
+                expected,
+                "{name}"
+            );
+            assert!(registry().register(identity(secs), limits(), now).is_ok());
+        }
+    }
+
+    #[test]
+    fn unproven_runs_never_fill_the_registry() {
+        let runs = Runs::default();
+        let now = Instant::now();
+        let quota = Quota {
+            max: usize::MAX,
+            window: Duration::from_secs(60),
+        };
+        let register = |i: usize| {
+            let name = RunName::new(&format!("run-{i}")).unwrap();
+            runs.register_unproven(name, None, limits(), quota, now)
+                .map(drop)
+        };
+        for i in 0..MAX_UNPROVEN_RUNS {
+            assert_eq!(register(i), Ok(()), "{i}");
+        }
+        assert_eq!(register(MAX_UNPROVEN_RUNS), Err(RegisterError::Full));
+        assert!(runs.register(identity(1), limits(), now).is_ok());
     }
 }
