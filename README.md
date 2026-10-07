@@ -165,6 +165,32 @@ its run's cap gets 429. Injecting a subscription token at a gateway is
 undocumented by Anthropic; read the risks in
 [INTERNALS.md](INTERNALS.md#risks) first.
 
+### Runs without proof
+
+A job with no GitHub Actions identity to show, or a deployment that trusts
+its private network, can have runs register on their word alone. This is
+off unless the policy file has `unproven`:
+
+```yaml
+unproven:
+  max_registrations: 8   # in any hour, from all callers together
+```
+
+Then a request with no `Authorization` registers the run it names (letters,
+digits, `.`, `_` and `-`, at most 128), and gets a run token with the same
+caps, lifetime and usage record as any other:
+
+```sh
+curl -X POST -H "x-run-id: $RUN_NAME" http://127.0.0.1:18080/v1/runs
+# 201 {"token": "praxis-run-...", "usage": {"proof": "none", "run": "...", ...}}
+```
+
+**Whatever can reach the port can then spend the broker's credentials**,
+the agent of a job included, which can register a run of its own for a
+fresh cap. Read [INTERNALS.md](INTERNALS.md#registering-a-run-without-proof)
+for what that gives up, the exact steps to turn it on and how to turn it
+off.
+
 ## Interactive agents: operator tokens
 
 A person's own agent, such as an interactive OpenCode or Codex on a

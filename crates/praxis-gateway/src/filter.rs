@@ -4,7 +4,10 @@
 //! On a chain with `registration` configured it serves the run endpoints:
 //!
 //! - `POST /v1/runs`, authenticated by a GitHub Actions OIDC token, registers
-//!   the job's run and returns its bearer token and usage record;
+//!   the job's run and returns its bearer token and usage record. If the
+//!   policy has `unproven`, off by default, a request with no
+//!   `Authorization` registers the run its `x-run-id` names instead, with
+//!   no proof of who sends it;
 //! - `GET /v1/runs/self` returns the calling run's usage record;
 //! - `DELETE /v1/runs/self` finishes the run and returns its final record.
 //!
@@ -38,7 +41,10 @@
 use crate::{
     oidc::{DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy},
     operators::{self, Operators},
-    runs::{Admission, Limits, Refusal, RegisterError, RunKey, Runs, TOKEN_PREFIX, Tokens, Usage},
+    runs::{
+        Admission, Limits, MAX_UNPROVEN_RUNS, Quota, Refusal, RegisterError, RunKey, RunName, Runs,
+        TOKEN_PREFIX, Tokens, Usage,
+    },
     usage::{BrokerUsage, Provider},
 };
 use async_trait::async_trait;
@@ -57,12 +63,13 @@ use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
     iter,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
     time::Instant,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub const FILTER_NAME: &str = "run_token";
 const RUNS_PATH: &str = "/v1/runs";
@@ -79,6 +86,18 @@ const REQUEST_PRIVATE_NETWORK: HeaderName =
     HeaderName::from_static("access-control-request-private-network");
 const ALLOW_PRIVATE_NETWORK: HeaderName =
     HeaderName::from_static("access-control-allow-private-network");
+/// The name a run registered without proof chooses for itself. A header,
+/// and not one a web page may send unasked, so that a browser on the
+/// deployment's network preflights the registration, which nothing allows.
+const RUN_ID: HeaderName = HeaderName::from_static("x-run-id");
+/// What a browser adds to a page's request, and a page cannot remove. A
+/// page is same-origin, and so asks nothing first, once its own host name
+/// resolves to the gateway (DNS rebinding); these still give it away.
+const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
+const BROWSER_HEADERS: [HeaderName; 2] = [header::ORIGIN, SEC_FETCH_SITE];
+/// The window of the quota of registrations without proof, unless the
+/// policy gives one.
+const DEFAULT_UNPROVEN_WINDOW_SECS: u64 = 3600;
 const DEFAULT_REGISTRY: &str = "default";
 const DEFAULT_MAX_SECS: u64 = 6 * 3600;
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -179,7 +198,9 @@ struct PolicyFile {
     audience: String,
     #[serde(default = "default_jwks_url")]
     jwks_url: String,
-    /// Exact `job_workflow_ref` claims that may register runs.
+    /// Exact `job_workflow_ref` claims that may register runs. None, with
+    /// `unproven`, means no run registers by proof.
+    #[serde(default)]
     workflows: HashSet<String>,
     #[serde(default)]
     repository_ids: HashSet<u64>,
@@ -196,8 +217,53 @@ struct PolicyFile {
     max_secs: u64,
     #[serde(default = "default_concurrency")]
     concurrency: usize,
+    /// Also register runs that prove nothing. Off unless present.
+    unproven: Option<UnprovenConfig>,
 }
 
+/// Registration without an identity token: whatever can reach the listener
+/// may register a run under a name it chooses, and so use the broker's
+/// credentials within a run's caps. The gateway cannot tell a job from its
+/// agent or from any other peer, so the network is the only gate, and the
+/// quota is all that bounds how many fresh per-run caps a caller mints.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnprovenConfig {
+    /// Registrations admitted in any window, from all callers together.
+    max_registrations: usize,
+    #[serde(default = "default_unproven_window_secs")]
+    window_secs: u64,
+}
+
+impl UnprovenConfig {
+    /// The quota this asks for, for runs that each last `ttl`. One whose
+    /// runs could outnumber what the registry remembers is refused, so
+    /// that no quota a gateway starts with can find the registry full and
+    /// stall every registration until old runs are forgotten.
+    fn quota(&self, ttl: Duration) -> Result<Quota, String> {
+        if self.max_registrations == 0 {
+            return Err("unproven.max_registrations must be positive".into());
+        }
+        if !(1..=MAX_SECS).contains(&self.window_secs) {
+            return Err(format!("unproven.window_secs must be from 1 to {MAX_SECS}"));
+        }
+        let quota = Quota {
+            max: self.max_registrations,
+            window: Duration::from_secs(self.window_secs),
+        };
+        let remembered = quota.most_remembered(ttl);
+        if remembered > MAX_UNPROVEN_RUNS {
+            return Err(format!(
+                "unproven: at this rate up to {remembered} runs would be remembered at once, and at most {MAX_UNPROVEN_RUNS} are; lower max_registrations or lengthen window_secs"
+            ));
+        }
+        Ok(quota)
+    }
+}
+
+fn default_unproven_window_secs() -> u64 {
+    DEFAULT_UNPROVEN_WINDOW_SECS
+}
 fn default_audience() -> String {
     DEFAULT_AUDIENCE.to_owned()
 }
@@ -216,7 +282,10 @@ fn default_concurrency() -> usize {
 
 /// Verifies registrations against the policy.
 struct Registrar {
-    oidc: GithubOidc,
+    /// None if the policy names no workflow: only `unproven` registers.
+    oidc: Option<GithubOidc>,
+    /// The quota of registrations without proof, if the policy admits them.
+    unproven: Option<Quota>,
     limits: Limits,
 }
 
@@ -297,6 +366,11 @@ impl RunTokenFilter {
                 .map_err(|e| format!("{FILTER_NAME}: {e}"))?,
         };
         let usage = BrokerUsage::named(&config.registry);
+        if let RunEndpoints::Serving(registrar) = &endpoints
+            && registrar.unproven.is_some()
+        {
+            usage.declare_unproven();
+        }
         for operator in operators.names() {
             usage.declare_operator(operator);
         }
@@ -393,11 +467,16 @@ impl RunTokenFilter {
         }
     }
 
-    async fn serve_runs(&self, registrar: Option<&Registrar>, request: &Request) -> FilterAction {
+    async fn serve_runs(
+        &self,
+        registrar: Option<&Registrar>,
+        request: &Request,
+        client: Option<IpAddr>,
+    ) -> FilterAction {
         let now = Instant::now();
         match (request.uri.path(), &request.method) {
             (RUNS_PATH, &Method::POST) => match registrar {
-                Some(registrar) => self.register(registrar, &request.headers).await,
+                Some(registrar) => self.register(registrar, &request.headers, client).await,
                 None => reject(503, "run registration is not configured\n"),
             },
             (RUN_SELF_PATH, &Method::GET) => {
@@ -423,8 +502,22 @@ impl RunTokenFilter {
         }
     }
 
-    async fn register(&self, registrar: &Registrar, headers: &HeaderMap) -> FilterAction {
-        let Ok(_permit) = registrar.oidc.registrations.try_acquire() else {
+    async fn register(
+        &self,
+        registrar: &Registrar,
+        headers: &HeaderMap,
+        client: Option<IpAddr>,
+    ) -> FilterAction {
+        // Anything in Authorization is a claim of proof, checked as one.
+        if let Some(quota) = registrar.unproven
+            && !headers.contains_key(header::AUTHORIZATION)
+        {
+            return self.register_unproven(quota, registrar.limits, headers, client);
+        }
+        let Some(oidc) = &registrar.oidc else {
+            return reject(403, "workflow may not register runs\n");
+        };
+        let Ok(_permit) = oidc.registrations.try_acquire() else {
             return reject(429, "too many registrations\n");
         };
         let Some(jwt) = headers
@@ -434,7 +527,7 @@ impl RunTokenFilter {
         else {
             return reject(401, "OIDC token required\n");
         };
-        let identity = match registrar.oidc.verify(jwt).await {
+        let identity = match oidc.verify(jwt).await {
             Ok(identity) => identity,
             Err(OidcError::Unavailable) => return reject(503, "OIDC keys unavailable\n"),
             Err(OidcError::WorkflowNotAllowed) => {
@@ -450,6 +543,47 @@ impl RunTokenFilter {
         {
             Ok((token, usage)) => json(201, &serde_json::json!({ "token": token, "usage": usage })),
             Err(RegisterError::AlreadyRegistered) => reject(409, "run already registered\n"),
+            Err(RegisterError::Full | RegisterError::OverQuota) => reject(503, "too many runs\n"),
+        }
+    }
+
+    /// Register the run `x-run-id` names, on the caller's word alone.
+    fn register_unproven(
+        &self,
+        quota: Quota,
+        limits: Limits,
+        headers: &HeaderMap,
+        client: Option<IpAddr>,
+    ) -> FilterAction {
+        if BROWSER_HEADERS
+            .iter()
+            .any(|name| headers.contains_key(name))
+        {
+            return reject(403, "a web page may not register a run\n");
+        }
+        let mut names = headers.get_all(RUN_ID).iter();
+        let (Some(name), None) = (names.next(), names.next()) else {
+            return reject(400, "one x-run-id header required\n");
+        };
+        let Some(name) = name.to_str().ok().and_then(RunName::new) else {
+            return reject(400, "invalid x-run-id\n");
+        };
+        match self
+            .runs
+            .register_unproven(name, client, limits, quota, Instant::now())
+        {
+            Ok((token, usage)) => {
+                self.usage.unproven_registration(true);
+                json(201, &serde_json::json!({ "token": token, "usage": usage }))
+            }
+            Err(RegisterError::AlreadyRegistered) => reject(409, "run already registered\n"),
+            // Counted in /usage rather than logged at a level a deployment
+            // keeps: any client can cause as many of these as it likes.
+            Err(RegisterError::OverQuota) => {
+                self.usage.unproven_registration(false);
+                debug!(client = ?client, "unproven run registration refused: over quota");
+                reject(429, "too many unproven registrations\n")
+            }
             Err(RegisterError::Full) => reject(503, "too many runs\n"),
         }
     }
@@ -479,22 +613,45 @@ impl Registrar {
             entry_workflows: file.entry_workflows,
             events: file.events,
         };
-        policy.validate().map_err(|e| path_error(&e))?;
+        // A policy for registration without proof only names no workflow,
+        // and then nothing about one either.
+        let proves = !(file.unproven.is_some()
+            && policy.workflows.is_empty()
+            && policy.repository_ids.is_empty()
+            && policy.owner_ids.is_empty());
+        if proves {
+            policy.validate().map_err(|e| path_error(&e))?;
+        }
         if file.max_secs == 0 || file.concurrency == 0 {
             return Err(path_error(&"max_secs and concurrency must be positive"));
         }
         if file.max_secs > MAX_SECS {
             return Err(path_error(&format!("max_secs may be at most {MAX_SECS}")));
         }
+        let limits = Limits {
+            ttl: Duration::from_secs(file.max_secs),
+            concurrency: file.concurrency,
+        };
+        let unproven = file
+            .unproven
+            .map(|unproven| unproven.quota(limits.ttl))
+            .transpose()
+            .map_err(|e| path_error(&e))?;
+        if let Some(quota) = unproven {
+            warn!(
+                policy_file = %path.display(),
+                max_registrations = quota.max,
+                window_secs = quota.window.as_secs(),
+                "runs register WITHOUT PROOF: any client that reaches the listener can use the broker's credentials"
+            );
+        }
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| format!("{FILTER_NAME}: HTTP client: {e}"))?;
         Ok(Some(Self {
-            oidc: GithubOidc::new(client, file.jwks_url, policy),
-            limits: Limits {
-                ttl: Duration::from_secs(file.max_secs),
-                concurrency: file.concurrency,
-            },
+            oidc: proves.then(|| GithubOidc::new(client, file.jwks_url, policy)),
+            unproven,
+            limits,
         }))
     }
 }
@@ -607,9 +764,12 @@ impl HttpFilter for RunTokenFilter {
         if path == RUNS_PATH || path.starts_with("/v1/runs/") {
             return Ok(match &self.endpoints {
                 RunEndpoints::Absent => reject(404, "not found\n"),
-                RunEndpoints::Unconfigured => self.serve_runs(None, ctx.request).await,
+                RunEndpoints::Unconfigured => {
+                    self.serve_runs(None, ctx.request, ctx.client_addr).await
+                }
                 RunEndpoints::Serving(registrar) => {
-                    self.serve_runs(Some(registrar.as_ref()), ctx.request).await
+                    self.serve_runs(Some(registrar.as_ref()), ctx.request, ctx.client_addr)
+                        .await
                 }
             });
         }
@@ -739,7 +899,13 @@ impl HttpFilter for RunTokenFilter {
                     .settle(provider, reported.as_ref(), metered.success);
             }
             match metered.caller {
-                Some(Caller::Run(admission)) => admission.settle(reported),
+                Some(Caller::Run(admission)) => {
+                    if admission.is_unproven() && !admission.usage_free {
+                        self.usage
+                            .settle_unproven(reported.as_ref(), metered.success);
+                    }
+                    admission.settle(reported);
+                }
                 Some(Caller::Operator(slot)) if !slot.usage_free => self.usage.settle_operator(
                     slot.operator().name(),
                     reported.as_ref(),
@@ -821,6 +987,78 @@ mod tests {
                 Some(r#"{"workflows": ["w"], "owner_ids": [7], "concurrency": 0}"#),
                 Err(()),
             ),
+            // Registration without proof, beside a proving policy or alone.
+            (
+                "unproven too",
+                Some(
+                    r#"{"workflows": ["w"], "owner_ids": [7], "unproven": {"max_registrations": 8}}"#,
+                ),
+                Ok(true),
+            ),
+            (
+                "unproven only",
+                Some(r#"{"unproven": {"max_registrations": 8, "window_secs": 7200}}"#),
+                Ok(true),
+            ),
+            ("nothing at all", Some("{}"), Err(())),
+            (
+                "unproven without a quota",
+                Some(r#"{"unproven": {}}"#),
+                Err(()),
+            ),
+            (
+                "unproven, no registrations",
+                Some(r#"{"unproven": {"max_registrations": 0}}"#),
+                Err(()),
+            ),
+            // Thirty hourly windows of a six-hour run are remembered at
+            // once, and 1024 runs.
+            (
+                "unproven, as many as are remembered",
+                Some(r#"{"unproven": {"max_registrations": 34}}"#),
+                Ok(true),
+            ),
+            (
+                "unproven, more than are remembered",
+                Some(r#"{"unproven": {"max_registrations": 35}}"#),
+                Err(()),
+            ),
+            (
+                "unproven, more than are remembered of longer runs",
+                Some(r#"{"max_secs": 43200, "unproven": {"max_registrations": 34}}"#),
+                Err(()),
+            ),
+            (
+                "unproven, too short a window",
+                Some(r#"{"unproven": {"max_registrations": 8, "window_secs": 60}}"#),
+                Err(()),
+            ),
+            (
+                "unproven, no window",
+                Some(r#"{"unproven": {"max_registrations": 8, "window_secs": 0}}"#),
+                Err(()),
+            ),
+            (
+                "unproven, unknown field",
+                Some(r#"{"unproven": {"max_registrations": 8, "enabled": true}}"#),
+                Err(()),
+            ),
+            (
+                "unproven as a flag",
+                Some(r#"{"workflows": ["w"], "owner_ids": [7], "unproven": true}"#),
+                Err(()),
+            ),
+            // Half of a proving policy is still refused beside it.
+            (
+                "unproven, ids without workflows",
+                Some(r#"{"repository_ids": [7], "unproven": {"max_registrations": 8}}"#),
+                Err(()),
+            ),
+            (
+                "unproven, names only",
+                Some(r#"{"workflows": ["w"], "unproven": {"max_registrations": 8}}"#),
+                Err(()),
+            ),
         ];
         for (name, contents, expected) in cases {
             let path = dir.path().join(name);
@@ -838,5 +1076,26 @@ mod tests {
                 concurrency: DEFAULT_CONCURRENCY,
             }
         );
+        // (policy, verifies OIDC tokens, quota of registrations without proof)
+        let hour = |max| Quota {
+            max,
+            window: Duration::from_secs(DEFAULT_UNPROVEN_WINDOW_SECS),
+        };
+        let two_hours = Quota {
+            max: 8,
+            window: Duration::from_secs(7200),
+        };
+        for (name, proves, unproven) in [
+            ("valid", true, None),
+            ("unproven too", true, Some(hour(8))),
+            ("unproven only", false, Some(two_hours)),
+        ] {
+            let registrar = Registrar::load(&dir.path().join(name)).unwrap().unwrap();
+            assert_eq!(
+                (registrar.oidc.is_some(), registrar.unproven),
+                (proves, unproven),
+                "{name}"
+            );
+        }
     }
 }

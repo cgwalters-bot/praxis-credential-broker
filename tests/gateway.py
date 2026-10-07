@@ -174,6 +174,8 @@ SHARED_CASES = [
     ("placeholder on /v1/responses", "POST", "/v1/responses", [P, R], 403, None),
     ("placeholder on /healthz", "GET", "/healthz", [P], 403, None),
     ("run registration without an OIDC token", "POST", "/v1/runs", [], 401, None),
+    ("run registration without proof, which the policy does not admit", "POST", "/v1/runs",
+     [("x-run-id", "job-1")], 401, None),
     ("run registration, wrong method", "GET", "/v1/runs", [], 405, None),
     ("the old /v1/messages pass-through route", "POST", "/v1/messages", [C], 404, None),
     ("placeholder on /v1/messages", "POST", "/v1/messages", [P, R], 403, None),
@@ -205,6 +207,20 @@ SHARED_CASES = [
     ("bare prefix with a slash", "POST", "/anthropic/", [P, R], 404, None),
     ("Responses under the prefix", "POST", "/anthropic/v1/responses", [P, R], 404, None),
     ("healthz under the prefix", "POST", "/anthropic/healthz", [P, R], 404, None),
+]
+
+# Registrations in order against a policy whose `unproven` admits two an
+# hour: the name, the headers, the status and the body of a refusal.
+UNPROVEN_CASES = [
+    ("without a run id", [], 400, "one x-run-id header required\n"),
+    ("with a run id that is not plain", [("x-run-id", "job 1")], 400, "invalid x-run-id\n"),
+    ("with an Authorization that proves nothing", [("x-run-id", "job-1"), C], 401, "invalid OIDC token\n"),
+    ("from a web page", [("x-run-id", "job-1"), ("Origin", "http://rebound.example")], 403,
+     "a web page may not register a run\n"),
+    ("of a first run", [("x-run-id", "job-1")], 201, None),
+    ("under a name that is taken", [("x-run-id", "job-1")], 409, "run already registered\n"),
+    ("of a second run", [("x-run-id", "job-2")], 201, None),
+    ("over the quota", [("x-run-id", "job-3")], 429, "too many unproven registrations\n"),
 ]
 
 DENY_BODIES = {
@@ -623,6 +639,71 @@ def register_run(port, run_id):
     return json.loads(body)["token"]
 
 
+def container_logs(name):
+    logs = podman("logs", name)
+    return re.sub(r"\x1b\[[0-9;]*m", "", logs.stdout + logs.stderr)
+
+
+def run_unproven(port, seen, check):
+    """A policy with `unproven` registers runs on the caller's word: within
+    its quota, once per name, and as runs like any other."""
+    tokens = {}
+    for name, headers, want_status, want_body in UNPROVEN_CASES:
+        resp = request(port, "/v1/runs", headers, b"")
+        text = resp.read().decode()
+        checks = {f"status {resp.status} != {want_status}": resp.status == want_status}
+        if want_body is None:
+            registered = json.loads(text)
+            run = dict(headers)["x-run-id"]
+            tokens[run] = registered["token"]
+            checks["record"] = (registered["usage"]["proof"], registered["usage"]["run"]) == ("none", run)
+        else:
+            checks[f"body {text!r}"] = text == want_body
+        check.report(f"registration without proof {name}", checks)
+    check.secrets += tokens.values()
+    token = tokens["job-1"]
+    proven = register_run(port, 2)
+    check.secrets.append(proven)
+    body = b'{"model":"claude-synthetic","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}'
+    before = len(seen)
+    statuses = []
+    for run_token in (token, proven):
+        resp = request(port, "/anthropic/v1/messages", [P, ("x-run-token", run_token)], body)
+        resp.read()
+        statuses.append(resp.status)
+    record = json.loads(request(port, "/v1/runs/self", [("x-run-token", token)], b"", method="GET").read())
+    usage = json.loads(request(port, "/usage", [], b"", method="GET").read())
+    finished = json.loads(request(port, "/v1/runs/self", [("x-run-token", token)], b"", method="DELETE").read())
+    after = request(port, "/anthropic/v1/messages", [P, ("x-run-token", token)], body)
+    after.read()
+    counts = usage.get("unproven_runs", {})
+    check.report("a run registered without proof is metered, counted apart and ended", {
+        f"statuses {statuses}": statuses == [200, 200],
+        "upstreams hit": [h["cluster"] for h in seen[before:]] == [ANTHROPIC, ANTHROPIC],
+        "run token or placeholder upstream": all(
+            header_map(h["headers"]).get("authorization") == INJECTED
+            and "x-run-token" not in header_map(h["headers"]) for h in seen[before:]),
+        f"record {record}": (record["proof"], record["run"], record["requests"], record["tokens"]["total"])
+        == ("none", "job-1", 1, 90),
+        # Both runs' requests are Anthropic's; only the unproven run's are counted apart.
+        f"usage {counts}": (counts.get("registered"), counts.get("refused"), counts.get("requests"),
+                            counts.get("tokens", {}).get("total")) == (2, 1, 1, 90),
+        "provider counts": usage["anthropic"]["counts"]["requests"] == 2,
+        "run names in /usage": "job-1" not in json.dumps(usage),
+        "not finished": finished["state"] == "finished" and finished["run"] == "job-1",
+        f"status {after.status} after the end": after.status == 401,
+    })
+    logs = container_logs(CONTAINER)
+    check.report("registration without proof is announced and logged apart", {
+        "no warning at startup": "WITHOUT PROOF" in logs,
+        "registration not logged": "unproven run registered" in logs and "unproven-run:job-1" in logs,
+        "request not logged under its kind": any("unproven-run:job-1" in line for line in logs.splitlines()
+                                                  if "request usage" in line),
+        "proven run logged as unproven": "unproven-run:2" not in logs and "github-run:7/2/1" in logs,
+        f"in logs: {check.leaks(logs)}": not [s for s in check.secrets if s in logs],
+    })
+
+
 def check_refuses_start(check, name, config_path, policy_path):
     """Startup must fail rather than serve without the broker's token."""
     container = CONTAINER + "-nostart"
@@ -659,8 +740,9 @@ def main():
         config_path = Path(tmp) / "praxis.yaml"
         config_path.write_text(test_config(praxis_port, upstreams))
         policy_path = Path(tmp) / "run-token-policy.yaml"
-        policy_path.write_text(json.dumps({"workflows": [WORKFLOW], "repository_ids": [7],
-                                           "jwks_url": f"http://127.0.0.1:{jwks.server_address[1]}/jwks"}))
+        policy = {"workflows": [WORKFLOW], "repository_ids": [7],
+                  "jwks_url": f"http://127.0.0.1:{jwks.server_address[1]}/jwks"}
+        policy_path.write_text(json.dumps(policy))
         operators_path = Path(tmp) / "operator-tokens.yaml"
         operators_path.write_text(json.dumps({"operators": [{
             "name": "interactive", "token_sha256": hashlib.sha256(OPERATOR_TOKEN.encode()).hexdigest(),
@@ -681,8 +763,7 @@ def main():
             run_body_limits(praxis_port, seen, check, run_token)
             run_h2c(praxis_port, seen, check, run_token)
             run_usage(praxis_port, seen, check, run_token)
-            logs = podman("logs", CONTAINER)
-            logs = re.sub(r"\x1b\[[0-9;]*m", "", logs.stdout + logs.stderr)
+            logs = container_logs(CONTAINER)
             inspect = podman("inspect", CONTAINER).stdout
             usage = [line for line in logs.splitlines() if "request usage" in line]
             check.report("no credential in logs or inspect; every request metered", {
@@ -694,6 +775,18 @@ def main():
                                                        for line in usage),
             })
             check_refuses_start(check, "startup fails without the token", config_path, policy_path)
+            # The setting is off unless the policy says otherwise.
+            usage = json.loads(request(praxis_port, "/usage", [], b"", method="GET").read())
+            check.report("registration without proof is off by default", {
+                "announced in the logs": "WITHOUT PROOF" not in logs and "unproven" not in logs,
+                "listed in /usage": "unproven_runs" not in usage,
+            })
+            policy["unproven"] = {"max_registrations": 2}
+            policy_path.write_text(json.dumps(policy))
+            podman("rm", "-f", CONTAINER)
+            podman("run", "--detach", "--name", CONTAINER, *container_args(config_path, policy_path))
+            wait_ready(praxis_port, CONTAINER)
+            run_unproven(praxis_port, seen, check)
         finally:
             podman("rm", "-f", CONTAINER, check=False)
             podman("secret", "rm", "--ignore", SECRET, check=False)

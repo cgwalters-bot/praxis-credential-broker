@@ -70,7 +70,8 @@ anthropic_status() {
 }
 
 # POST /v1/runs without an OIDC token: 401 when runs can register, 503
-# without a policy file.
+# without a policy file, and 400 (for the missing x-run-id) when the policy
+# has `unproven`, so that a run registers without one.
 runs_status() {
     curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
         --request POST "http://127.0.0.1:$1/v1/runs"
@@ -112,6 +113,7 @@ case "$mode" in
         echo 'Anthropic routes: ready'
         case $(runs_status 18080) in
             401) echo 'run registration: ready' ;;
+            400) echo 'run registration: ready, and OPEN: the policy has "unproven", so any client that reaches the port registers runs without proof' ;;
             503) echo 'run registration: no policy, so only pass-through requests are served' ;;
             *) echo 'run registration: not ready' >&2; exit 1 ;;
         esac
@@ -270,8 +272,9 @@ printf '%s' 'synthetic-agent-channel-012345678901234567890123' | podman secret c
 printf '%s' "$test_anthropic_token" | podman secret create --replace "$test_anthropic" - >/dev/null
 
 # The registration policy for a test workflow, whose OIDC tokens are signed
-# by the test-only key whose key set the mock serves, and praxis.yaml with a
-# per-run cap of 150 tokens for the second pass.
+# by the test-only key whose key set the mock serves, and for the second
+# pass praxis.yaml with a per-run cap of 150 tokens and that policy with
+# `unproven`, admitting two registrations without proof.
 test_workflow=owner/repo/.github/workflows/agent.yml@refs/heads/main
 python3 - "$root/praxis.yaml" "$test_dir" "$test_workflow" <<'PY'
 import json, sys
@@ -282,6 +285,8 @@ assert config.count(old) == 2, old
 open(f'{target}/praxis.yaml', 'w').write(config.replace(old, 'capacity: 150\n            reserved_tokens: 10'))
 policy = {'workflows': [workflow], 'repository_ids': [7], 'jwks_url': 'http://127.0.0.1:18081/jwks'}
 open(f'{target}/run-token-policy.yaml', 'w').write(json.dumps(policy))
+policy['unproven'] = {'max_registrations': 2}
+open(f'{target}/unproven-policy.yaml', 'w').write(json.dumps(policy))
 PY
 chmod 0755 "$test_dir"
 chmod 0644 "$test_dir"/*
@@ -294,7 +299,9 @@ test_jwt() {
     printf '%s.%s.%s' "$header" "$payload" "$signature"
 }
 # The pod as `up` creates it, with the synthetic provider and the mock
-# upstream; extra arguments go to the Praxis container.
+# upstream and $test_policy as its registration policy; extra arguments go
+# to the Praxis container.
+test_policy=run-token-policy.yaml
 start_test_pod() {
     remove_pod "$test_pod"
     remove_socket "$test_socket"
@@ -312,7 +319,7 @@ start_test_pod() {
         localhost/praxis-provider-codex:synthetic >/dev/null
     podman create "${common[@]}" --name "$test_pod-praxis" --no-healthcheck \
         --secret "$test_anthropic,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400" \
-        --volume "$test_dir/run-token-policy.yaml:$policy_target:ro,Z" "$@" \
+        --volume "$test_dir/$test_policy:$policy_target:ro,Z" "$@" \
         localhost/praxis-gateway:test >/dev/null
     podman create "${common[@]}" --name "$test_pod-mock" localhost/praxis-mock-upstream:dev >/dev/null
     podman pod start "$test_pod" >/dev/null
@@ -342,6 +349,9 @@ socket_label=$(ls -Zd "$socket_dir/agent.sock")
 wait_ready
 [[ $(anthropic_status 18081) == 403 ]]
 [[ $(runs_status 18081) == 401 ]]
+# Nor does naming a run register it: the policy has no `unproven`.
+test "$(http_status -X POST -H 'x-run-id: pod-run' http://127.0.0.1:18081/v1/runs)" = 401
+curl --fail --silent http://127.0.0.1:18081/usage | grep -Fq unproven && exit 1
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 # Injected routes refuse requests without a registered run's token.
 test "$(http_status -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses)" = 401
@@ -378,12 +388,15 @@ for secret in synthetic-agent-channel-012345678901234567890123 caller-value-must
 done
 printf '%s' "$logs" | grep -F 'run usage' | grep -Fq 'finished'
 printf '%s' "$logs" | grep -F 'request usage' | grep -Fq injected
+printf '%s' "$logs" | grep -Fq unproven && exit 1
 podman inspect "$test_pod-praxis" | grep -Fq "$test_anthropic_token" && exit 1
 
 # Second pass: a per-run cap of 150 tokens, which the second response
-# overshoots and the third is refused.
+# overshoots and the third is refused, under the policy with `unproven`.
+test_policy=unproven-policy.yaml
 start_test_pod --volume "$test_dir/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z"
 wait_ready
+[[ $(runs_status 18081) == 400 ]]
 curl --fail --silent http://127.0.0.1:18082/reset >/dev/null
 registration=$(curl --fail --silent -X POST -H "Authorization: Bearer $(test_jwt 2 "$test_workflow")" http://127.0.0.1:18081/v1/runs)
 run_token=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$registration")
@@ -392,5 +405,29 @@ for _ in 1 2; do
 done
 test "$(http_status -H "Authorization: Bearer $run_token" -H 'Content-Type: application/json' --data '{"model":"synthetic"}' http://127.0.0.1:18081/v1/responses)" = 429
 mock_counters '{"calls": 4, "observed": [[true, true], [true, true]]}'
-logs=$(podman pod logs "$test_pod"); printf '%s' "$logs" | grep -Fq "$run_token" && exit 1
+# A run registered without proof: once per name, within the quota of two,
+# with a cap of its own, metered under its name and ended like any other.
+registration=$(curl --fail --silent -X POST -H 'x-run-id: pod-run' http://127.0.0.1:18081/v1/runs)
+unproven_token=$(python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert (x["usage"]["proof"], x["usage"]["run"]) == ("none", "pod-run"), x; print(x["token"])' "$registration")
+test "$(http_status -X POST -H 'x-run-id: pod-run' http://127.0.0.1:18081/v1/runs)" = 409
+test "$(http_status -X POST -H 'x-run-id: pod-run-2' http://127.0.0.1:18081/v1/runs)" = 201
+test "$(http_status -X POST -H 'x-run-id: pod-run-3' http://127.0.0.1:18081/v1/runs)" = 429
+test "$(http_status -X POST -H "Authorization: Bearer $(test_jwt 3 "$test_workflow")" http://127.0.0.1:18081/v1/runs)" = 201
+for _ in 1 2; do
+    stream=$(curl --fail --silent -H "Authorization: Bearer $unproven_token" -H 'Accept: text/event-stream' -H 'Content-Type: application/json' --data '{"model":"synthetic"}' http://127.0.0.1:18081/v1/responses); case "$stream" in *response.completed*) ;; *) exit 1;; esac
+done
+test "$(http_status -H "Authorization: Bearer $unproven_token" -H 'Content-Type: application/json' --data '{"model":"synthetic"}' http://127.0.0.1:18081/v1/responses)" = 429
+usage=$(curl --fail --silent -X DELETE -H "Authorization: Bearer $unproven_token" http://127.0.0.1:18081/v1/runs/self)
+python3 -c 'import json,sys; x=json.loads(sys.argv[1]); assert (x["proof"], x["run"], x["state"], x["requests"], x["tokens"]["total"]) == ("none", "pod-run", "finished", 2, 200), x' "$usage"
+test "$(http_status -H "Authorization: Bearer $unproven_token" -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:18081/v1/responses)" = 401
+usage=$(curl --fail --silent http://127.0.0.1:18081/usage)
+python3 -c 'import json,sys; x=json.loads(sys.argv[1]); u=x["unproven_runs"]; assert (u["registered"], u["refused"], u["requests"], u["tokens"]["total"]) == (2, 1, 2, 200), u; assert x["codex"]["counts"]["requests"] == 4, x' "$usage"
+logs=$(podman pod logs "$test_pod")
+for secret in "$run_token" "$unproven_token"; do
+    printf '%s' "$logs" | grep -Fq "$secret" && exit 1
+done
+printf '%s' "$logs" | grep -Fq 'WITHOUT PROOF'
+printf '%s' "$logs" | grep -F 'unproven run registered' | grep -Fq 'unproven-run:pod-run'
+printf '%s' "$logs" | grep -F 'request usage' | grep -Fq 'unproven-run:pod-run'
+printf '%s' "$logs" | grep -F 'run usage' | grep -F 'pod-run' | grep -Fq 'finished'
 echo 'Synthetic native Podman pod checks passed.'

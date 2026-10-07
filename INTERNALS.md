@@ -389,6 +389,112 @@ with the same usage and limits, and the old token stops working, so a job
 whose 201 was lost can retry. The gateway keeps only the SHA-256 of a
 token.
 
+### Registering a run without proof
+
+Off by default. A policy file with an `unproven` section also registers runs
+that show no identity token:
+
+```yaml
+unproven:
+  max_registrations: 8   # required
+  # window_secs: 3600
+```
+
+```sh
+curl -X POST -H "x-run-id: NAME" http://PRAXIS/v1/runs
+# 201 {"token": "praxis-run-...", "usage": {"proof": "none", "run": "NAME", ...}}
+```
+
+A `POST /v1/runs` with no `Authorization` header then registers the run its
+one `x-run-id` header names: 1 to 128 letters, digits, `.`, `_` and `-`
+(400 otherwise). The run gets a run token like any other, with the same
+`max_secs` and `concurrency`, the same per-run token caps (the `run` rules
+in `praxis.yaml`, keyed on its own subject, `unproven-run:NAME`), the same
+usage record and the same `GET` and `DELETE /v1/runs/self`; the providers'
+window caps apply as to every injected request. A request that has an
+`Authorization` header is a claim of proof and is verified as one, exactly
+as without the setting, so a bad token is never a registration without
+proof. Without the section nothing changes: a registration with no token
+gets 401 whatever else it carries.
+
+A browser on the deployment's network reaches the listener too, and so
+does a web page open in it. The name is in a header rather than the body
+so that a page on another origin has to ask first: it may not send
+`x-run-id` without a preflight, which `/v1/runs` answers with 405 and no
+CORS header. A page whose own host name is made to resolve to the gateway
+(DNS rebinding) is same-origin and asks nothing, so a registration that
+carries `Origin` or `Sec-Fetch-Site`, which a browser adds to a page's
+`POST` and the page cannot remove, is refused with 403. That is what
+browsers send today, not a guarantee: the listener is plain HTTP and
+answers to any `Host`.
+
+To turn it on in a deployment, the gateway must first run an image that
+knows the key, since an older one refuses to start on a policy file with a
+field it does not know. Then add the section to the policy file the
+deployment mounts (`PRAXIS_RUN_TOKEN_POLICY` for `native-pod.sh up`; under
+Quadlet the file the `run-token-policy.conf` drop-in names, by default
+`~/.config/praxis-credential-broker/run-token-policy.yaml`) and restart the
+gateway (`systemctl --user restart praxis-credential-broker-pod.service`):
+it reads the file when it starts, and editing the file alone changes
+nothing. (A reload of `praxis.yaml` does read the policy file again, so
+an edit left in place takes effect at the next one; like any reload it
+keeps the registered runs and the quota already used, and resets the token
+caps, as under [Metering and caps](#metering-and-caps).) A restart forgets
+every registered run, so do it while none is active. The gateway then logs `runs register WITHOUT PROOF` as it starts,
+`native-pod.sh health` says that registration is open, and `GET /usage`
+has `unproven_runs`. To turn it off, remove the section and restart; runs
+registered until then end with the restart, and only with it: after a mere
+reload without the section no new run registers so, but those registered
+keep their tokens until they finish or expire. A policy file with `unproven`
+and no `workflows`, `repository_ids` or `owner_ids` at all registers runs
+only this way, and refuses every OIDC token with 403.
+
+What it gives up, all of it deliberately:
+
+- **The network is the only gate.** Whatever can reach the listener can
+  register a run and use the broker's credentials within a run's caps. The
+  gateway cannot tell an admitted workflow from any other peer, so restrict
+  the port with the private network's own policy. Publishing the port
+  beyond a network you trust gives the credentials away.
+- **A job's agent is such a peer.** The agent must reach the gateway to
+  work, so it can register a run of its own under a new name and get a
+  fresh per-run cap. Against an agent that tries, a run's cap is a
+  convention. What still bounds it is the quota below, the providers'
+  window caps (100M tokens per API in any five hours as committed, shared
+  by everyone, so one agent that used them up stops every other run until
+  the window moves on) and whatever ends the job.
+- **Names are the caller's.** Nothing vouches for an `x-run-id`: a record
+  with `"proof": "none"` says who the caller claimed to be. A name
+  registers once and stays taken until a day after its run expires (409),
+  whoever asks and even once the run finished, so no caller can take over,
+  re-arm or read another's run by naming it. The 409 also tells any peer
+  that a name is taken, as often as it asks. Unlike a proven run, a lost
+  reply cannot be retried under the same name, since nothing tells the
+  caller that lost it from any other: register again under a new name, and
+  the orphan expires on its own. A peer that guesses a job's name can take
+  it first, and that job then gets 409.
+- **The quota is shared.** At most `max_registrations` runs register
+  without proof in any `window_secs` (an hour by default), from all callers
+  together; the next gets 429. That bounds what registering fresh runs can
+  mint to `max_registrations` per-run caps a window, and it means a peer
+  that uses the quota up keeps honest jobs from registering until the
+  window moves on. It is a single quota rather than one per source address
+  because an address separates nothing that matters here: a job and its own
+  agent share one, and behind rootless Podman's port forwarding every
+  client can arrive from the same address. The client address is logged
+  with each registration all the same. Runs registered with an OIDC token
+  are not counted against it. At most 1024 runs registered without proof
+  are remembered at once, so they cannot fill the registry and keep proven
+  runs out, and the gateway refuses to start with a quota that could reach
+  that: each run is remembered for `max_secs` and a day more, so with the
+  defaults at most 34 an hour.
+
+Proven and unproven runs stay apart everywhere they are named: the subject
+in every `request usage` log line and cap key is `github-run:...` or
+`unproven-run:NAME`, each registration is logged as `unproven run
+registered` with the client's address, a usage record has `proof`, and
+`GET /usage` counts the runs without proof together under `unproven_runs`.
+
 ### Who holds what
 
 The run token is for the agent; the OIDC credentials must stay with the
@@ -407,7 +513,9 @@ With that, the agent can't register a run, raise its cap or extend its
 lifetime; its token admits no requests once the run is finished or
 expires, and another run's token is useless to it once that run ends. A
 tailnet peer without a registered run's token can't use the broker's
-credentials at all.
+credentials at all. None of this paragraph holds for a deployment whose
+policy has `unproven`: there the agent, like any peer, registers runs of
+its own ([above](#registering-a-run-without-proof)).
 
 ### Operator tokens
 
@@ -462,8 +570,10 @@ requests, and returns the final record, which is also logged (`run usage`)
 when a run finishes or expires. Both keep working after the run ends, so
 the job gets the record even if the agent finished the run itself. The
 record (`praxis-run-usage/v2`) holds only identifiers, model names and
-numbers, fit for a run footer: the repository, run id, attempt and check
-run id, workflow ref, `state` (`active`, `finished` or `expired`), Unix
+numbers, fit for a run footer: `proof` and what names the run (for
+`github-oidc` the repository, run id, attempt and check run id and the
+workflow ref, as the token's claims gave them; for `none` only `run`, the
+name the caller chose), `state` (`active`, `finished` or `expired`), Unix
 times registered, expiring and finished, the number of metered `requests`
 and of `unmetered` ones (successful responses whose usage never arrived,
 as when the client left mid-stream; the cap keeps their reservation),
@@ -495,7 +605,12 @@ The existing placeholder-deny filter still applies before this local route.
 `anthropic.counts` and `codex.counts` contain cumulative `requests` with reported
 usage, `unmetered` successful completed responses without usage, and `tokens` in
 the run-record shape. `operators` has the same counts for each operator the
-tokens file names, by its name, from zero; a provider's counts include them. Counts use the same `reported_usage` from `token_count` as
+tokens file names, by its name, from zero; a provider's counts include them.
+`unproven_runs` is there only if the policy admits
+[registration without proof](#registering-a-run-without-proof): the same
+counts for all such runs together, which a provider's counts include too,
+with `registered`, the registrations admitted, and `refused`, those over
+the quota. Counts use the same `reported_usage` from `token_count` as
 run records, for injected inference only. Pass-through, health checks, local
 endpoints and `count_tokens` do not contribute. Incomplete/disconnected responses
 are not settled here; these are observed totals, not rate-limit reservations.
@@ -515,7 +630,8 @@ window is null. Windows update independently and may be stale; these passive obs
 are neither a fresh provider query nor the broker's configured caps.
 
 The bounded state has two counters and four window slots per named run registry,
-and a counter per operator (at most 64 names, across reloads of the tokens file).
+a counter per operator (at most 64 names, across reloads of the tokens file)
+and one for the runs registered without proof.
 It survives configuration reloads, and resets on process restart (`started_at`
 names the start of that state). It stores no credentials, arbitrary headers,
 prompt content, model dimensions or run identifiers; operators' names are the
@@ -626,7 +742,10 @@ ExecStartPre=/usr/bin/tailscale ip --4 --assert=100.64.0.1
 Every tailnet peer that can reach the port can then use pass-through,
 register runs if it holds an allowed job's OIDC token, and use the injected
 routes of an operator whose token it holds, and nothing else;
-restrict the port with the tailnet policy anyway.
+restrict the port with the tailnet policy anyway. If the policy has
+`unproven`, every such peer can also register runs with no token at all,
+and the tailnet policy is the only thing that restricts who spends the
+broker's credentials.
 
 Upgrading units from before the run tokens: the gateway now refuses to
 start without the Claude token secret, which the committed unit mounts, and
@@ -663,7 +782,8 @@ user bus.
 
 Xenon, the operator's broker host, runs these units with two drop-ins: the
 tailnet one above for its address `100.121.0.115`, and the run registration
-policy. Tailnet clients use its MagicDNS name, `xenon.tailf2eb8.ts.net`, on
+policy, which has no `unproven`: runs register there by OIDC token only.
+Tailnet clients use its MagicDNS name, `xenon.tailf2eb8.ts.net`, on
 port 18080: `http://xenon.tailf2eb8.ts.net:18080/v1` for Codex and
 `http://xenon.tailf2eb8.ts.net:18080/anthropic` for Claude Code. It used to
 also publish a pass-through Claude listener on port 18083, from a
@@ -705,7 +825,8 @@ Podman secret storage is not claimed to encrypt secrets at rest.
 include the gateway's integration tests, which serve `praxis.yaml` with
 the gateway's registry in front of a fake upstream per cluster and the
 test-only OIDC key set (`crates/praxis-gateway/testdata`), and cover run
-registration, both credential modes, the metering of streamed Responses and
+registration, with proof and, under a policy with `unproven`, without,
+both credential modes, the metering of streamed Responses and
 Messages responses by `token_count`, the run and window caps, and a client
 that leaves mid-stream.
 
@@ -721,7 +842,9 @@ header stripping, Host and beta handling, byte-identical bodies, unbuffered
 SSE, h2c, that every metered request is logged without its credential, that
 neither the token nor a pass-through credential nor the run token is in the
 logs or `podman inspect`, and that the container refuses to start without
-the token. It needs rootless Podman with host networking.
+the token. It then starts the container again with `unproven` in the
+policy, having checked that nothing registers without proof before, and
+checks registration without proof, its quota and its metering. It needs rootless Podman with host networking.
 
 `just test-pod` builds a synthetic provider and mock upstream, then runs the
 native Podman integration checks. It always uses hardwired local synthetic
@@ -736,7 +859,8 @@ and its retry rules, finite and SSE Responses through credential-proxy with
 401 recovery, the usage record, that finishing the run revokes its token,
 and that no secret or token reaches the logs. Its second pass sets a per-run
 cap of 150 tokens and checks that the request after the cap is refused with
-429. It also checks idempotent removal of absent synthetic secrets.
+429, and adds `unproven` to the policy, which the first pass lacks and
+refuses, to check a run registered without proof through to its end. It also checks idempotent removal of absent synthetic secrets.
 
 ```sh
 just check
