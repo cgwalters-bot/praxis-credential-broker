@@ -24,6 +24,39 @@ repository_ids: [0]
 # Requests of one run in flight at once.
 # concurrency: 4
 #
+# The two entries below are OFF unless present, and each admits tokens that
+# `workflows` above refuses. A token registers if any one entry admits it;
+# its signature, issuer, audience and validity are checked first whatever
+# the entries say. Read "Admitting more workflows" in INTERNALS.md before
+# uncommenting either: both widen who can spend the broker's credentials.
+#
+# A workflow admitted wherever it runs, which is how a reusable workflow
+# called from another repository registers. `workflow` and `ref` are the
+# two halves of `job_workflow_ref`, `sha` is `job_workflow_sha` (give
+# either or both), and `callers` says which repositories may run it: by
+# owner id, by repository id, or `any: true` for every repository on
+# GitHub. Nothing here pins the called repository by id: the token has no
+# id for it. Each entry has its own `events`: the `events` and
+# `entry_workflows` above narrow `workflows` only.
+# called_workflows:
+#   - workflow: example-owner/example-lib/.github/workflows/job.yml
+#     ref: refs/heads/main
+#     # sha: 0123456789abcdef0123456789abcdef01234567
+#     callers:
+#       owner_ids: [0]
+#       # repository_ids: [0]
+#       # any: true
+#     # events: [workflow_dispatch]   # any event if left out
+#
+# Every workflow, at every ref, of the repositories it names: the workflow
+# file, what called it and its event are not checked.
+# any_workflow:
+#   repositories:
+#     owner_ids: [0]
+#     # repository_ids: [0]
+#     # any: true
+#   # events: [workflow_dispatch]   # any event if left out
+#
 # OFF unless present: also register runs that prove nothing. With it, a
 # POST /v1/runs with no Authorization and an `x-run-id` header registers a
 # run under that name, for ANY client that can reach the listener: the

@@ -165,6 +165,35 @@ its run's cap gets 429. Injecting a subscription token at a gateway is
 undocumented by Anthropic; read the risks in
 [INTERNALS.md](INTERNALS.md#risks) first.
 
+### More workflows than a list
+
+The policy's `workflows` names each workflow that may register, in its own
+repository and at one ref. Two entries, off unless the policy file has
+them, admit more: `any_workflow` every workflow of the repositories or
+owners it lists (or of all of GitHub), and `called_workflows` a named
+workflow wherever it runs, which is what a reusable workflow called from
+another repository needs.
+
+```yaml
+any_workflow:
+  repositories:
+    owner_ids: [333055778]     # every repository of this owner
+called_workflows:
+  - workflow: OWNER/REPO/.github/workflows/FILE.yml
+    ref: refs/heads/main       # or sha: the commit callers pin
+    callers:
+      repository_ids: [1372023819]
+```
+
+The token is still verified in full and the job still proves it is a job,
+so its agent, which holds no identity token, cannot register a run of its
+own by asking. The run has the same caps and usage record, which says
+which entry admitted it. **Either entry widens who can spend the broker's
+credentials** to whoever can push a workflow to an admitted repository,
+which includes an agent that holds a GitHub credential able to. Read
+[INTERNALS.md](INTERNALS.md#admitting-more-workflows) first: it says which
+claims each form checks, and has the exact text for this deployment.
+
 ### Runs without proof
 
 A job with no GitHub Actions identity to show, or a deployment that trusts

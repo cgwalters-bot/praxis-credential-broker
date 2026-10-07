@@ -346,7 +346,7 @@ verifies the token's RS256 signature against GitHub's published key set
 (cached for an hour, refetched at most once a minute for an unknown key id,
 and no longer trusted a day after the last successful fetch), its issuer,
 audience and validity period, and that it was issued after the gateway
-started. Then the policy file:
+started. Then the policy file, whose `workflows` entry is these fields:
 
 | Field | Claim | Default |
 |-------|-------|---------|
@@ -388,6 +388,192 @@ may register an active run again: it gets a new token for the same run,
 with the same usage and limits, and the old token stops working, so a job
 whose 201 was lost can retry. The gateway keeps only the SHA-256 of a
 token.
+
+### Admitting more workflows
+
+Off by default. The `workflows` entry above names each workflow, in its own
+repository, at one ref. Two more forms of entry admit tokens it refuses,
+and a policy file has them only if its operator adds them. A token
+registers if any one entry admits it. Whatever the entries say, the token
+is verified first exactly as above (signature against the key set, issuer,
+audience, validity period, issued after the gateway started), and a token
+no entry admits gets the same 403.
+
+```yaml
+called_workflows:
+  - workflow: OWNER/REPO/.github/workflows/FILE.yml
+    ref: refs/heads/main            # and/or
+    sha: 0123456789abcdef0123456789abcdef01234567
+    callers:
+      owner_ids: [1]                # and/or repository_ids, or `any: true`
+    # events: [workflow_dispatch]
+any_workflow:
+  repositories:
+    owner_ids: [1]                  # and/or repository_ids, or `any: true`
+  # events: [workflow_dispatch]
+```
+
+What each form checks, by GitHub's
+[claims](https://docs.github.com/en/actions/reference/security/oidc):
+
+| Entry | `job_workflow_ref` | `job_workflow_sha` | `repository_id`, `repository_owner_id` | `repository`, `workflow_ref` | `event_name` |
+|-------|--------------------|--------------------|----------------------------------------|------------------------------|--------------|
+| `workflows` | one of the list, exact | no | in `repository_ids` and in `owner_ids`, where given | `repository` is the one in `job_workflow_ref`; `workflow_ref` equals it or is in `entry_workflows` | in `events`, default `workflow_dispatch` |
+| `called_workflows` | `workflow`, then `@`, then `ref` | equals `sha`, if given | in `callers` | no | in `events`, if given |
+| `any_workflow` | no | no | in `repositories` | no | in `events`, if given |
+
+`job_workflow_ref` and `job_workflow_sha` name the workflow file whose job
+asked for the token and the commit it was read at; for a job of a reusable
+workflow that is the called workflow. `repository`, `repository_id`,
+`repository_owner_id` and `workflow_ref` name the run: for a reusable
+workflow, the repository and the workflow that called it. So `callers` and
+`repositories` are both about the repository the run is in.
+
+- **`callers` and `repositories`** list `owner_ids` and `repository_ids`,
+  and admit a repository that is in either list (unlike the two lists of
+  the `workflows` entry, which must both match). `any: true` admits every
+  repository on GitHub and takes no list; an entry with neither is refused
+  at startup, so no entry means "everyone" by omission. Likewise a key
+  written with nothing under it (`events:`, `ref:`) is refused rather than
+  read as left out.
+- **Each entry has its own `events`.** The `events` and `entry_workflows`
+  beside `workflows` narrow that entry only. A policy that has them
+  without `workflows` is refused, since they would read as a limit on the
+  other entries.
+- **`called_workflows`** needs `ref`, `sha` or both. With `ref` the claim
+  must be exactly `workflow@ref`, and `ref` is a full ref
+  (`refs/heads/main`, `refs/tags/v1`): whoever can move that ref in the
+  called repository decides what the job runs. With `sha` alone the caller
+  may reach the commit by any ref, or by the commit itself. `sha` is 40
+  lowercase hex digits. The entry admits the workflow run directly in its
+  own repository too, if `callers` admits that repository.
+- **The called repository is a name.** The token has ids for the run's
+  repository and owner only, so `workflow` cannot be pinned by id. If the
+  owner of the called repository renames or deletes the account, whoever
+  takes the name publishes that workflow at that ref. `sha` narrows this
+  to a commit with the same content, and `callers` to repositories that
+  chose to call that name.
+- **`any_workflow`** checks nothing about the workflow. It admits every
+  workflow file at every ref of the admitted repositories, the reusable
+  workflows of any other repository that they call, and by default every
+  event. It does not admit an admitted owner's reusable workflow called
+  from a repository that is not admitted: the token names the caller.
+
+What they give up, compared with the `workflows` entry:
+
+- **Review of the workflow.** Under `any_workflow`, anyone who can push a
+  branch to an admitted repository can add a workflow that registers runs,
+  with `id-token: write` and a step of their own. Under `called_workflows`
+  the job's steps are the named workflow's, but the caller chooses its
+  inputs, its secrets, its `vars` and `github` context and, since
+  `runs-on` labels resolve in the caller's repository, the machine it
+  runs on.
+- **The event.** Without `events`, workflows started by events outsiders
+  can cause (`pull_request_target`, `issue_comment`, `workflow_run`)
+  register too. GitHub gives no `id-token: write` to a pull request from a
+  fork of a public repository, and a fork's own runs carry the fork's
+  owner id, which is how a fork is refused. A pull request from a branch
+  of the repository itself does get a token, and without `events` it
+  registers like a push.
+- **A bound on the number of runs.** Each admitted job is a run with a cap
+  of its own, and nothing counts the jobs: what bounds them together is the
+  providers' window caps, shared by everyone. The registry remembers 4096
+  runs, each for its lifetime and a day more, and while it is full no run
+  registers (503), so enough admitted jobs keep every other job out.
+- With `any: true`, **the listener's network is the only gate on which
+  GitHub user spends**: any account can create a repository and a
+  workflow.
+- **The agent's distance from a second run** is now its distance from a
+  workflow of an admitted repository. The agent of a job still holds no
+  identity token ([Who holds what](#who-holds-what)), which is the
+  difference from [`unproven`](#registering-a-run-without-proof). But an
+  agent that holds a GitHub credential able to push a workflow to an
+  admitted repository, or under `any: true` to create a repository at
+  all, can start jobs of its own that register runs, each with a fresh
+  cap. Admit only repositories the agents' credentials cannot write
+  workflows to, or accept that the per-run cap then binds only an agent
+  that does not try.
+
+A run admitted this way is a run like any other: once per job, the same
+`max_secs` and `concurrency`, the same per-run caps keyed on its subject
+(`github-run:REPOSITORY_ID/RUN_ID/ATTEMPT`, with `/CHECK_RUN_ID` when the
+token has one), the same usage record and end.
+To see who spent what, its record has `admitted_by` (`workflows`,
+`called_workflows` or `any_workflow`: the narrowest entry that admits the
+token) beside the claims it was admitted on, and the `run registered` log
+line has the subject with the same claims, which ties every `request
+usage` line of that subject to a repository, workflow, commit, caller,
+event and actor. Those are names the admitted party chose (a workflow
+file, a branch), so the log line quotes and escapes them, and whatever
+renders a record should escape them too. The gateway logs a warning for
+each of these entries as it starts.
+
+To turn one on, the gateway must first run an image that knows the keys
+(an older one refuses to start on a policy file with a field it does not
+know). Add the entry to the policy file the deployment mounts and restart
+the gateway, as for [`unproven`](#registering-a-run-without-proof) below,
+while no run is active. To turn it off, remove the entry and restart: runs
+it admitted end with the restart. After a mere reload without the entry no
+new run registers through it, but those registered keep their tokens until
+they finish or expire.
+
+Two settings for this deployment's operator, neither of which is in any
+committed or deployed file. Ids are from
+`gh api repos/OWNER/REPO --jq '.id, .owner.id'`.
+
+(a) Any workflow of his organization cgwalters-forge (333055778):
+
+```yaml
+any_workflow:
+  repositories:
+    owner_ids: [333055778]
+```
+
+This admits every workflow file on every branch of every repository of
+that organization, on any event, and whatever reusable workflow they
+call. It gives up the list of workflows and refs: whoever has push access
+to any of those repositories can register runs, and that includes the
+bot account, so an agent that holds the bot's GitHub credential with
+permission to push workflow files can start jobs that register runs of
+their own. Each further owner id widens it the same way:
+
+- cgwalters-bot (17814078) is the bot's user account, not an
+  organization. Its repositories are mostly forks with pull requests open
+  upstream, where the upstream's maintainers can also push to a pull
+  request's branch.
+- bootc-dev (202312630) would admit everyone with push access to any
+  bootc-dev repository; (b) is the narrower way to admit one repository
+  there.
+
+(b) agentic-job's reusable workflow, called from
+bootc-dev/cgwalters-devspace-sandbox (repository 1372023819). The workflow
+file does not exist yet: `agentic-job.yml` is the name agentic-job's plan
+gives it, and the entry admits nothing until a file of that name is
+there. That plan has callers name a commit (`uses: ...@COMMIT`), which is
+the `sha` form:
+
+```yaml
+called_workflows:
+  - workflow: cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml
+    sha: COMMIT   # the 40 hex digits the caller's `uses:` names
+    callers:
+      repository_ids: [1372023819]
+```
+
+This admits jobs of that workflow file as it is at that one commit,
+called from any workflow on any branch of that one repository, on any
+event (add `events: [workflow_dispatch]` to keep today's default). It
+gives up the rule that the run's repository holds the workflow, and the
+pin on the entry workflow: whoever can push a branch to the sandbox
+repository can call it with inputs and a runner of their choice. The
+entry needs the new commit each time the caller's pin moves.
+
+For a caller that names a branch instead (`uses: ...@main`), give
+`ref: refs/heads/main` in place of `sha`. Then whoever can push
+agentic-job's `main` also decides what the admitted job does, with no
+change to this file. A caller that pins a commit does not match `ref`,
+since its `job_workflow_ref` then ends in the commit (as GitHub's tokens
+have been seen to; not tried against this gateway).
 
 ### Registering a run without proof
 
@@ -569,11 +755,15 @@ who reaches the listener.
 requests, and returns the final record, which is also logged (`run usage`)
 when a run finishes or expires. Both keep working after the run ends, so
 the job gets the record even if the agent finished the run itself. The
-record (`praxis-run-usage/v2`) holds only identifiers, model names and
-numbers, fit for a run footer: `proof` and what names the run (for
+record (`praxis-run-usage/v2`) holds identifiers, model names, numbers
+and names from the run's token, fit for a run footer once those names are
+escaped: `proof` and what names the run (for
 `github-oidc` the repository, run id, attempt and check run id and the
-workflow ref, as the token's claims gave them; for `none` only `run`, the
-name the caller chose), `state` (`active`, `finished` or `expired`), Unix
+workflow ref, as the token's claims gave them, with `workflow_sha`
+(`job_workflow_sha`), `entry_workflow_ref` (`workflow_ref`, the caller of a
+reusable workflow), `repository_owner_id`, `event_name`, `actor` and
+`admitted_by`, the policy entry that admitted it; for `none` only `run`,
+the name the caller chose), `state` (`active`, `finished` or `expired`), Unix
 times registered, expiring and finished, the number of metered `requests`
 and of `unmetered` ones (successful responses whose usage never arrived,
 as when the client left mid-stream; the cap keeps their reservation),
@@ -745,7 +935,9 @@ routes of an operator whose token it holds, and nothing else;
 restrict the port with the tailnet policy anyway. If the policy has
 `unproven`, every such peer can also register runs with no token at all,
 and the tailnet policy is the only thing that restricts who spends the
-broker's credentials.
+broker's credentials. With `any_workflow` or `called_workflows`, more jobs'
+tokens are allowed ones
+([Admitting more workflows](#admitting-more-workflows)).
 
 Upgrading units from before the run tokens: the gateway now refuses to
 start without the Claude token secret, which the committed unit mounts, and
@@ -826,7 +1018,7 @@ include the gateway's integration tests, which serve `praxis.yaml` with
 the gateway's registry in front of a fake upstream per cluster and the
 test-only OIDC key set (`crates/praxis-gateway/testdata`), and cover run
 registration, with proof and, under a policy with `unproven`, without,
-both credential modes, the metering of streamed Responses and
+what each form of policy entry admits and refuses, both credential modes, the metering of streamed Responses and
 Messages responses by `token_count`, the run and window caps, and a client
 that leaves mid-stream.
 
@@ -842,9 +1034,12 @@ header stripping, Host and beta handling, byte-identical bodies, unbuffered
 SSE, h2c, that every metered request is logged without its credential, that
 neither the token nor a pass-through credential nor the run token is in the
 logs or `podman inspect`, and that the container refuses to start without
-the token. It then starts the container again with `unproven` in the
-policy, having checked that nothing registers without proof before, and
-checks registration without proof, its quota and its metering. It needs rootless Podman with host networking.
+the token. It then starts the container again with `unproven`,
+`called_workflows` and `any_workflow` in the policy, having checked that
+nothing registers without proof before and which OIDC tokens the policy
+refuses, and checks registration without proof, its quota and its
+metering, and that the same tokens get the same statuses except those the
+new entries admit, whose run record and log line say what admitted them. It needs rootless Podman with host networking.
 
 `just test-pod` builds a synthetic provider and mock upstream, then runs the
 native Podman integration checks. It always uses hardwired local synthetic
@@ -860,7 +1055,9 @@ and its retry rules, finite and SSE Responses through credential-proxy with
 and that no secret or token reaches the logs. Its second pass sets a per-run
 cap of 150 tokens and checks that the request after the cap is refused with
 429, and adds `unproven` to the policy, which the first pass lacks and
-refuses, to check a run registered without proof through to its end. It also checks idempotent removal of absent synthetic secrets.
+refuses, to check a run registered without proof through to its end, and
+`called_workflows` and `any_workflow`, to check that tokens the first pass
+refused register, each as a capped run, and that others still get 403. It also checks idempotent removal of absent synthetic secrets.
 
 ```sh
 just check

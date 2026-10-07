@@ -223,6 +223,63 @@ UNPROVEN_CASES = [
     ("over the quota", [("x-run-id", "job-3")], 429, "too many unproven registrations\n"),
 ]
 
+# A reusable workflow of another owner's repository and the commit it is at,
+# which the test repository's caller.yml calls, and an owner the first
+# policy does not name.
+CALLED = "lib/agentic/.github/workflows/job.yml"
+CALLED_SHA = "0123456789abcdef0123456789abcdef01234567"
+CALLER = "owner/repo/.github/workflows/caller.yml@refs/heads/main"
+OTHER_OWNER = {"repository": "other/tool", "repository_id": "80", "repository_owner_id": "71",
+               "job_workflow_ref": "other/tool/.github/workflows/ci.yml@refs/heads/topic",
+               "workflow_ref": "other/tool/.github/workflows/ci.yml@refs/heads/topic", "event_name": "push"}
+# An actor's name that would end its log line's field, add one of its own
+# and start a line, if the gateway logged it as it came.
+FORGING = 'mallory" admitted_by="workflows\nFORGED LINE'
+FORBIDDEN = "workflow may not register runs\n"
+INVALID = "invalid OIDC token\n"
+
+
+def called(ref="refs/heads/main", **claims):
+    """What a token of a job of CALLED at `ref` says, called from the test
+    repository."""
+    return {"job_workflow_ref": f"{CALLED}@{ref}", "job_workflow_sha": CALLED_SHA, "workflow_ref": CALLER,
+            "actor": "someone", **claims}
+
+
+# The entries a policy has only if its operator adds them: CALLED at one
+# commit from the test owner's repositories, and any workflow of another
+# owner's.
+PERMISSIVE = {
+    "called_workflows": [{"workflow": CALLED, "sha": CALLED_SHA, "callers": {"owner_ids": [70]}}],
+    "any_workflow": {"repositories": {"owner_ids": [71]}},
+}
+# Registrations by OIDC token: the name, what the token says beyond the
+# test workflow's own run, and what the policy as committed answers and
+# what one with PERMISSIVE does: a status, and the entry that admitted the
+# run or the body of the refusal.
+OIDC_CASES = [
+    ("the named workflow", {}, (201, "workflows"), (201, "workflows")),
+    ("a reusable workflow called from the test repository", called(), (403, FORBIDDEN), (201, "called_workflows")),
+    ("the same, reached by a tag", called("refs/tags/v1"), (403, FORBIDDEN), (201, "called_workflows")),
+    ("any workflow of another owner", OTHER_OWNER, (403, FORBIDDEN), (201, "any_workflow")),
+    ("a workflow of that owner whose names would forge a log line",
+     {**OTHER_OWNER, "repository_id": "81", "actor": FORGING}, (403, FORBIDDEN), (201, "any_workflow")),
+    ("the reusable workflow at another commit", called(job_workflow_sha="f" * 40), (403, FORBIDDEN),
+     (403, FORBIDDEN)),
+    ("a fork of the reusable workflow",
+     called(job_workflow_ref="evil/agentic/.github/workflows/job.yml@refs/heads/main"),
+     (403, FORBIDDEN), (403, FORBIDDEN)),
+    ("the reusable workflow called by an owner nothing lists",
+     called(repository="third/tool", repository_id="90", repository_owner_id="72"), (403, FORBIDDEN), (403, FORBIDDEN)),
+    ("a workflow of an owner nothing lists", {**OTHER_OWNER, "repository_id": "90", "repository_owner_id": "72"},
+     (403, FORBIDDEN), (403, FORBIDDEN)),
+    ("the named workflow on another event", {"event_name": "pull_request_target"}, (403, FORBIDDEN),
+     (403, FORBIDDEN)),
+    ("another issuer", {**OTHER_OWNER, "iss": "https://example.com"}, (401, INVALID), (401, INVALID)),
+    ("another audience", called(aud="someone-else"), (401, INVALID), (401, INVALID)),
+    ("an expired token", {**OTHER_OWNER, "expired": True}, (401, INVALID), (401, INVALID)),
+]
+
 DENY_BODIES = {
     "/anthropic": {"type": "error", "error": {"type": "permission_error", "message": "only POST is forwarded"}},
     "elsewhere": {"type": "error", "error": {"type": "permission_error",
@@ -329,17 +386,19 @@ def b64url(data):
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def oidc_token(run_id):
+def oidc_token(run_id, claims=None):
     """A GitHub Actions OIDC token for the test workflow's run, signed with
-    the test-only key."""
-    now = int(time.time())
+    the test-only key, with `claims` over its own; `expired` makes it one
+    whose validity ended."""
+    claims = dict(claims or {})
+    now = int(time.time()) - (900 if claims.pop("expired", False) else 0)
     header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "praxis-test-key"}).encode())
     payload = b64url(json.dumps({
         "iss": "https://token.actions.githubusercontent.com", "aud": "praxis-credential-broker",
         "iat": now, "nbf": now, "exp": now + 300, "jti": str(uuid.uuid4()),
         "repository": "owner/repo", "repository_id": "7", "repository_owner_id": "70",
         "run_id": str(run_id), "run_attempt": "1", "job_workflow_ref": WORKFLOW,
-        "workflow_ref": WORKFLOW, "event_name": "workflow_dispatch"}).encode())
+        "workflow_ref": WORKFLOW, "event_name": "workflow_dispatch", **claims}).encode())
     signature = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(OIDC_KEY), "-binary"],
                                input=f"{header}.{payload}".encode(), capture_output=True, check=True).stdout
     return f"{header}.{payload}.{b64url(signature)}"
@@ -639,6 +698,80 @@ def register_run(port, run_id):
     return json.loads(body)["token"]
 
 
+def run_oidc(port, seen, check, permissive):
+    """Which OIDC tokens register, under the policy as committed or with
+    PERMISSIVE: the same statuses either way for a token no entry admits."""
+    policy = "a permissive policy" if permissive else "the default policy"
+    before = len(seen)
+    admitted = {}
+    for number, (name, claims, default, with_entries) in enumerate(OIDC_CASES):
+        want_status, want = with_entries if permissive else default
+        # Runs of their own, in each repository: 1 to 3 are the other checks'.
+        resp = request(port, "/v1/runs", [("Authorization", f"Bearer {oidc_token(100 + number, claims)}")], b"")
+        text = resp.read().decode()
+        checks = {f"status {resp.status} != {want_status}": resp.status == want_status}
+        if resp.status == 201:
+            registered = json.loads(text)
+            check.secrets.append(registered["token"])
+            admitted[name] = registered
+            by = registered["usage"].get("admitted_by")
+            checks[f"admitted by {by}"] = by == want
+        else:
+            checks[f"body {text!r}"] = text == want
+        check.report(f"{policy}: registration of {name}", checks)
+    check.report(f"{policy}: registration reaches no upstream", {"upstreams hit": len(seen) == before})
+    return admitted
+
+
+def run_admitted(port, seen, check, admitted):
+    """A run one of PERMISSIVE's entries admitted is a run like any other,
+    and its record and the logs say whose it is."""
+    registered = admitted.get("a reusable workflow called from the test repository")
+    if registered is None:
+        check.report("a called workflow's run is metered, recorded and ended", {"registered": False})
+        return
+    token = registered["token"]
+    body = b'{"model":"claude-synthetic","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}'
+    before = len(seen)
+    resp = request(port, "/anthropic/v1/messages", [P, ("x-run-token", token)], body)
+    resp.read()
+    record = json.loads(request(port, "/v1/runs/self", [("x-run-token", token)], b"", method="DELETE").read())
+    after = request(port, "/anthropic/v1/messages", [P, ("x-run-token", token)], body)
+    after.read()
+    who = {name: record.get(name) for name in (
+        "proof", "admitted_by", "repository", "repository_id", "repository_owner_id", "workflow_ref", "workflow_sha",
+        "entry_workflow_ref", "event_name", "actor")}
+    run = record.get("run_id")
+    check.report("a called workflow's run is metered, recorded and ended", {
+        f"status {resp.status}": resp.status == 200,
+        "upstreams hit": [h["cluster"] for h in seen[before:]] == [ANTHROPIC],
+        f"record {who}": who == {
+            "proof": "github-oidc", "admitted_by": "called_workflows", "repository": "owner/repo",
+            "repository_id": 7, "repository_owner_id": 70, "workflow_ref": f"{CALLED}@refs/heads/main",
+            "workflow_sha": CALLED_SHA, "entry_workflow_ref": CALLER, "event_name": "workflow_dispatch",
+            "actor": "someone"},
+        f"usage {record.get('requests')}, {record.get('tokens')}": (
+            record.get("requests"), record.get("tokens", {}).get("total"), record.get("state")) == (1, 90, "finished"),
+        f"status {after.status} after the end": after.status == 401,
+    })
+    logs = container_logs(CONTAINER)
+    lines = [line for line in logs.splitlines() if "run registered" in line and f"github-run:7/{run}/1" in line]
+    check.report("the new entries are announced, and a registration logged with what admitted it", {
+        "no warning at startup": "ANY WORKFLOW" in logs and "called from other repositories" in logs,
+        f"registration: {lines}": len(lines) == 1 and all(
+            part in lines[0] for part in ("called_workflows", f"{CALLED}@refs/heads/main", CALLED_SHA, CALLER,
+                                          "owner/repo", "someone")),
+        "request not logged under its run": any(f"github-run:7/{run}/1" in line for line in logs.splitlines()
+                                                if "request usage" in line),
+        # Names the admitted party chose are quoted and escaped, on the
+        # registration's own line.
+        "a claim forged a log line": [json.dumps(FORGING)[1:-1] in line and "run registered" in line
+                                      and "github-run:81/" in line
+                                      for line in logs.splitlines() if "FORGED LINE" in line] == [True],
+        f"in logs: {check.leaks(logs)}": not [s for s in check.secrets if s in logs],
+    })
+
+
 def container_logs(name):
     logs = podman("logs", name)
     return re.sub(r"\x1b\[[0-9;]*m", "", logs.stdout + logs.stderr)
@@ -763,6 +896,7 @@ def main():
             run_body_limits(praxis_port, seen, check, run_token)
             run_h2c(praxis_port, seen, check, run_token)
             run_usage(praxis_port, seen, check, run_token)
+            run_oidc(praxis_port, seen, check, permissive=False)
             logs = container_logs(CONTAINER)
             inspect = podman("inspect", CONTAINER).stdout
             usage = [line for line in logs.splitlines() if "request usage" in line]
@@ -781,12 +915,17 @@ def main():
                 "announced in the logs": "WITHOUT PROOF" not in logs and "unproven" not in logs,
                 "listed in /usage": "unproven_runs" not in usage,
             })
+            check.report("the permissive entries are off by default", {
+                "announced in the logs": "ANY WORKFLOW" not in logs and "called from other" not in logs,
+            })
             policy["unproven"] = {"max_registrations": 2}
+            policy.update(PERMISSIVE)
             policy_path.write_text(json.dumps(policy))
             podman("rm", "-f", CONTAINER)
             podman("run", "--detach", "--name", CONTAINER, *container_args(config_path, policy_path))
             wait_ready(praxis_port, CONTAINER)
             run_unproven(praxis_port, seen, check)
+            run_admitted(praxis_port, seen, check, run_oidc(praxis_port, seen, check, permissive=True))
         finally:
             podman("rm", "-f", CONTAINER, check=False)
             podman("secret", "rm", "--ignore", SECRET, check=False)
