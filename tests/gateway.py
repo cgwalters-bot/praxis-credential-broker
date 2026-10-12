@@ -2,8 +2,9 @@
 """Check the gateway image's routes against fake upstreams.
 
 Builds the gateway image (Containerfile.gateway) and runs it with the pod's
-container hardening, a synthetic Claude OAuth token delivered as a Podman
-secret file, and a run registration policy that trusts a test-only OIDC key.
+container hardening, a synthetic Claude OAuth token and a synthetic Mistral
+API key delivered as Podman secret files, and a run registration policy that
+trusts a test-only OIDC key.
 The configuration baked into the image is replaced by a copy in which only
 the listener address and the upstream endpoints are rewritten, so the filter
 order and conditions under test are the ones that ship. Each cluster gets a
@@ -40,6 +41,13 @@ IMAGE = "localhost/praxis-gateway:test"
 CONTAINER = "praxis-credential-broker-test-gateway"
 SECRET = "praxis-credential-broker-test-anthropic-oauth"
 TOKEN_FILE = "/run/secrets/anthropic/oauth-token"
+MISTRAL_SECRET = "praxis-credential-broker-test-mistral-api-key"
+MISTRAL_KEY_FILE = "/run/secrets/mistral/api-key"
+MISTRAL_KEY = "SYNTHETICmistralTESTkey0123456789abcdef"
+# What the entrypoint gives credential_injection where no key is stored.
+NO_MISTRAL_KEY = "praxis-no-mistral-key"
+MISTRAL_PATH = "/mistral/v1/chat/completions"
+MISTRAL_MODEL = "zai-glm-5-3"
 POLICY_FILE = "/etc/praxis-credential-broker/run-token-policy.yaml"
 OPERATORS_FILE = "/etc/praxis-credential-broker/operator-tokens.yaml"
 # The one operator of the test tokens file, for Responses only.
@@ -58,17 +66,19 @@ MAX_REQUEST_BYTES = 33554432
 
 # The fake upstream that stands in for each cluster of the load_balancer.
 RESPONSES, ANTHROPIC, PASS = "inference-backend", "anthropic", "anthropic-pass-through"
+MISTRAL = "mistral"
 RUNS = "run-endpoints"
-CLUSTERS = (RESPONSES, ANTHROPIC, PASS, RUNS)
+CLUSTERS = (RESPONSES, ANTHROPIC, PASS, MISTRAL, RUNS)
 
 # The deny filters must come first, and the router before run_token and
 # anything that changes the request. A reordering is a security change, not
 # a refactor.
 FILTERS = [
-    "static_response", "static_response", "static_response", "openai_responses_proxy", "anthropic_messages_format",
-    "anthropic_validate", "anthropic_messages_protocol", "router", "run_token", "token_rate_limit",
-    "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_count", "token_count",
-    "path_rewrite", "headers", "headers", "headers", "credential_injection", "load_balancer",
+    "static_response", "static_response", "static_response", "static_response", "openai_responses_proxy",
+    "anthropic_messages_format", "anthropic_validate", "anthropic_messages_protocol", "router", "run_token",
+    "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_rate_limit",
+    "token_rate_limit", "token_count", "token_count", "token_count", "path_rewrite", "path_rewrite",
+    "headers", "headers", "headers", "headers", "credential_injection", "load_balancer",
 ]
 
 P = ("Authorization", PLACEHOLDER)
@@ -209,6 +219,51 @@ SHARED_CASES = [
     ("healthz under the prefix", "POST", "/anthropic/healthz", [P, R], 404, None),
 ]
 
+# Mistral chat completions: one exact path, for a run token as the request's
+# bearer token or in x-run-token, and no other way to the broker's key, which
+# is good for every endpoint of api.mistral.ai.
+MISTRAL_CASES = [
+    ("Mistral with a run token", "POST", MISTRAL_PATH, [B], 200, MISTRAL),
+    ("Mistral with a run token in x-run-token", "POST", MISTRAL_PATH, [R], 200, MISTRAL),
+    ("Mistral with a client x-api-key and Host", "POST", MISTRAL_PATH,
+     [B, ("x-api-key", "client"), ("Host", "evil.example")], 200, MISTRAL),
+    ("Mistral, lowercase post", "post", MISTRAL_PATH, [B], 200, MISTRAL),
+    ("Mistral without a run token", "POST", MISTRAL_PATH, [], 401, None),
+    ("Mistral with an unknown run token", "POST", MISTRAL_PATH, [("x-run-token", "praxis-run-0000")], 401, None),
+    ("Mistral with a key of the caller's own", "POST", MISTRAL_PATH, [C], 401, None),
+    ("Mistral with the run token only in x-api-key", "POST", MISTRAL_PATH, [("x-api-key", RUN_TOKEN)], 401, None),
+    ("Mistral with two Authorization headers", "POST", MISTRAL_PATH, [B, C], 400, None),
+    ("placeholder on /mistral", "POST", MISTRAL_PATH, [P, R], 403, None),
+    ("GET Mistral chat completions", "GET", MISTRAL_PATH, [B], 405, None),
+    ("GET Mistral models", "GET", "/mistral/v1/models", [B], 405, None),
+    ("DELETE a Mistral file", "DELETE", "/mistral/v1/files/f", [B], 405, None),
+    ("lowercase delete of a Mistral file", "delete", "/mistral/v1/files/f", [B], 405, None),
+    ("TRACE Mistral chat completions", "TRACE", MISTRAL_PATH, [B], 405, None),
+    ("Mistral files", "POST", "/mistral/v1/files", [B], 404, None),
+    ("Mistral agents completions", "POST", "/mistral/v1/agents/completions", [B], 404, None),
+    ("Mistral conversations", "POST", "/mistral/v1/conversations", [B], 404, None),
+    ("Mistral FIM", "POST", "/mistral/v1/fim/completions", [B], 404, None),
+    ("Responses under /mistral", "POST", "/mistral/v1/responses", [B], 404, None),
+    ("Messages under /mistral", "POST", "/mistral/v1/messages", [C], 404, None),
+    ("Mistral, trailing slash", "POST", MISTRAL_PATH + "/", [B], 404, None),
+    ("Mistral dot-dot out of chat completions", "POST", MISTRAL_PATH + "/../../files", [B], 404, None),
+    ("Mistral dot segment", "POST", "/mistral/v1/./chat/completions", [B], 404, None),
+    ("Mistral encoded dot-dot", "POST", MISTRAL_PATH + "/%2e%2e/%2e%2e/files", [B], 404, None),
+    ("Mistral encoded slashes", "POST", "/mistral%2fv1%2fchat%2fcompletions", [B], 404, None),
+    ("Mistral, double slash after the prefix", "POST", "/mistral//v1/chat/completions", [B], 404, None),
+    ("Mistral, leading double slash", "POST", "//mistral/v1/chat/completions", [B], 404, None),
+    ("bare /mistral", "POST", "/mistral", [B], 404, None),
+    ("/mistral as a word prefix", "POST", "/mistralx/v1/chat/completions", [B], 404, None),
+    ("/v1 dot-dot into /mistral", "POST", "/v1/../mistral/v1/chat/completions", [B], 404, None),
+    ("/anthropic dot-dot into /mistral", "POST", "/anthropic/../mistral/v1/chat/completions", [B], 404, None),
+    ("/anthropic dot-dot into /mistral, placeholder", "POST", "/anthropic/../mistral/v1/chat/completions",
+     [P, R], 404, None),
+    ("/mistral dot-dot into /v1/responses", "POST", "/mistral/../v1/responses", [B], 404, None),
+    ("/mistral dot-dot into /anthropic, placeholder", "POST", "/mistral/../anthropic/v1/messages", [P, R], 403, None),
+    ("/mistral dot-dot into /anthropic, client OAuth", "POST", "/mistral/../anthropic/v1/messages", [C], 404, None),
+    ("chat completions without the prefix", "POST", "/v1/chat/completions", [B], 404, None),
+]
+
 # Registrations in order against a policy whose `unproven` admits two an
 # hour: the name, the headers, the status and the body of a refusal.
 UNPROVEN_CASES = [
@@ -288,6 +343,11 @@ DENY_BODIES = {
 
 # What each fake Messages upstream reports, which token_count meters.
 MESSAGES_USAGE = {"input_tokens": 40, "cache_read_input_tokens": 20, "output_tokens": 30}
+# The end of a stream api.mistral.ai sent, with the usage of its last chunk,
+# which the fake Mistral upstream also reports when it does not stream.
+MISTRAL_STREAM = (TESTDATA / "mistral-chat-stream.sse").read_text()
+MISTRAL_USAGE = {"prompt_tokens": 24, "total_tokens": 44, "completion_tokens": 20,
+                 "prompt_tokens_details": {"cached_tokens": 0}}
 USAGE_HEADERS = json.loads((TESTDATA / "usage-headers.json").read_text())
 
 
@@ -297,11 +357,37 @@ class Upstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def end_headers(self):
-        provider = "codex" if self.server.cluster == RESPONSES else "anthropic"
-        for name, value in USAGE_HEADERS[provider].items():
+        # Mistral's responses have no limit headers.
+        provider = {RESPONSES: "codex", MISTRAL: None}.get(self.server.cluster, "anthropic")
+        for name, value in USAGE_HEADERS.get(provider, {}).items():
             if name.startswith(("anthropic-ratelimit-unified-", "x-codex-")):
                 self.send_header(name, value)
         super().end_headers()
+
+    def chat_completion(self, stream):
+        """Answer like Mistral's chat completions."""
+        self.send_response(200)
+        if not stream:
+            out = json.dumps({"id": "c", "object": "chat.completion", "model": MISTRAL_MODEL,
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"},
+                                           "finish_reason": "stop"}],
+                              "usage": MISTRAL_USAGE}).encode()
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        self.send_header("content-type", "text/event-stream; charset=utf-8")
+        self.send_header("transfer-encoding", "chunked")
+        self.end_headers()
+        for event in MISTRAL_STREAM.split("\n\n"):
+            if event:
+                chunk = (event + "\n\n").encode()
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+                time.sleep(SSE_DELAY)
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length") or 0))
@@ -312,6 +398,9 @@ class Upstream(BaseHTTPRequestHandler):
             stream = json.loads(body).get("stream") is True
         except ValueError:
             stream = False
+        if self.server.cluster == MISTRAL:
+            self.chat_completion(stream)
+            return
         if not stream:
             out = json.dumps({"id": "msg_synthetic", "type": "message", "model": "claude-synthetic",
                               "content": [{"type": "text", "text": "OK"}], "usage": MESSAGES_USAGE}).encode()
@@ -443,9 +532,10 @@ def check_filter_order(check):
     })
 
 
-def container_args(config_path, policy_path, with_secret=True):
+def container_args(config_path, policy_path, with_secret=True, with_mistral=True):
     """The praxis container's settings in native-pod.sh, on the host network,
-    with the operator tokens file next to the policy if there is one."""
+    with the operator tokens file next to the policy if there is one, and
+    the Mistral key, which a deployment may be without."""
     operators_path = policy_path.with_name("operator-tokens.yaml")
     args = ["--network", "host", "--user", "65532:65532", "--read-only", "--cap-drop=ALL",
             "--security-opt=no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
@@ -456,6 +546,8 @@ def container_args(config_path, policy_path, with_secret=True):
         args += ["--volume", f"{operators_path}:{OPERATORS_FILE}:ro,Z"]
     if with_secret:
         args += ["--secret", f"{SECRET},target={TOKEN_FILE},uid=65532,gid=65532,mode=0400"]
+    if with_mistral:
+        args += ["--secret", f"{MISTRAL_SECRET},target={MISTRAL_KEY_FILE},uid=65532,gid=65532,mode=0400"]
     return args + [IMAGE]
 
 
@@ -479,7 +571,7 @@ class Checker:
     def __init__(self):
         self.failed = 0
         # Strings that must never appear in a response or the logs.
-        self.secrets = [TOKEN, CLIENT_OAUTH.removeprefix("Bearer ")]
+        self.secrets = [TOKEN, CLIENT_OAUTH.removeprefix("Bearer "), MISTRAL_KEY]
 
     def leaks(self, text):
         return [s for s in self.secrets + [OAUTH_BETA] if s in text]
@@ -496,6 +588,7 @@ def forwarded_checks(cluster, path, headers, body, hit, run_token):
     checks = {
         "body changed": hit["body_sha256"] == hashlib.sha256(body).hexdigest(),
         "token sent to the wrong upstream": cluster == ANTHROPIC or TOKEN not in str(hit["headers"]),
+        "Mistral key sent to the wrong upstream": cluster == MISTRAL or MISTRAL_KEY not in str(hit["headers"]),
         "run token forwarded": run_token not in str(hit["headers"]),
         "operator token forwarded": OPERATOR_TOKEN not in str(hit["headers"]),
         "x-run-token forwarded": "x-run-token" not in up,
@@ -509,6 +602,14 @@ def forwarded_checks(cluster, path, headers, body, hit, run_token):
             "prefix not stripped": hit["path"] == path.removeprefix("/anthropic"),
         }
     checks |= {"OAuth beta added": OAUTH_BETA not in str(up.get("anthropic-beta"))}
+    if cluster == MISTRAL:
+        return checks | {
+            "upstream Authorization is not the single injected key":
+                up.get("authorization") == ["Bearer " + MISTRAL_KEY],
+            "x-api-key forwarded": "x-api-key" not in up,
+            "Host not rewritten": up.get("host") == ["api.mistral.ai"],
+            "prefix not stripped": hit["path"] == path.removeprefix("/mistral"),
+        }
     if cluster == PASS:
         return checks | {
             "client Authorization not passed through": up.get("authorization") == sent.get("authorization"),
@@ -613,6 +714,71 @@ def run_usage(port, seen, check, run_token):
     resp = request(port, "/usage", [], b"", method="GET")
     check.report("pass-through and count_tokens leave broker usage unchanged", {
         "snapshot changed": json.loads(resp.read()) == usage,
+    })
+
+
+def chat_body(stream):
+    return json.dumps({"model": MISTRAL_MODEL, "stream": stream, "max_tokens": 20,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+
+def run_mistral(port, seen, check, run_token):
+    """Chat completions, streamed and not, are metered from the usage Mistral
+    sends unasked, charged to the run and counted under their own provider."""
+    def state():
+        record = json.loads(request(port, "/v1/runs/self", [("x-run-token", run_token)], b"", method="GET").read())
+        return record, json.loads(request(port, "/usage", [], b"", method="GET").read())
+
+    def counted(record, usage):
+        return [record["requests"], record["tokens"]["total"], record["models"].get(MISTRAL_MODEL, {}).get("total", 0),
+                usage["mistral"]["counts"]["requests"], usage["mistral"]["counts"]["tokens"]["total"]]
+
+    record, usage = state()
+    for stream in (True, False):
+        body = chat_body(stream)
+        before = len(seen)
+        resp = request(port, MISTRAL_PATH, [("Authorization", "Bearer " + run_token), ("accept-encoding", "gzip")],
+                       body)
+        text = resp.read().decode()
+        hits = seen[before:]
+        checks = {
+            f"status {resp.status}": resp.status == 200,
+            f"upstreams hit: {[h['cluster'] for h in hits]}": [h["cluster"] for h in hits] == [MISTRAL],
+            "response changed": text == MISTRAL_STREAM if stream else json.loads(text)["usage"] == MISTRAL_USAGE,
+            "key or run token in response": not check.leaks(text + str(resp.getheaders())),
+        }
+        if len(hits) == 1:
+            checks |= forwarded_checks(MISTRAL, MISTRAL_PATH, [], body, hits[0], run_token)
+            checks["accept-encoding forwarded"] = "accept-encoding" not in header_map(hits[0]["headers"])
+        check.report(f"/mistral: {'streamed' if stream else 'plain'} chat completion", checks)
+    after_record, after_usage = state()
+    spent = [b - a for a, b in zip(counted(record, usage), counted(after_record, after_usage))]
+    others = [(usage[p]["counts"], after_usage[p]["counts"]) for p in ("anthropic", "codex")]
+    check.report("Mistral usage is the run's, and the broker counts it under its own provider", {
+        f"requests and tokens {spent}": spent == [2, 88, 88, 2, 88],
+        "unmetered": after_record["unmetered"] == record["unmetered"]
+        and after_usage["mistral"]["counts"]["unmetered"] == 0,
+        "counted as another provider's": all(before == after for before, after in others),
+        f"more than counts: {sorted(after_usage['mistral'])}": sorted(after_usage["mistral"]) == ["counts"],
+    })
+
+
+def run_without_mistral_key(port, seen, check):
+    """A deployment that stored no Mistral key starts all the same, and what
+    it forwards on /mistral carries no credential of anyone's."""
+    run_token = register_run(port, 3)
+    check.secrets.append(run_token)
+    before = len(seen)
+    resp = request(port, MISTRAL_PATH, [("Authorization", "Bearer " + run_token)], chat_body(False))
+    resp.read()
+    hits = seen[before:]
+    sent = str([h["headers"] for h in hits])
+    check.report("without a Mistral key, /mistral forwards a value that is no key", {
+        f"upstreams hit: {[h['cluster'] for h in hits]}": [h["cluster"] for h in hits] == [MISTRAL],
+        "upstream Authorization": [header_map(h["headers"]).get("authorization") for h in hits]
+        == [["Bearer " + NO_MISTRAL_KEY]],
+        "a credential went upstream": not [s for s in check.secrets if s in sent],
+        "not said at startup": "no Mistral API key" in container_logs(CONTAINER),
     })
 
 
@@ -883,16 +1049,18 @@ def main():
         for path in (config_path, policy_path, operators_path):
             path.chmod(0o644)
         # Podman 4 (Ubuntu's, in CI) has no secret create --replace.
-        podman("secret", "rm", "--ignore", SECRET, check=False)
-        podman("secret", "create", SECRET, "-", stdin=TOKEN)
+        for secret, value in ((SECRET, TOKEN), (MISTRAL_SECRET, MISTRAL_KEY)):
+            podman("secret", "rm", "--ignore", secret, check=False)
+            podman("secret", "create", secret, "-", stdin=value)
         podman("rm", "-f", CONTAINER, check=False)
         try:
             podman("run", "--detach", "--name", CONTAINER, *container_args(config_path, policy_path))
             wait_ready(praxis_port, CONTAINER)
             run_token = register_run(praxis_port, 1)
             check.secrets += [run_token, OPERATOR_TOKEN]
-            run_cases(praxis_port, seen, check, run_token, ANTHROPIC_CASES + SHARED_CASES)
+            run_cases(praxis_port, seen, check, run_token, ANTHROPIC_CASES + SHARED_CASES + MISTRAL_CASES)
             run_stream(praxis_port, seen, check, run_token)
+            run_mistral(praxis_port, seen, check, run_token)
             run_body_limits(praxis_port, seen, check, run_token)
             run_h2c(praxis_port, seen, check, run_token)
             run_usage(praxis_port, seen, check, run_token)
@@ -902,7 +1070,8 @@ def main():
             usage = [line for line in logs.splitlines() if "request usage" in line]
             check.report("no credential in logs or inspect; every request metered", {
                 f"in logs: {check.leaks(logs)}": not [s for s in check.secrets if s in logs],
-                "token in podman inspect": TOKEN not in inspect,
+                "token in podman inspect": TOKEN not in inspect and MISTRAL_KEY not in inspect,
+                "startup said the Mistral key is missing": "no Mistral API key" not in logs,
                 "no metered injected request": any(re.search(r"\binjected\b.*\btotal\W+90\b", line)
                                                    for line in usage),
                 "no metered pass-through request": any(re.search(r"\bpass-through\b.*\btotal\W+90\b", line)
@@ -922,13 +1091,15 @@ def main():
             policy.update(PERMISSIVE)
             policy_path.write_text(json.dumps(policy))
             podman("rm", "-f", CONTAINER)
-            podman("run", "--detach", "--name", CONTAINER, *container_args(config_path, policy_path))
+            podman("run", "--detach", "--name", CONTAINER,
+                   *container_args(config_path, policy_path, with_mistral=False))
             wait_ready(praxis_port, CONTAINER)
+            run_without_mistral_key(praxis_port, seen, check)
             run_unproven(praxis_port, seen, check)
             run_admitted(praxis_port, seen, check, run_oidc(praxis_port, seen, check, permissive=True))
         finally:
             podman("rm", "-f", CONTAINER, check=False)
-            podman("secret", "rm", "--ignore", SECRET, check=False)
+            podman("secret", "rm", "--ignore", SECRET, MISTRAL_SECRET, check=False)
             for server in [*upstreams.values(), jwks]:
                 server.shutdown()
     print("Gateway checks " + ("failed" if check.failed else "passed") + ".")

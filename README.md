@@ -8,12 +8,13 @@
 
 A credential broker built on [Praxis AI](https://github.com/praxis-proxy/ai).
 One listener serves the ChatGPT Codex Responses API, authenticated through
-`codex login`, under `/v1`, and the Anthropic Messages API under
-`/anthropic/v1`. Every route has a credential mode:
+`codex login`, under `/v1`, the Anthropic Messages API under
+`/anthropic/v1`, and Mistral's chat completions under `/mistral/v1`. Every
+route has a credential mode:
 
-- **injected**: the broker supplies its own credential (the Codex login, or a
-  Claude subscription token), and only for requests that carry the token of
-  a registered CI run. This is how agent runs use the broker: they never see
+- **injected**: the broker supplies its own credential (the Codex login, a
+  Claude subscription token, or a Mistral API key), and only for requests
+  that carry the token of a registered CI run. This is how agent runs use the broker: they never see
   a real credential, and each run is capped.
 - **pass-through**: the caller's own Claude credential is forwarded to
   Anthropic, never stored, and only metered. This is for interactive Claude
@@ -53,6 +54,11 @@ bash scripts/native-pod.sh down
 
 `down` preserves the secrets and Codex login for a later restart. GHCR access
 policies may require `podman login ghcr.io`.
+
+The Mistral route needs a key of its own, which a deployment may leave out:
+`bash scripts/init-mistral-key` before `up` stores it, read like the Claude
+token. Without it the broker starts all the same, and Mistral refuses what
+`/mistral` forwards.
 
 Which CI jobs may register runs, and so use the broker's credentials, is a
 policy file: copy `run-token-policy.yaml`, name the workflows and the
@@ -164,6 +170,44 @@ A request with the placeholder but without a valid run token is refused with
 its run's cap gets 429. Injecting a subscription token at a gateway is
 undocumented by Anthropic; read the risks in
 [INTERNALS.md](INTERNALS.md#risks) first.
+
+Mistral's chat completions are at `/mistral/v1/chat/completions`, and
+nothing else of Mistral's API is. A client sends the run token as its API
+key, as on Responses:
+
+```sh
+curl http://127.0.0.1:18080/mistral/v1/chat/completions \
+  -H "Authorization: Bearer $PRAXIS_RUN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model": "zai-glm-5-3", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+The broker maps no model names, here or on the other routes: `model` goes
+upstream as the client wrote it, and a client's own name for a model, such
+as OpenCode's `praxis/gpt-6-astra`, is its provider entry and the upstream
+name. A provider entry has one base URL, so Mistral's models get an entry
+of their own, such as `praxis-mistral`, and are then
+`praxis-mistral/zai-glm-5-3` (GLM-5.3 as Mistral hosts it) and
+`praxis-mistral/mistral-vibe-cli-latest` (Mistral Medium 3.5), the names
+Mistral Vibe itself uses upstream. For Mistral Vibe, in the
+`config.toml` of its `VIBE_HOME`:
+
+```toml
+active_model = "glm-5-3"
+
+[[providers]]
+name = "praxis"
+api_base = "http://127.0.0.1:18080/mistral/v1"
+api_key_env_var = "PRAXIS_RUN_TOKEN"
+backend = "mistral"
+
+[[models]]
+name = "zai-glm-5-3"
+provider = "praxis"
+alias = "glm-5-3"
+```
+
+Neither client has been run against the route yet; what has is in
+[INTERNALS.md](INTERNALS.md#development-and-synthetic-testing).
 
 ### More workflows than a list
 

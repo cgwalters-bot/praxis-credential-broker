@@ -6,6 +6,8 @@
 #                                      POST only
 #   /anthropic/v1/messages             Anthropic Messages, with
 #   /anthropic/v1/messages/count_tokens    exact paths only
+#   /mistral/v1/chat/completions       Mistral chat completions, POST only,
+#                                      this exact path only
 #   /v1/runs (prefix)                  run registration, answered by run_token
 #   /usage (exact), GET                local broker usage, answered by run_token,
 #                                      with CORS for the review dashboard
@@ -14,8 +16,9 @@
 # cluster in run_token's `credentials` below:
 #
 #   injected      the broker's credential, only for a registered run's
-#                 requests, each carrying its run token: Responses always,
-#                 and Messages sent with the placeholder
+#                 requests, each carrying its run token: Responses and
+#                 Mistral chat completions always, and Messages sent with
+#                 the placeholder
 #                 (counting tokens is admitted but neither capped nor
 #                 charged)
 #                 `Authorization: Bearer praxis-substitute:anthropic`.
@@ -27,8 +30,10 @@
 #
 # Every request that reaches a provider is metered by token_count, and run_token
 # logs its usage. Injected requests are also capped per run and per sliding
-# 5h window, the providers' own limit window, one per provider, by
-# token_rate_limit; pass-through requests spend the caller's own limits.
+# 5h window, one per provider, by token_rate_limit (Codex's and Claude's own
+# limit window; Mistral publishes none for its plans, so its window here is
+# only the broker's bound); pass-through requests spend the caller's own
+# limits.
 #
 # THE FILTER ORDER AND THE CONDITIONS ARE SECURITY-CRITICAL; see
 # INTERNALS.md, and run `just test-gateway` after any change. Conditions and
@@ -70,6 +75,19 @@ filter_chains:
           - name: content-type
             value: application/json
         body: '{"error":{"type":"invalid_request_error","message":"only POST is forwarded"}}'
+      # And for Mistral: its key reads and deletes the account's files,
+      # agents and conversations with other methods.
+      - filter: static_response
+        conditions:
+          - when:
+              path_prefix: "/mistral"
+          - unless:
+              methods: [POST]
+        status: 405
+        headers:
+          - name: content-type
+            value: application/json
+        body: '{"object":"error","message":"only POST is forwarded","type":"invalid_request_error"}'
       # 2. The placeholder means nothing anywhere else, so refuse it there
       #    rather than forward it to credential-proxy. This also catches
       #    spellings of the prefix that skip step 1, such as "//anthropic/..."
@@ -119,7 +137,9 @@ filter_chains:
       #    normalizing them and api.anthropic.com resolves "..", so with a
       #    prefix such as "/anthropic/v1/" a request for
       #    "/anthropic/v1/../api/oauth/..." would spend the credential on
-      #    account endpoints.
+      #    account endpoints. The Mistral route is exact for the same
+      #    reason: its key is good for every endpoint of api.mistral.ai, and
+      #    only chat completions is metered here.
       - filter: router
         routes:
           - path: "/healthz"
@@ -142,6 +162,8 @@ filter_chains:
             cluster: anthropic-pass-through
           - path: "/anthropic/v1/messages/count_tokens"
             cluster: anthropic-pass-through
+          - path: "/mistral/v1/chat/completions"
+            cluster: mistral
       # 4. Run tokens and credential modes, by the cluster the router chose.
       #    It answers /v1/runs itself, refuses a request with more than one
       #    Authorization header (the router matches any of them, conditions
@@ -170,10 +192,12 @@ filter_chains:
           inference-backend: injected
           anthropic: injected
           anthropic-pass-through: pass-through
+          # The run token is the request's bearer token, as on Responses.
+          mistral: injected
       # 5. Each run's cap. Response filters run in reverse order, so every
       #    token_rate_limit comes before the token_count whose counts it
-      #    reconciles with, and run_token before them all. Two instances,
-      #    one per API, because a condition cannot say "injected" for both;
+      #    reconciles with, and run_token before them all. An instance
+      #    per API, because a condition cannot say "injected" for them all;
       #    a run normally uses one API. The window must be at least the
       #    policy's max_secs (6h by default), so that it spans the whole run.
       #    A reservation still open after reservation_timeout is charged its
@@ -201,6 +225,19 @@ filter_chains:
                 authorization: "Bearer praxis-substitute:anthropic"
           - unless:
               path: "/anthropic/v1/messages/count_tokens"
+        rules:
+          - name: run
+            algorithm: sliding_window
+            window: 6h
+            capacity: 20000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
+      - filter: token_rate_limit
+        key: authenticated_subject
+        conditions:
+          - when:
+              path_prefix: "/mistral"
+              methods: [POST]
         rules:
           - name: run
             algorithm: sliding_window
@@ -237,8 +274,22 @@ filter_chains:
             capacity: 100000000
             reserved_tokens: 10000
             reservation_timeout: 30m
+      - filter: token_rate_limit
+        conditions:
+          - when:
+              path_prefix: "/mistral"
+              methods: [POST]
+        rules:
+          - name: window
+            algorithm: sliding_window
+            window: 5h
+            capacity: 100000000
+            reserved_tokens: 10000
+            reservation_timeout: 30m
       # 7. Metering, for both credential modes. response.completed carries
-      #    the whole Responses response.
+      #    the whole Responses response. Mistral's chat completions report
+      #    usage in OpenAI's shape, and in the last chunk of a stream without
+      #    being asked to (stream_options.include_usage).
       - filter: token_count
         conditions:
           - when:
@@ -253,6 +304,13 @@ filter_chains:
         provider: anthropic
         max_body_bytes: 16777216
         max_scratch_bytes: 16777216
+      - filter: token_count
+        conditions:
+          - when:
+              path_prefix: "/mistral"
+        provider: openai
+        max_body_bytes: 16777216
+        max_scratch_bytes: 16777216
       # 8. Upstream, /anthropic/v1/... is /v1/.... Only the exact routes
       #    above reach this with the prefix, so nothing is left to normalize.
       - filter: path_rewrite
@@ -260,6 +318,15 @@ filter_chains:
           - when:
               path_prefix: "/anthropic"
         strip_prefix: "/anthropic"
+      #    And /mistral/v1/... is /v1/.... Praxis wants to be told that a
+      #    second filter may rewrite the path; no request meets both
+      #    conditions, so neither ever overrides the other.
+      - filter: path_rewrite
+        conditions:
+          - when:
+              path_prefix: "/mistral"
+        strip_prefix: "/mistral"
+        allow_rewrite_override: true
       # 9. token_count reads bodies as they are, so ask for them
       #    uncompressed.
       - filter: headers
@@ -298,17 +365,36 @@ filter_chains:
         request_set:
           - name: Host
             value: api.anthropic.com
+      #     Mistral: the same as injected Messages. run_token has already
+      #     taken the run token out of Authorization.
+      - filter: headers
+        conditions:
+          - when:
+              path_prefix: "/mistral"
+        request_remove:
+          - authorization
+          - x-api-key
+        request_set:
+          - name: Host
+            value: api.mistral.ai
       # 12. The broker's Claude token, from a Podman secret exposed only to
       #     Praxis's environment. It is keyed on the cluster the router chose,
       #     so only the anthropic cluster gets it: anthropic-pass-through is
       #     a separate cluster for exactly this reason, and inference-backend
-      #     gets the Codex credential from credential-proxy instead.
+      #     gets the Codex credential from credential-proxy instead. The
+      #     Mistral key is a secret of its own, for its cluster only; a
+      #     deployment without one has a value here that is no key (see
+      #     scripts/praxis-gateway-entrypoint), and Mistral refuses it.
       - filter: credential_injection
         clusters:
           - name: anthropic
             header: Authorization
             header_prefix: "Bearer "
             env_var: PRAXIS_ANTHROPIC_OAUTH_TOKEN
+          - name: mistral
+            header: Authorization
+            header_prefix: "Bearer "
+            env_var: PRAXIS_MISTRAL_API_KEY
       - filter: load_balancer
         clusters:
           - name: inference-backend
@@ -321,6 +407,10 @@ filter_chains:
             endpoints: ["api.anthropic.com:443"]
             tls:
               sni: "api.anthropic.com"
+          - name: mistral
+            endpoints: ["api.mistral.ai:443"]
+            tls:
+              sni: "api.mistral.ai"
           # Never connected to: run_token answers /v1/runs and /usage locally.
           - name: run-endpoints
             endpoints: ["127.0.0.1:9"]
