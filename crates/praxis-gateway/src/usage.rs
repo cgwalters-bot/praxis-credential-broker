@@ -9,17 +9,20 @@ use std::{
 };
 use tracing::warn;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Provider {
     Anthropic,
     Codex,
+    Mistral,
 }
 
 impl Provider {
+    /// The provider whose credential the broker injects for `cluster`.
     pub(crate) fn for_cluster(cluster: Option<&str>) -> Option<Self> {
         match cluster? {
             "anthropic" => Some(Self::Anthropic),
             "inference-backend" => Some(Self::Codex),
+            "mistral" => Some(Self::Mistral),
             _ => None,
         }
     }
@@ -92,12 +95,20 @@ struct Codex {
     secondary: Option<CodexWindow>,
 }
 
+/// No header of Mistral's responses is known to say how much of a plan is
+/// used, so there is no window to observe, only what the broker counted.
+#[derive(Clone, Default, Serialize)]
+struct Mistral {
+    counts: Counts,
+}
+
 #[derive(Clone, Serialize)]
 pub(crate) struct Snapshot {
     schema: &'static str,
     started_at: u64,
     anthropic: Anthropic,
     codex: Codex,
+    mistral: Mistral,
     /// What each operator token used, by its operator's name. Its provider's
     /// `counts` include it.
     operators: BTreeMap<String, Counts>,
@@ -114,6 +125,7 @@ impl Default for Snapshot {
             started_at: unix_time(),
             anthropic: Anthropic::default(),
             codex: Codex::default(),
+            mistral: Mistral::default(),
             operators: BTreeMap::new(),
             unproven_runs: None,
         }
@@ -124,7 +136,7 @@ impl Default for Snapshot {
 pub(crate) struct BrokerUsage(Mutex<Snapshot>);
 
 // Like the run registry, configuration reloads retain the named state. Each
-// registry has exactly two counters and four window slots, a counter per
+// registry has exactly three counters and four window slots, a counter per
 // operator a tokens file named and one for all runs registered without
 // proof, never per-client keys.
 static REGISTRIES: LazyLock<Mutex<HashMap<String, Arc<BrokerUsage>>>> =
@@ -163,6 +175,7 @@ impl BrokerUsage {
         let counts = match provider {
             Provider::Anthropic => &mut state.anthropic.counts,
             Provider::Codex => &mut state.codex.counts,
+            Provider::Mistral => &mut state.mistral.counts,
         };
         counts.settle(usage, success);
     }
@@ -250,6 +263,7 @@ impl BrokerUsage {
                     }
                 }
             }
+            Provider::Mistral => {}
         }
     }
 }
@@ -373,6 +387,72 @@ mod tests {
         let codex = usage.snapshot().codex;
         assert_eq!(codex.primary.unwrap().window_minutes, Some(10080));
         assert_eq!(codex.secondary, None);
+    }
+
+    /// Each injected cluster of praxis.yaml is counted under its own
+    /// provider, and nothing else is counted at all.
+    #[test]
+    fn each_injected_cluster_is_counted_under_its_own_provider() {
+        let cases = [
+            (Some("anthropic"), Some((Provider::Anthropic, "anthropic"))),
+            (Some("inference-backend"), Some((Provider::Codex, "codex"))),
+            (Some("mistral"), Some((Provider::Mistral, "mistral"))),
+            (Some("anthropic-pass-through"), None),
+            (Some("run-endpoints"), None),
+            (Some("Mistral"), None),
+            (None, None),
+        ];
+        let reported = Usage {
+            tokens: Tokens {
+                input: 24,
+                output: 20,
+                total: 44,
+                ..Tokens::default()
+            },
+            model: None,
+        };
+        let counts = |requests: u64, unmetered: u64, tokens: [u64; 3]| {
+            serde_json::json!({
+                "requests": requests,
+                "unmetered": unmetered,
+                "tokens": {"input": tokens[0], "cache_read": 0, "output": tokens[1], "reasoning": 0, "total": tokens[2]},
+            })
+        };
+        for (cluster, want) in cases {
+            let provider = Provider::for_cluster(cluster);
+            assert_eq!(provider, want.map(|(provider, _)| provider), "{cluster:?}");
+            let Some((provider, field)) = want else {
+                continue;
+            };
+            let usage = BrokerUsage::default();
+            usage.settle(provider, Some(&reported), true);
+            usage.settle(provider, None, true);
+            usage.settle(provider, None, false);
+            // Every provider's response headers, which only its own windows
+            // may come from.
+            let mut headers = fixture("anthropic");
+            headers.extend(fixture("codex"));
+            usage.capture_at(provider, &headers, 10);
+            let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+            for other in ["anthropic", "codex", "mistral"] {
+                let want = if other == field {
+                    counts(1, 1, [24, 20, 44])
+                } else {
+                    counts(0, 0, [0; 3])
+                };
+                assert_eq!(snapshot[other]["counts"], want, "{cluster:?}: {other}");
+            }
+            assert_eq!(
+                (
+                    snapshot["anthropic"]["unified_5h"].is_null(),
+                    snapshot["codex"]["primary"].is_null(),
+                ),
+                (provider != Provider::Anthropic, provider != Provider::Codex),
+                "{cluster:?}"
+            );
+            // Mistral has counts and nothing else.
+            assert_eq!(snapshot["mistral"].as_object().unwrap().len(), 1);
+        }
     }
 
     #[test]

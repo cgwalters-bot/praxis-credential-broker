@@ -49,7 +49,12 @@ const CALLER_OAUTH: &str = "Bearer sk-ant-oat01-SYNTHETIC-CALLER-OAUTH";
 const RESPONSES: &str = "inference-backend";
 const INJECTED: &str = "anthropic";
 const PASS_THROUGH: &str = "anthropic-pass-through";
-const CLUSTERS: [&str; 4] = [RESPONSES, INJECTED, PASS_THROUGH, "run-endpoints"];
+const MISTRAL: &str = "mistral";
+const CLUSTERS: [&str; 5] = [RESPONSES, INJECTED, PASS_THROUGH, MISTRAL, "run-endpoints"];
+/// The broker's Mistral key, as the tests configure credential_injection.
+const MISTRAL_KEY: &str = "SYNTHETIC-MISTRAL-KEY";
+const MISTRAL_AUTHORIZATION: &str = "Bearer SYNTHETIC-MISTRAL-KEY";
+const MISTRAL_PATH: &str = "/mistral/v1/chat/completions";
 
 /// Usage the fake upstream reports, and what a run record makes of it.
 const RESPONSES_USAGE: &str = r#"{"input_tokens":70,"input_tokens_details":{"cached_tokens":30},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":100}"#;
@@ -62,6 +67,14 @@ const RECORDED_STREAM: &str = include_str!("../testdata/codex-responses-stream.s
 /// The `input` the fake Responses upstream answers with `RECORDED_STREAM`.
 const RECORDED_INPUT: &str = "recorded";
 const MESSAGES_TOTAL: u64 = 90;
+/// The end of a stream api.mistral.ai sent on 2026-10-12 for `zai-glm-5-3`,
+/// its id replaced: the last delta, the chunk that ends the choice and holds
+/// the usage, which nothing in the request asked for, and the terminator.
+/// 24 tokens in, none of them cached, and 20 out.
+const MISTRAL_STREAM: &str = include_str!("../testdata/mistral-chat-stream.sse");
+/// That usage, for a response that is not streamed.
+const CHAT_USAGE: &str = r#"{"prompt_tokens":24,"total_tokens":44,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":0}}"#;
+const CHAT_MODEL: &str = "zai-glm-5-3";
 /// The ref `permissive_policy` admits the called workflow at, and the owner
 /// whose every workflow it admits.
 const MAIN: &str = "refs/heads/main";
@@ -176,6 +189,49 @@ async fn fake_responses(
     sse(events)
 }
 
+/// What Vibe asks of Mistral's chat completions, less the conversation.
+fn chat_request(stream: bool) -> Value {
+    json!({
+        "model": CHAT_MODEL,
+        "stream": stream,
+        "max_tokens": 20,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+}
+
+async fn fake_chat(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response<Body> {
+    fake.upstream.saw(fake.cluster, &headers);
+    let request: Value = serde_json::from_slice(&body).unwrap_or_default();
+    if request["stream"] != true {
+        let usage: Value = serde_json::from_str(CHAT_USAGE).unwrap();
+        return json_response(&json!({
+            "id": "c",
+            "object": "chat.completion",
+            "model": CHAT_MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello there"},
+                "finish_reason": "stop",
+            }],
+            "usage": usage,
+        }));
+    }
+    let mut response = sse(MISTRAL_STREAM
+        .split_inclusive("\n\n")
+        .map(str::to_owned)
+        .collect());
+    // As api.mistral.ai names its streams.
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "text/event-stream; charset=utf-8".parse().unwrap(),
+    );
+    response
+}
+
 async fn fake_messages(State(fake): State<Fake>, headers: HeaderMap) -> Response<Body> {
     fake.upstream.saw(fake.cluster, &headers);
     let start = json!({"type": "message_start", "message": {"id": "m", "model": "claude-test", "usage": {"input_tokens": 40, "cache_read_input_tokens": 20, "output_tokens": 1}}});
@@ -199,6 +255,7 @@ async fn fake_count_tokens(State(fake): State<Fake>, headers: HeaderMap) -> Resp
 async fn serve_upstream(upstream: &Arc<Upstream>, cluster: &'static str) -> String {
     let router = Router::new()
         .route("/v1/responses", post(fake_responses))
+        .route("/v1/chat/completions", post(fake_chat))
         .route("/v1/messages", post(fake_messages))
         .route("/v1/messages/count_tokens", post(fake_count_tokens))
         .route("/healthz", get(|| async { "ready\n" }))
@@ -235,16 +292,21 @@ fn rules_named<'a>(filter: &'a mut Yaml, name: &'a str) -> impl Iterator<Item = 
         .filter(move |rule| rule["name"] == name)
 }
 
-/// The broker's token where praxis.yaml reads it from the environment, which
-/// tests can't safely set.
+/// The broker's credentials, each cluster's own, where praxis.yaml reads
+/// them from the environment, which tests can't safely set.
 fn inline_broker_token(filter: &mut Yaml) {
     if filter["filter"] != "credential_injection" {
         return;
     }
     for cluster in filter["clusters"].as_sequence_mut().unwrap() {
+        let credential = if cluster["name"] == MISTRAL {
+            MISTRAL_KEY
+        } else {
+            BROKER_TOKEN
+        };
         let cluster = cluster.as_mapping_mut().unwrap();
         assert!(cluster.remove("env_var").is_some());
-        cluster.insert("value".into(), BROKER_TOKEN.into());
+        cluster.insert("value".into(), credential.into());
     }
 }
 
@@ -521,6 +583,26 @@ impl Harness {
     async fn injected(&self, token: Option<&str>) -> (StatusCode, String) {
         self.message(PLACEHOLDER, token).await
     }
+
+    /// A Mistral chat completion, streamed or not, with a run token as its
+    /// bearer token, which is where Vibe and opencode put their API key.
+    async fn chat(&self, token: Option<&str>, stream: bool) -> (StatusCode, String) {
+        let auth = token.map(|t| format!("Bearer {t}"));
+        let mut headers = vec![("accept-encoding", "gzip"), ("x-api-key", "client")];
+        if let Some(auth) = &auth {
+            headers.push(("authorization", auth));
+        }
+        let response = self
+            .call(
+                Method::POST,
+                MISTRAL_PATH,
+                &headers,
+                Some(chat_request(stream)),
+            )
+            .await;
+        let status = response.status();
+        (status, response.text().await.unwrap())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -787,6 +869,232 @@ async fn a_recorded_codex_stream_is_metered() {
     assert_eq!(
         broker["codex"]["counts"],
         json!({"requests": 1, "unmetered": 0, "tokens": tokens})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mistral_chat_completions_are_injected_metered_and_capped_like_the_other_apis() {
+    let h = Harness::with_policy().await;
+    let token = h.run(1).await;
+    let (status, body) = h.chat(Some(&token), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, MISTRAL_STREAM);
+    let (status, body) = h.chat(Some(&token), false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"object\":\"chat.completion\""), "{body}");
+    // Upstream got the broker's Mistral key and nothing of the client's:
+    // not the run token, not its x-api-key, and no compression that would
+    // hide the usage.
+    assert_eq!(h.upstream.clusters(), [MISTRAL, MISTRAL]);
+    assert_eq!(
+        h.upstream.seen("authorization"),
+        vec![Some(MISTRAL_AUTHORIZATION.to_owned()); 2]
+    );
+    assert_eq!(
+        h.upstream.seen("host"),
+        vec![Some("api.mistral.ai".to_owned()); 2]
+    );
+    for removed in ["x-run-token", "x-api-key", "accept-encoding"] {
+        assert_eq!(h.upstream.seen(removed), vec![None; 2], "{removed}");
+    }
+
+    // Streamed or not, the response's own usage is the run's.
+    let tokens = |n: u64| json!({"input": 24 * n, "cache_read": 0, "output": 20 * n, "reasoning": 0, "total": 44 * n});
+    let usage = h.usage(&token).await;
+    assert_eq!(
+        (&usage["requests"], &usage["unmetered"]),
+        (&json!(2), &json!(0)),
+        "{usage}"
+    );
+    assert_eq!(usage["tokens"], tokens(2));
+    assert_eq!(usage["models"][CHAT_MODEL], tokens(2));
+
+    // The run's cap is this API's own. Two more requests fit under it, the
+    // second overshooting it, and the next is refused before upstream.
+    for stream in [true, false] {
+        let (status, body) = h.chat(Some(&token), stream).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let calls = h.upstream.calls();
+    for stream in [true, false] {
+        let (status, body) = h.chat(Some(&token), stream).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    }
+    assert_eq!(
+        h.upstream.calls(),
+        calls,
+        "refused requests reached upstream"
+    );
+    let (status, body) = h.respond(Some(&token), "", false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.injected(Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.chat(Some(&h.run(2).await), true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The broker counts the provider apart from the other two, with no
+    // window: none is known to be in Mistral's responses.
+    let broker = h.broker_usage().await;
+    assert_eq!(
+        broker["mistral"],
+        json!({"counts": {"requests": 5, "unmetered": 0, "tokens": tokens(5)}})
+    );
+    assert_eq!(
+        (
+            &broker["codex"]["counts"]["requests"],
+            &broker["anthropic"]["counts"]["requests"]
+        ),
+        (&json!(1), &json!(1))
+    );
+    assert!(!broker.to_string().contains(MISTRAL_KEY));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_run_tokens_chat_completion_reaches_mistral() {
+    let h = Harness::with_policy().await;
+    let token = h.run(1).await;
+    let run = format!("Bearer {token}");
+    let proof = format!("Bearer {}", jwt(2, &json!({})));
+    let operator = format!("Bearer {OPERATOR_TOKEN}");
+    let run = ("authorization", run.as_str());
+    // (method, path, headers, the refusal)
+    let cases: &[(Method, &str, Headers<'_>, StatusCode)] = &[
+        (Method::POST, MISTRAL_PATH, &[], StatusCode::UNAUTHORIZED),
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[("authorization", "Bearer praxis-run-0000")],
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[("authorization", proof.as_str())],
+            StatusCode::UNAUTHORIZED,
+        ),
+        // A key of the caller's own: this route has no pass-through.
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[("authorization", "Bearer SYNTHETIC-CALLER-MISTRAL-KEY")],
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[("x-api-key", token.as_str())],
+            StatusCode::UNAUTHORIZED,
+        ),
+        // The test operators' tokens are for other clusters.
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[("authorization", operator.as_str())],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[
+                ("authorization", PLACEHOLDER),
+                ("x-run-token", token.as_str()),
+            ],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Method::POST,
+            MISTRAL_PATH,
+            &[
+                run,
+                ("authorization", "Bearer SYNTHETIC-CALLER-MISTRAL-KEY"),
+            ],
+            StatusCode::BAD_REQUEST,
+        ),
+        // The key is good for all of api.mistral.ai; the run gets one path.
+        (
+            Method::GET,
+            MISTRAL_PATH,
+            &[run],
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::GET,
+            "/mistral/v1/models",
+            &[run],
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::DELETE,
+            "/mistral/v1/files/f",
+            &[run],
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::POST,
+            "/mistral/v1/chat/completions/",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/mistral/v1/fim/completions",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/mistral/v1/agents/completions",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/mistral/v1/conversations",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/mistral/v1/files",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            "/mistral/v1/responses",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+        (Method::POST, "/mistral", &[run], StatusCode::NOT_FOUND),
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            &[run],
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (method, path, headers, status) in cases {
+        let response = h
+            .call(method.clone(), path, headers, Some(chat_request(true)))
+            .await;
+        assert_eq!(response.status(), *status, "{method} {path}");
+    }
+    assert_eq!(h.upstream.calls(), 0);
+    assert_eq!(h.usage(&token).await["requests"], 0);
+    // The run token in the header of its own is the same request.
+    let response = h
+        .call(
+            Method::POST,
+            MISTRAL_PATH,
+            &[("x-run-token", token.as_str())],
+            Some(chat_request(false)),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.upstream.clusters(), [MISTRAL]);
+    assert_eq!(
+        h.upstream.seen("authorization"),
+        [Some(MISTRAL_AUTHORIZATION.to_owned())]
     );
 }
 

@@ -1,11 +1,11 @@
 #!/bin/sh
 # Entrypoint of the gateway image (Containerfile.gateway). It exports the
-# broker's Claude OAuth token from its Podman secret file, since core
-# credential_injection reads credentials only from environment variables,
-# and runs the baked-in praxis.yaml. The token ends up only in Praxis's own
-# environment: never on a command line, and never in the container
-# configuration, where Podman 4 shows the values of type=env secrets in
-# podman inspect.
+# broker's Claude OAuth token, and its Mistral API key if it has one, from
+# their Podman secret files, since core credential_injection reads
+# credentials only from environment variables, and runs the baked-in
+# praxis.yaml. They end up only in Praxis's own environment: never on a
+# command line, and never in the container configuration, where Podman 4
+# shows the values of type=env secrets in podman inspect.
 set -eu
 token_file=/run/secrets/anthropic/oauth-token
 if [ -n "${PRAXIS_ANTHROPIC_GATEWAY+set}" ]; then
@@ -17,4 +17,16 @@ if [ ! -s "$token_file" ]; then
 fi
 PRAXIS_ANTHROPIC_OAUTH_TOKEN=$(cat "$token_file")
 export PRAXIS_ANTHROPIC_OAUTH_TOKEN
+# The Mistral key is a deployment's choice, so that an image with the
+# /mistral route still starts where nobody stored one. credential_injection
+# needs a value all the same; this one is no key, and Mistral answers a
+# request that carries it with 401, which the run sees.
+mistral_key_file=/run/secrets/mistral/api-key
+if [ -s "$mistral_key_file" ]; then
+    PRAXIS_MISTRAL_API_KEY=$(cat "$mistral_key_file")
+else
+    echo "praxis-gateway-entrypoint: no Mistral API key at $mistral_key_file, so Mistral will refuse what /mistral forwards; store one with scripts/init-mistral-key and mount it" >&2
+    PRAXIS_MISTRAL_API_KEY=praxis-no-mistral-key
+fi
+export PRAXIS_MISTRAL_API_KEY
 exec praxis-gateway --config /etc/praxis/praxis.yaml "$@"

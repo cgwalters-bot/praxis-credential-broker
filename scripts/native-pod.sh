@@ -8,6 +8,8 @@ socket_volume=praxis-credential-broker-socket
 client_secret=praxis-credential-broker-client-auth
 channel_secret=praxis-credential-broker-agent-channel
 anthropic_secret=praxis-credential-broker-anthropic-oauth
+# Optional: /mistral is served with it, and refused by Mistral without.
+mistral_secret=praxis-credential-broker-mistral-api-key
 proxy_image=${PRAXIS_PROXY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-proxy:main}
 provider_codex_image=${PRAXIS_PROVIDER_CODEX_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-provider-codex:main}
 gateway_image=${PRAXIS_GATEWAY_IMAGE-ghcr.io/cgwalters-bot/praxis-credential-broker-gateway:main}
@@ -139,7 +141,7 @@ case "$mode" in
         test "${RESET_SECRETS:-}" = RESET
         require_stopped_pod
         # The client secret is only removed: Praxis authenticates runs now.
-        remove_secrets "$client_secret" "$channel_secret" "$anthropic_secret"
+        remove_secrets "$client_secret" "$channel_secret" "$anthropic_secret" "$mistral_secret"
         exit 0
         ;;
     reset-auth)
@@ -187,8 +189,12 @@ if [[ $mode == up ]]; then
         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
         -- "$provider_codex_image" >/dev/null
     # The gateway image carries its own routes; only this container holds
-    # the Claude token. Without a policy no run can register.
+    # the Claude token, and the Mistral key if one is stored. Without a
+    # policy no run can register.
     policy_mount=()
+    if podman secret exists "$mistral_secret"; then
+        policy_mount+=(--secret "$mistral_secret,target=/run/secrets/mistral/api-key,uid=65532,gid=65532,mode=0400")
+    fi
     if [[ -n $policy ]]; then
         policy_mount=(--volume "$(realpath "$policy"):$policy_target:ro,Z")
     fi

@@ -12,6 +12,8 @@ client -> Praxis (gateway image) --+        | private versioned Unix socket (cre
           :18080, one listener     |   provider-codex
                                    |
                                    +---------------------> fixed api.anthropic.com Messages endpoint
+                                   |
+                                   +---------------------> fixed api.mistral.ai chat completions endpoint
 ```
 
 Praxis is `praxis-gateway` (`crates/praxis-gateway`): Praxis AI built from
@@ -26,13 +28,15 @@ published as `127.0.0.1:18080`:
 | `/healthz` (exact) | any | `inference-backend` | none needed | none |
 | `/anthropic/v1/messages`, `/anthropic/v1/messages/count_tokens` (exact), with the placeholder | `POST` | `anthropic` | injected | the broker's Claude token |
 | the same paths, with any other `Authorization` | `POST` | `anthropic-pass-through` | pass-through | the caller's own |
+| `/mistral/v1/chat/completions` (exact) | `POST` | `mistral` | injected | the broker's Mistral API key |
 | `/v1/runs` (prefix) | see [run tokens](#run-tokens) | answered by `run_token` | | |
 | `/usage` (exact) | `GET` | answered locally by `run_token` | none needed | none |
 
 Any other path gets 404. Upstream, `/anthropic/v1/...` is rewritten to
 `/v1/...` and the query string is kept, so Claude Code uses
 `ANTHROPIC_BASE_URL=http://host:18080/anthropic` and appends `/v1/messages`
-itself.
+itself. `/mistral/v1/...` is rewritten the same way, for a client whose
+base URL is `http://host:18080/mistral/v1`.
 
 There are these credentials:
 
@@ -110,10 +114,11 @@ like `credential_injection` is. So one choice, the router's, decides both
 whether a request needs a run token and whose credential goes upstream; a
 cluster with no mode is refused with 500.
 
-- **injected** (`inference-backend`, `anthropic`): the request must carry the
-  token of an active registered run. The broker's credential goes upstream:
-  credential-proxy adds the Codex one, and `credential_injection` adds the
-  Claude one for the `anthropic` cluster only. Injected requests are capped
+- **injected** (`inference-backend`, `anthropic`, `mistral`): the request must
+  carry the token of an active registered run. The broker's credential goes
+  upstream: credential-proxy adds the Codex one, and `credential_injection`
+  adds the Claude one for the `anthropic` cluster only and the Mistral key
+  for the `mistral` cluster only. Injected requests are capped
   per run and per window (see [metering and caps](#metering-and-caps)),
   except `count_tokens`, which uses no tokens: `run_token` admits it for the
   run (`usage_free_paths`) but charges it nothing. So a run can call it
@@ -133,6 +138,15 @@ which also matches `Authorization: Bearer praxis-substitute:anthropic`,
 selects `anthropic`; any other `Authorization`, or none, selects
 `anthropic-pass-through`. That cluster exists so that the token can never be
 injected there: `credential_injection` is keyed by cluster.
+
+Mistral has one route, `/mistral/v1/chat/completions`, exact and POST only,
+and one mode, injected: the run token is the request's bearer token or in
+`x-run-token`, as on Responses, and there is no pass-through for a key of
+the caller's own. The key the broker holds is good for all of
+`api.mistral.ai`, the account's files, agents and conversations included,
+so no prefix of it is routed. The request body is forwarded as it is, with
+no protocol filter in front: Mistral validates it, and the run chooses the
+model, any the key is served.
 
 ### Placeholder semantics and filter order
 
@@ -251,6 +265,8 @@ credentials apart is the configuration, not a process boundary:
 - `inference-backend` is `127.0.0.1:8080`, credential-proxy, which takes the
   Codex credential from the provider. Nothing on an Anthropic route reaches
   it.
+- `credential_injection` adds the Mistral key only for the `mistral`
+  cluster, which only the exact `/mistral/v1/chat/completions` route selects.
 - Every filter that acts on only one route is conditioned on that route's raw
   path, and on the placeholder where it acts on one mode only.
 
@@ -279,6 +295,23 @@ Setup tokens are long-lived and are not refreshed: there is no
 `UnauthorizedRecovery` equivalent. When one expires or is revoked, Claude Code
 sees the upstream 401; store a new one with `init-anthropic-token` and
 recreate the pod. `reset-secrets` removes this secret along with the others.
+
+The Mistral key is handled the same way, with one difference.
+`scripts/init-mistral-key` stores it as the Podman secret
+`praxis-credential-broker-mistral-api-key`, read and stored like the Claude
+token; Mistral documents no shape for its keys, so the script refuses only
+what could not be one. The Praxis container mounts it as
+`/run/secrets/mistral/api-key`, and the entrypoint exports it as
+`PRAXIS_MISTRAL_API_KEY`. The difference is that a deployment may be
+without it: the committed Quadlet unit does not mount it (a
+[drop-in](#quadlet) does), `native-pod.sh up` mounts it only if it exists,
+and without it the entrypoint says so and gives `credential_injection`,
+which needs a value, one that is no key. `/mistral` then still admits and
+forwards a run's request, and Mistral answers it with 401. Which key is
+stored decides what is spent: the key of a plan (Mistral's "Code > Vibe
+CLI" key, the one Vibe keeps in `~/.vibe/.env`) draws on the plan's
+included usage, a key from `console.mistral.ai/api-keys` is billed per
+token.
 
 ### Risks
 
@@ -792,7 +825,7 @@ origin gets the JSON without those headers and 403 for a preflight, and
 only: the endpoint itself stays readable by anything that reaches the listener.
 The existing placeholder-deny filter still applies before this local route.
 
-`anthropic.counts` and `codex.counts` contain cumulative `requests` with reported
+`anthropic.counts`, `codex.counts` and `mistral.counts` contain cumulative `requests` with reported
 usage, `unmetered` successful completed responses without usage, and `tokens` in
 the run-record shape. `operators` has the same counts for each operator the
 tokens file names, by its name, from zero; a provider's counts include them.
@@ -818,8 +851,11 @@ intact. Codex reports a window the plan lacks with `window_minutes: 0` (a plan
 with only a weekly limit has it as `primary` and a zero `secondary`), and such a
 window is null. Windows update independently and may be stale; these passive observations
 are neither a fresh provider query nor the broker's configured caps.
+`mistral` has `counts` only: no header of its responses is known to say how
+much of a plan is used. (Of a response of 2026-10-12, the headers kept
+named no limit; those with `token` in their names were not kept.)
 
-The bounded state has two counters and four window slots per named run registry,
+The bounded state has three counters and four window slots per named run registry,
 a counter per operator (at most 64 names, across reloads of the tokens file)
 and one for the runs registered without proof.
 It survives configuration reloads, and resets on process restart (`started_at`
@@ -910,6 +946,16 @@ the same container:
 # ~/.config/containers/systemd/praxis-credential-broker-praxis.container.d/operator-tokens.conf
 [Container]
 Volume=%h/.config/praxis-credential-broker/operator-tokens.yaml:/etc/praxis-credential-broker/operator-tokens.yaml:ro,Z
+```
+
+The Mistral key, if the deployment serves `/mistral`, is a third, once
+`scripts/init-mistral-key` has stored the secret; a unit that names a secret
+Podman does not have fails to start:
+
+```ini
+# ~/.config/containers/systemd/praxis-credential-broker-praxis.container.d/mistral-api-key.conf
+[Container]
+Secret=praxis-credential-broker-mistral-api-key,target=/run/secrets/mistral/api-key,uid=65532,gid=65532,mode=0400
 ```
 
 and publishing on the host's tailnet address as well is another, checked
@@ -1034,7 +1080,13 @@ header stripping, Host and beta handling, byte-identical bodies, unbuffered
 SSE, h2c, that every metered request is logged without its credential, that
 neither the token nor a pass-through credential nor the run token is in the
 logs or `podman inspect`, and that the container refuses to start without
-the token. It then starts the container again with `unproven`,
+the token. For `/mistral` it checks the one route and the ways around it,
+that only that cluster's upstream gets the Mistral key, and that a streamed
+and a plain chat completion are metered from the usage Mistral sends, in
+the shape a recorded stream of its has
+(`crates/praxis-gateway/testdata/mistral-chat-stream.sse`), and counted
+under their own provider. It then starts the container again, without the
+Mistral key, which must not stop it, and with `unproven`,
 `called_workflows` and `any_workflow` in the policy, having checked that
 nothing registers without proof before and which OIDC tokens the policy
 refuses, and checks registration without proof, its quota and its

@@ -19,7 +19,8 @@ operators:
     # Of the whole token, "praxis-operator-" included, in hex.
     token_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
     # The injected clusters of praxis.yaml it may use: inference-backend
-    # (Codex Responses) and anthropic (Claude Messages).
+    # (Codex Responses), anthropic (Claude Messages) and mistral (Mistral
+    # chat completions).
     clusters: [inference-backend]
     # Optional: requests in flight at once.
     # concurrency: 8
