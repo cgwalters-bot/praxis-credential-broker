@@ -575,6 +575,108 @@ change to this file. A caller that pins a commit does not match `ref`,
 since its `job_workflow_ref` then ends in the commit (as GitHub's tokens
 have been seen to; not tried against this gateway).
 
+### Other issuers
+
+Off by default. Everything above is about GitHub's tokens: the issuer is
+`https://token.actions.githubusercontent.com`, and the policy file's top
+level holds its rules. `issuers` lists any other issuer whose tokens may
+register runs, such as a Forgejo instance, each with rules of its own:
+
+```yaml
+issuers:
+  - name: forge                     # names its runs; lowercase, digits, `-`
+    issuer: https://forge.example/api/actions       # the `iss` claim, exactly
+    jwks_url: https://forge.example/api/actions/.well-known/keys
+    claims: forgejo                 # or github
+    workflows:
+      - OWNER/REPO/.forgejo/workflows/FILE.yml@refs/heads/main
+    repository_ids: [1]
+    # owner_ids, events, any_workflow: as at the top level
+    # audience: praxis-credential-broker
+    # max_token_age_secs: 300
+    # allow_http: true              # only for an http:// issuer; see below
+```
+
+A token is first read, unverified, for the issuer it claims. That only
+chooses an entry: the token is then verified with that entry's key set
+(fetched and cached as GitHub's is), must be signed for exactly that
+`issuer` and for that entry's `audience`, and is matched against that
+entry's rules and no others. A token that claims an issuer nothing names
+gets the 401 a wrong issuer always got. So the keys of one issuer sign
+nothing for another, and a rule admits only tokens of the issuer it is
+written under: the top-level `workflows`, `any_workflow` and the rest
+never admit a forge's token, nor a forge's entry one of GitHub's.
+
+- **Ids are per issuer.** `repository_ids` and `owner_ids` in an entry are
+  that issuer's numbering, and so are the ids in a run's key. A run is
+  named by its issuer too: its subject is
+  `oidc-run:NAME:REPOSITORY_ID/RUN_ID/ATTEMPT` where GitHub's is
+  `github-run:...`, its record has `"proof": "oidc"` and `"issuer": NAME`,
+  and repository 7's run 1 on the forge and on GitHub are two runs with
+  two caps. A name is unique within the file, at most 32 of `a-z`, `0-9`
+  and `-`, and not `github`. Runs are kept per `registry`, so chains that
+  share one must share the policy file too, as `praxis.yaml`'s one
+  registration chain does, and an entry is renamed only across a restart. GitHub itself cannot be an entry, and no two entries
+  may have one `issuer`, since its runs would then register twice.
+- **`claims` says which claims the tokens carry**, and is required.
+  `github` is GitHub's set, for a GitHub Enterprise Server: everything
+  above applies, `job_workflow_ref` and `jti` are required, and
+  `called_workflows` and `entry_workflows` work. `forgejo` is what Forgejo
+  writes, which has neither claim, no `job_workflow_sha` and no
+  `check_run_id`:
+
+  | GitHub's claim | Under `claims: forgejo` |
+  |----------------|-------------------------|
+  | `job_workflow_ref` | `workflow_ref` is matched against `workflows` instead, exactly, and `repository` must be the one it names. It is the workflow the run started from, at the ref it ran at; nothing in the token tells a job of a workflow it calls from its own, so `called_workflows` and `entry_workflows` are refused at startup. |
+  | `jti` | Nothing. A run registers once and never again: the token that registered it gets 409 like any other, so a job whose 201 was lost cannot retry and its run cannot be taken over by replaying its token. `max_token_age_secs` bounds how long a token that has not registered stays good. |
+  | `check_run_id` | Nothing. All jobs of one run attempt are one run here, and the first to register is the only one. |
+
+  A claim the set does not define is ignored if a token has it.
+- **`max_token_age_secs`** refuses a token whose `iat` is older, whatever
+  its `exp`; the default is 300, the lifetime of GitHub's tokens, and the
+  most is 3600. Forgejo's tokens are valid for an hour by default
+  (`[actions] ID_TOKEN_EXPIRATION_TIME`) and have no id by which a used one
+  could be told from a fresh one. What stops a replay is that the run
+  they name is already registered, and stays remembered for a day past
+  the end of its `max_secs`, far longer than any token lives. The age
+  limit covers the rest: a token for this audience that leaked without
+  registering a run can register it for five minutes rather than an hour.
+  A token dated more than a minute ahead of the gateway's clock is refused
+  too, so the two clocks must agree to within that. Runs are remembered in
+  memory: as for GitHub, a token issued in the minute before the gateway
+  restarts can register its run again after it.
+- **`allow_http`** is needed for an `issuer` or `jwks_url` that starts
+  with `http://`, and is off by default; anything but `http://` and
+  `https://` is refused. Over plaintext, whoever can answer for that host
+  name on the gateway's network (its DNS, its routes, a host on the path)
+  can serve a key set of their own, and so sign tokens for any repository
+  and workflow the entry admits. That is acceptable only where the
+  network itself is trusted for this, such as a tailnet whose peers are
+  authenticated and whose names its own DNS serves. The issuer's host
+  name must also resolve inside the gateway's container. Prefer serving
+  the forge over TLS.
+- **What an entry gives up.** Whoever administers the issuer can mint a
+  token for anything its rules admit: it holds the signing key. On a
+  Forgejo instance that includes whoever can read its data directory. A
+  job's request credentials are in the environment of every step as on
+  GitHub, and on Forgejo the request token is the job's
+  `ACTIONS_RUNTIME_TOKEN`, so the harness must keep both
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN` and `ACTIONS_RUNTIME_TOKEN` from the
+  agent ([Who holds what](#who-holds-what)). The risks of `any_workflow`
+  and of `events` are those described above, with "every repository on
+  GitHub" read as every repository of that forge.
+
+A Forgejo job gets a token only if its workflow sets
+`enable-openid-connect: true` and its runner is v12.5.0 or later; it asks
+as a GitHub job does, with `ACTIONS_ID_TOKEN_REQUEST_URL` and
+`ACTIONS_ID_TOKEN_REQUEST_TOKEN` and `&audience=`. Ids for the rules:
+`GET /api/v1/repos/OWNER/REPO` has `id` and `owner.id`.
+
+The gateway logs a warning for each entry as it starts, with its issuer,
+key set URL and whether it allows plaintext. Turning an entry on
+or off is as for [the entries above](#admitting-more-workflows): an image
+that knows the key, the policy file, and a restart while no run is active.
+
 ### Registering a run without proof
 
 Off by default. A policy file with an `unproven` section also registers runs
@@ -758,6 +860,8 @@ the job gets the record even if the agent finished the run itself. The
 record (`praxis-run-usage/v2`) holds identifiers, model names, numbers
 and names from the run's token, fit for a run footer once those names are
 escaped: `proof` and what names the run (for
+`oidc`, a run of [another issuer](#other-issuers), `issuer`, the policy's
+name for it, and then the same fields as `github-oidc`; for
 `github-oidc` the repository, run id, attempt and check run id and the
 workflow ref, as the token's claims gave them, with `workflow_sha`
 (`job_workflow_sha`), `entry_workflow_ref` (`workflow_ref`, the caller of a
@@ -937,7 +1041,9 @@ restrict the port with the tailnet policy anyway. If the policy has
 and the tailnet policy is the only thing that restricts who spends the
 broker's credentials. With `any_workflow` or `called_workflows`, more jobs'
 tokens are allowed ones
-([Admitting more workflows](#admitting-more-workflows)).
+([Admitting more workflows](#admitting-more-workflows)), and with
+`issuers` so are those of jobs on another forge
+([Other issuers](#other-issuers)).
 
 Upgrading units from before the run tokens: the gateway now refuses to
 start without the Claude token secret, which the committed unit mounts, and
@@ -1018,7 +1124,8 @@ include the gateway's integration tests, which serve `praxis.yaml` with
 the gateway's registry in front of a fake upstream per cluster and the
 test-only OIDC key set (`crates/praxis-gateway/testdata`), and cover run
 registration, with proof and, under a policy with `unproven`, without,
-what each form of policy entry admits and refuses, both credential modes, the metering of streamed Responses and
+what each form of policy entry admits and refuses, a second issuer with
+keys and rules of its own, both credential modes, the metering of streamed Responses and
 Messages responses by `token_count`, the run and window caps, and a client
 that leaves mid-stream.
 
