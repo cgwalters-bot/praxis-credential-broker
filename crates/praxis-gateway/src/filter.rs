@@ -3,8 +3,9 @@
 //!
 //! On a chain with `registration` configured it serves the run endpoints:
 //!
-//! - `POST /v1/runs`, authenticated by a GitHub Actions OIDC token, registers
-//!   the job's run and returns its bearer token and usage record. If the
+//! - `POST /v1/runs`, authenticated by an Actions OIDC token of GitHub or of
+//!   another issuer the policy names, registers the job's run and returns
+//!   its bearer token and usage record. If the
 //!   policy has `unproven`, off by default, a request with no
 //!   `Authorization` registers the run its `x-run-id` names instead, with
 //!   no proof of who sends it;
@@ -40,8 +41,8 @@
 //! first, and the two must agree on which route a request takes.
 use crate::{
     oidc::{
-        AnyWorkflow, CalledWorkflow, DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy,
-        present,
+        AnyWorkflow, CalledWorkflow, ClaimSet, DEFAULT_AUDIENCE, DEFAULT_MAX_TOKEN_AGE_SECS,
+        GITHUB_JWKS, GITHUB_NAME, Oidc, OidcError, Policy, TrustedIssuer, present,
     },
     operators::{self, Operators},
     runs::{
@@ -108,6 +109,9 @@ const DEFAULT_CONCURRENCY: usize = 4;
 const MAX_SECS: u64 = 30 * 24 * 3600;
 /// The only event that may register runs unless `events` says otherwise.
 const DEFAULT_EVENT: &str = "workflow_dispatch";
+/// Beside only the entries that have events of their own, a reader would
+/// take these for a limit on them, which they are not.
+const NARROWS_WORKFLOWS_ONLY: &str = "events and entry_workflows apply to `workflows` only; give called_workflows and any_workflow their own events";
 
 fn default_registry() -> String {
     DEFAULT_REGISTRY.to_owned()
@@ -193,7 +197,10 @@ struct RegistrationConfig {
 }
 
 /// The registration policy, kept in a file of its own so that it is the only
-/// part of the configuration each deployment writes.
+/// part of the configuration each deployment writes. Its entries for
+/// tokens (`workflows` and the keys that narrow it, `called_workflows`,
+/// `any_workflow`), with `audience` and `jwks_url`, are GitHub's; any other
+/// issuer has an entry of `issuers` with its own.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
@@ -201,6 +208,10 @@ struct PolicyFile {
     audience: String,
     #[serde(default = "default_jwks_url")]
     jwks_url: String,
+    /// Issuers besides GitHub whose tokens may register runs, each under
+    /// rules of its own. Off unless present.
+    #[serde(default)]
+    issuers: Vec<IssuerEntry>,
     /// Exact `job_workflow_ref` claims that may register runs. None, with
     /// `unproven`, means no run registers by proof.
     #[serde(default)]
@@ -232,6 +243,77 @@ struct PolicyFile {
     concurrency: usize,
     /// Also register runs that prove nothing. Off unless present.
     unproven: Option<UnprovenConfig>,
+}
+
+/// An issuer besides GitHub, such as a Forgejo instance, and the rules for
+/// its tokens: the keys GitHub has at the top level of the file, read the
+/// same way, and matched against this issuer's tokens only.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuerEntry {
+    /// What the runs of this issuer are keyed, metered and recorded under,
+    /// so that its ids are never taken for another issuer's.
+    name: String,
+    /// The `iss` claim of its tokens, exactly.
+    issuer: String,
+    jwks_url: String,
+    /// Accept plaintext `http://` for `issuer` and `jwks_url`. Whoever can
+    /// answer for that host name on the network then chooses the keys.
+    #[serde(default)]
+    allow_http: bool,
+    /// Which claims its tokens carry. Never guessed.
+    claims: ClaimSet,
+    #[serde(default = "default_audience")]
+    audience: String,
+    /// The oldest a token may be, by its `iat`, whatever its `exp`.
+    #[serde(default = "default_max_token_age_secs")]
+    max_token_age_secs: u64,
+    #[serde(default)]
+    workflows: HashSet<String>,
+    #[serde(default)]
+    repository_ids: HashSet<u64>,
+    #[serde(default)]
+    owner_ids: HashSet<u64>,
+    entry_workflows: Option<HashSet<String>>,
+    #[serde(default, deserialize_with = "present")]
+    events: Option<HashSet<String>>,
+    #[serde(default)]
+    called_workflows: Vec<CalledWorkflow>,
+    #[serde(default, deserialize_with = "present")]
+    any_workflow: Option<AnyWorkflow>,
+}
+
+/// The entries for one issuer's tokens, as the policy file has them.
+struct Entries {
+    workflows: HashSet<String>,
+    repository_ids: HashSet<u64>,
+    owner_ids: HashSet<u64>,
+    entry_workflows: Option<HashSet<String>>,
+    events: Option<HashSet<String>>,
+    called_workflows: Vec<CalledWorkflow>,
+    any_workflow: Option<AnyWorkflow>,
+}
+
+impl Entries {
+    /// Whether a key that narrows `workflows`, and no other entry, is
+    /// written.
+    fn narrows_workflows(&self) -> bool {
+        self.events.is_some() || self.entry_workflows.is_some()
+    }
+
+    /// The policy these make for tokens of `audience`.
+    fn policy(self, audience: String) -> Policy {
+        Policy {
+            audience,
+            workflows: self.workflows,
+            repository_ids: self.repository_ids,
+            owner_ids: self.owner_ids,
+            entry_workflows: self.entry_workflows,
+            events: self.events.unwrap_or_else(default_events),
+            called_workflows: self.called_workflows,
+            any_workflow: self.any_workflow,
+        }
+    }
 }
 
 /// Registration without an identity token: whatever can reach the listener
@@ -283,6 +365,9 @@ fn default_audience() -> String {
 fn default_jwks_url() -> String {
     GITHUB_JWKS.to_owned()
 }
+fn default_max_token_age_secs() -> u64 {
+    DEFAULT_MAX_TOKEN_AGE_SECS
+}
 fn default_events() -> HashSet<String> {
     HashSet::from([DEFAULT_EVENT.to_owned()])
 }
@@ -295,8 +380,9 @@ fn default_concurrency() -> usize {
 
 /// Verifies registrations against the policy.
 struct Registrar {
-    /// None if the policy names no workflow: only `unproven` registers.
-    oidc: Option<GithubOidc>,
+    /// None if the policy admits no issuer's tokens: only `unproven`
+    /// registers.
+    oidc: Option<Oidc>,
     /// The quota of registrations without proof, if the policy admits them.
     unproven: Option<Quota>,
     limits: Limits,
@@ -618,30 +704,82 @@ impl Registrar {
             Err(e) => return Err(path_error(&e)),
         };
         let file: PolicyFile = serde_yaml::from_str(&text).map_err(|e| path_error(&e))?;
-        // These narrow `workflows` and no other entry.
-        let narrows_workflows = file.events.is_some() || file.entry_workflows.is_some();
-        let policy = Policy {
-            audience: file.audience,
+        let github = Entries {
             workflows: file.workflows,
             repository_ids: file.repository_ids,
             owner_ids: file.owner_ids,
             entry_workflows: file.entry_workflows,
-            events: file.events.unwrap_or_else(default_events),
+            events: file.events,
             called_workflows: file.called_workflows,
             any_workflow: file.any_workflow,
         };
-        // A policy for registration without proof only has no entry that
-        // admits a token, and then nothing about one either.
+        let narrows_workflows = github.narrows_workflows();
+        let policy = github.policy(file.audience);
+        // A policy for other issuers only, or for registration without
+        // proof only, has no entry that admits a token of GitHub's, and
+        // then nothing about one either.
         let proves = policy.proves();
-        if proves || file.unproven.is_none() {
+        let others = !file.issuers.is_empty();
+        if proves || !(others || file.unproven.is_some()) {
             policy.validate().map_err(|e| path_error(&e))?;
         }
-        // Beside only the entries that have events of their own, a reader
-        // would take these for a limit on them, which they are not.
-        if proves && !policy.names_workflows() && narrows_workflows {
-            return Err(path_error(
-                &"events and entry_workflows apply to `workflows` only; give called_workflows and any_workflow their own events",
-            ));
+        if (proves || others) && !policy.names_workflows() && narrows_workflows {
+            return Err(path_error(&NARROWS_WORKFLOWS_ONLY));
+        }
+        let mut issuers = Vec::new();
+        if proves {
+            warn_of_wide_entries(path, GITHUB_NAME, &policy);
+            issuers.push(TrustedIssuer::github(file.jwks_url, policy));
+        }
+        for entry in file.issuers {
+            let allow_http = entry.allow_http;
+            let entries = Entries {
+                workflows: entry.workflows,
+                repository_ids: entry.repository_ids,
+                owner_ids: entry.owner_ids,
+                entry_workflows: entry.entry_workflows,
+                events: entry.events,
+                called_workflows: entry.called_workflows,
+                any_workflow: entry.any_workflow,
+            };
+            let narrows_workflows = entries.narrows_workflows();
+            let name = entry.name;
+            let trusted = TrustedIssuer {
+                name: Some(name.clone()),
+                issuer: entry.issuer,
+                jwks_url: entry.jwks_url,
+                claims: entry.claims,
+                max_token_age_secs: Some(entry.max_token_age_secs),
+                policy: entries.policy(entry.audience),
+            };
+            trusted.validate(allow_http).map_err(|e| path_error(&e))?;
+            if !trusted.policy.names_workflows() && narrows_workflows {
+                return Err(path_error(&format!(
+                    "issuers: {name}: {NARROWS_WORKFLOWS_ONLY}"
+                )));
+            }
+            // Two entries of one name would share runs, and two of one
+            // issuer would register each of its runs twice.
+            let repeated = |other: &TrustedIssuer| {
+                other.name == trusted.name || other.issuer == trusted.issuer
+            };
+            if issuers.iter().any(repeated) {
+                return Err(path_error(&format!(
+                    "issuers: {name}: each name and each issuer may have one entry"
+                )));
+            }
+            warn!(
+                policy_file = %path.display(),
+                issuer = %name,
+                iss = %trusted.issuer,
+                jwks_url = %trusted.jwks_url,
+                claims = ?trusted.claims,
+                allow_http,
+                max_token_age_secs = entry.max_token_age_secs,
+                "runs register for tokens of an issuer besides GitHub"
+            );
+            warn_of_wide_entries(path, &name, &trusted.policy);
+            issuers.push(trusted);
         }
         if file.max_secs == 0 || file.concurrency == 0 {
             return Err(path_error(&"max_secs and concurrency must be positive"));
@@ -666,33 +804,40 @@ impl Registrar {
                 "runs register WITHOUT PROOF: any client that reaches the listener can use the broker's credentials"
             );
         }
-        for called in &policy.called_workflows {
-            warn!(
-                policy_file = %path.display(),
-                workflow = %called.workflow,
-                git_ref = called.git_ref.as_deref().unwrap_or_default(),
-                sha = called.sha.as_deref().unwrap_or_default(),
-                any_caller = called.callers.any,
-                "runs register for a workflow called from other repositories"
-            );
-        }
-        if let Some(any) = &policy.any_workflow {
-            warn!(
-                policy_file = %path.display(),
-                any_repository = any.repositories.any,
-                owner_ids = ?any.repositories.owner_ids,
-                repository_ids = ?any.repositories.repository_ids,
-                "runs register for ANY WORKFLOW of the admitted repositories"
-            );
-        }
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| format!("{FILTER_NAME}: HTTP client: {e}"))?;
         Ok(Some(Self {
-            oidc: proves.then(|| GithubOidc::new(client, file.jwks_url, policy)),
+            oidc: (!issuers.is_empty()).then(|| Oidc::new(client, issuers)),
             unproven,
             limits,
         }))
+    }
+}
+
+/// Say at startup which entries of `issuer`'s policy admit more than the
+/// workflows it lists.
+fn warn_of_wide_entries(path: &Path, issuer: &str, policy: &Policy) {
+    for called in &policy.called_workflows {
+        warn!(
+            policy_file = %path.display(),
+            issuer,
+            workflow = %called.workflow,
+            git_ref = called.git_ref.as_deref().unwrap_or_default(),
+            sha = called.sha.as_deref().unwrap_or_default(),
+            any_caller = called.callers.any,
+            "runs register for a workflow called from other repositories"
+        );
+    }
+    if let Some(any) = &policy.any_workflow {
+        warn!(
+            policy_file = %path.display(),
+            issuer,
+            any_repository = any.repositories.any,
+            owner_ids = ?any.repositories.owner_ids,
+            repository_ids = ?any.repositories.repository_ids,
+            "runs register for ANY WORKFLOW of the admitted repositories"
+        );
     }
 }
 
@@ -993,6 +1138,154 @@ mod tests {
         praxis_ai::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let valid = r#"{"workflows": ["o/r/.github/workflows/a.yml@refs/heads/main"], "repository_ids": [7]}"#;
+        // An entry of `issuers` for a Forgejo instance reached in
+        // plaintext, with `more` keys after its own, and policies with it.
+        let forge = |more: &str| {
+            format!(
+                r#"{{"name": "forge", "issuer": "http://forge.test/api/actions", "jwks_url": "http://forge.test/api/actions/.well-known/keys", "claims": "forgejo", "workflows": ["o/r/.forgejo/workflows/a.yml@refs/heads/main"], "repository_ids": [7]{more}}}"#
+            )
+        };
+        let plaintext = forge(r#", "allow_http": true"#);
+        let issuers = |entries: &[&str]| format!(r#"{{"issuers": [{}]}}"#, entries.join(", "));
+        let with_issuer =
+            |more: &str| issuers(&[forge(&format!(r#", "allow_http": true{more}"#)).as_str()]);
+        let https = r#"{"issuers": [{"name": "forge", "issuer": "https://forge.test/api/actions", "jwks_url": "https://forge.test/api/actions/.well-known/keys", "claims": "forgejo", "any_workflow": {"repositories": {"owner_ids": [1]}}}]}"#;
+        let beside_github =
+            format!(r#"{{"workflows": ["w"], "owner_ids": [7], "issuers": [{plaintext}]}}"#);
+        let beside_unproven =
+            format!(r#"{{"unproven": {{"max_registrations": 8}}, "issuers": [{plaintext}]}}"#);
+        let under_github_events = format!(r#"{{"events": ["push"], "issuers": [{plaintext}]}}"#);
+        let half_of_github = format!(r#"{{"workflows": ["w"], "issuers": [{plaintext}]}}"#);
+        let issuer_cases = [
+            // Another issuer, alone, beside GitHub's entries and beside
+            // registration without proof.
+            ("issuers only", with_issuer(""), true),
+            ("an https issuer", https.to_owned(), true),
+            ("an issuer beside github", beside_github, true),
+            ("an issuer and unproven", beside_unproven, true),
+            // Plaintext is an entry's own choice, never the default.
+            ("an http issuer unasked", issuers(&[forge("").as_str()]), false),
+            (
+                "an http issuer, refused outright",
+                issuers(&[forge(r#", "allow_http": false"#).as_str()]),
+                false,
+            ),
+            (
+                "an http issuer, allow_http with nothing under it",
+                issuers(&[forge(r#", "allow_http": null"#).as_str()]),
+                false,
+            ),
+            // What an entry must say: nothing about it is guessed.
+            (
+                "an issuer with no claims",
+                r#"{"issuers": [{"name": "forge", "issuer": "https://forge.test/api/actions", "jwks_url": "https://forge.test/keys", "workflows": ["w"], "repository_ids": [7]}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "an issuer with claims of no kind",
+                r#"{"issuers": [{"name": "forge", "issuer": "https://forge.test/api/actions", "jwks_url": "https://forge.test/keys", "claims": "gitlab", "workflows": ["w"], "repository_ids": [7]}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "an issuer with no keys",
+                r#"{"issuers": [{"name": "forge", "issuer": "https://forge.test/api/actions", "claims": "forgejo", "workflows": ["w"], "repository_ids": [7]}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "an issuer with no name",
+                r#"{"issuers": [{"issuer": "https://forge.test/api/actions", "jwks_url": "https://forge.test/keys", "claims": "forgejo", "workflows": ["w"], "repository_ids": [7]}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "an issuer with no rules",
+                r#"{"issuers": [{"name": "forge", "issuer": "https://forge.test/api/actions", "jwks_url": "https://forge.test/keys", "claims": "forgejo"}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "an issuer trusted by name only",
+                r#"{"issuers": [{"name": "forge", "issuer": "https://forge.test/api/actions", "jwks_url": "https://forge.test/keys", "claims": "forgejo", "workflows": ["w"]}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "an issuer, unknown field",
+                with_issuer(r#", "discovery": true"#),
+                false,
+            ),
+            ("no issuers", r#"{"issuers": []}"#.to_owned(), false),
+            ("issuers of nothing", "issuers:\n".to_owned(), false),
+            // Its own audience, events and age limit.
+            (
+                "an issuer with settings of its own",
+                with_issuer(r#", "audience": "forge", "events": ["push"], "max_token_age_secs": 3600"#),
+                true,
+            ),
+            (
+                "an issuer whose tokens may be any age",
+                with_issuer(r#", "max_token_age_secs": 0"#),
+                false,
+            ),
+            (
+                "an issuer whose tokens may be older than an hour",
+                with_issuer(r#", "max_token_age_secs": 3601"#),
+                false,
+            ),
+            (
+                "an issuer with no events",
+                with_issuer(r#", "events": []"#),
+                false,
+            ),
+            // Rules that need a claim Forgejo's tokens lack.
+            (
+                "a forgejo issuer with entry workflows",
+                with_issuer(r#", "entry_workflows": ["w"]"#),
+                false,
+            ),
+            (
+                "a forgejo issuer with a called workflow",
+                with_issuer(
+                    r#", "called_workflows": [{"workflow": "o/r/w.yml", "ref": "refs/heads/main", "callers": {"any": true}}]"#,
+                ),
+                false,
+            ),
+            // Each issuer's ids are its own, so GitHub's rules stay at the
+            // top level and no two entries share a name or an issuer.
+            (
+                "github as an issuer",
+                r#"{"issuers": [{"name": "gh", "issuer": "https://token.actions.githubusercontent.com", "jwks_url": "https://token.actions.githubusercontent.com/.well-known/jwks", "claims": "github", "workflows": ["w"], "repository_ids": [7]}]}"#.to_owned(),
+                false,
+            ),
+            (
+                "the same issuer twice",
+                issuers(&[plaintext.as_str(), plaintext.replace(r#""name": "forge""#, r#""name": "forge-2""#).as_str()]),
+                false,
+            ),
+            (
+                "two issuers of one name",
+                issuers(&[plaintext.as_str(), plaintext.replace("forge.test", "other.test").as_str()]),
+                false,
+            ),
+            (
+                "two issuers",
+                issuers(&[
+                    plaintext.as_str(),
+                    plaintext
+                        .replace("forge.test", "other.test")
+                        .replace(r#""name": "forge""#, r#""name": "other""#)
+                        .as_str(),
+                ]),
+                true,
+            ),
+            // GitHub's keys beside an issuer's entry are not that issuer's.
+            ("an issuer under github's events", under_github_events, false),
+            ("an issuer beside half of github's policy", half_of_github, false),
+        ];
+        let issuer_cases = issuer_cases.iter().map(|(name, contents, valid)| {
+            (
+                *name,
+                Some(contents.as_str()),
+                valid.then_some(true).ok_or(()),
+            )
+        });
         let cases = [
             ("valid", Some(valid), Ok(true)),
             ("missing", None, Ok(false)),
@@ -1196,7 +1489,7 @@ mod tests {
                 Err(()),
             ),
         ];
-        for (name, contents, expected) in cases {
+        for (name, contents, expected) in cases.into_iter().chain(issuer_cases) {
             let path = dir.path().join(name);
             if let Some(contents) = contents {
                 std::fs::write(&path, contents).unwrap();
@@ -1227,6 +1520,9 @@ mod tests {
             ("unproven only", false, Some(two_hours)),
             ("any workflow of an owner", true, None),
             ("a called workflow and unproven", true, Some(hour(8))),
+            ("issuers only", true, None),
+            ("an issuer beside github", true, None),
+            ("an issuer and unproven", true, Some(hour(8))),
         ] {
             let registrar = Registrar::load(&dir.path().join(name)).unwrap().unwrap();
             assert_eq!(

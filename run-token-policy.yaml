@@ -1,4 +1,4 @@
-# Which GitHub Actions jobs may register runs, and so use the broker's own
+# Which Actions jobs may register runs, and so use the broker's own
 # credentials (the "injected" routes in praxis.yaml). The gateway reads it
 # from /etc/praxis-credential-broker/run-token-policy.yaml; without that
 # file no run can register, and only pass-through requests are served.
@@ -56,6 +56,38 @@ repository_ids: [0]
 #     # repository_ids: [0]
 #     # any: true
 #   # events: [workflow_dispatch]   # any event if left out
+#
+# OFF unless present: issuers besides GitHub whose jobs may register runs,
+# such as a Forgejo instance. Everything above is GitHub's and admits no
+# token of these; each entry has rules of its own, read the same way and
+# matched against that issuer's tokens only, and its ids are that issuer's
+# numbering. Read "Other issuers" in INTERNALS.md before uncommenting it:
+# whoever holds an issuer's signing key can register any run its entry
+# admits.
+# issuers:
+#     # Names the issuer's runs in subjects, records and logs.
+#   - name: forge
+#     # The `iss` claim, exactly. For Forgejo, its ROOT_URL and /api/actions.
+#     issuer: https://forge.example/api/actions
+#     jwks_url: https://forge.example/api/actions/.well-known/keys
+#     # Required. `forgejo`: no job_workflow_ref, so `workflows` are exact
+#     # workflow_ref claims; no jti, so a run registers once with no retry.
+#     # `github`: GitHub's claims, for a GitHub Enterprise Server.
+#     claims: forgejo
+#     workflows:
+#       - "example-owner/example-repo/.forgejo/workflows/agent.yml@refs/heads/main"
+#     repository_ids: [0]
+#     # Optional, with these defaults:
+#     # owner_ids: []
+#     # events: [workflow_dispatch]
+#     # audience: praxis-credential-broker
+#     # any_workflow: as above, for this issuer's repositories
+#     # A token issued longer ago is refused whatever its expiry; at most 3600.
+#     # max_token_age_secs: 300
+#     # Needed for an http:// issuer or jwks_url, and off by default: over
+#     # plaintext, whoever can answer for that host on the network chooses
+#     # the keys.
+#     # allow_http: true
 #
 # OFF unless present: also register runs that prove nothing. With it, a
 # POST /v1/runs with no Authorization and an `x-run-id` header registers a

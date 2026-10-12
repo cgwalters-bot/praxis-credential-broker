@@ -67,18 +67,25 @@ pub struct Limits {
     pub concurrency: usize,
 }
 
-/// A GitHub Actions job in a run attempt, as its verified OIDC token names
-/// it, and that token's unique id.
+/// A job in a run attempt, as its verified OIDC token names it, and that
+/// token's unique id if it has one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunIdentity {
+    /// The policy's name for the issuer that signed the token, or None for
+    /// GitHub. Runs are told apart by it, so one issuer's ids are never
+    /// another's.
+    pub issuer: Option<String>,
     pub repository: String,
     pub repository_id: u64,
     pub run_id: u64,
     pub run_attempt: u64,
     /// Tells the jobs of one run apart, such as a matrix's.
     pub check_run_id: Option<u64>,
-    pub jti: String,
-    /// The `job_workflow_ref` claim: the workflow that runs the job.
+    /// The token's `jti`. An issuer whose tokens have none gives None, and
+    /// its runs register once and never again.
+    pub jti: Option<String>,
+    /// The `job_workflow_ref` claim: the workflow that runs the job. For
+    /// an issuer without that claim, `workflow_ref`.
     pub workflow_ref: String,
     /// The `job_workflow_sha` claim: the commit of that workflow.
     pub workflow_sha: Option<String>,
@@ -116,11 +123,18 @@ impl Admitted {
 
 impl RunIdentity {
     fn key(&self) -> RunKey {
-        RunKey::Github {
+        let job = Job {
             repository_id: self.repository_id,
             run_id: self.run_id,
             run_attempt: self.run_attempt,
             check_run_id: self.check_run_id,
+        };
+        match &self.issuer {
+            None => RunKey::Github(job),
+            Some(issuer) => RunKey::Oidc {
+                issuer: issuer.clone(),
+                job,
+            },
         }
     }
 }
@@ -163,15 +177,39 @@ impl Quota {
     }
 }
 
+/// The ids that name a job within its issuer.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct Job {
+    pub repository_id: u64,
+    pub run_id: u64,
+    pub run_attempt: u64,
+    pub check_run_id: Option<u64>,
+}
+
+impl std::fmt::Display for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            repository_id,
+            run_id,
+            run_attempt,
+            check_run_id,
+        } = self;
+        write!(f, "{repository_id}/{run_id}/{run_attempt}")?;
+        match check_run_id {
+            Some(check_run_id) => write!(f, "/{check_run_id}"),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum RunKey {
     /// A job its GitHub Actions OIDC token named.
-    Github {
-        repository_id: u64,
-        run_id: u64,
-        run_attempt: u64,
-        check_run_id: Option<u64>,
-    },
+    Github(Job),
+    /// A job the token of another issuer named. The issuer, by its name in
+    /// the policy, is part of the key: the same ids from two issuers are
+    /// two runs.
+    Oidc { issuer: String, job: Job },
     /// A run registered without proof, by the name its caller chose.
     Unproven(RunName),
 }
@@ -179,22 +217,14 @@ pub enum RunKey {
 impl RunKey {
     /// The run as an authenticated subject, which budgets are keyed on. A
     /// proven run's names the job by ids only, so it is stable and unique
-    /// per job. The prefix tells the two kinds apart wherever a subject is
-    /// logged, and keeps a chosen name from ever being a proven run's.
+    /// per job. The prefix tells the kinds apart wherever a subject is
+    /// logged, and keeps a chosen name from ever being a proven run's. An
+    /// issuer's name has no `:` or `/`, so its subjects cannot be made to
+    /// read as another issuer's.
     pub fn subject(&self) -> String {
         match self {
-            Self::Github {
-                repository_id,
-                run_id,
-                run_attempt,
-                check_run_id: Some(check_run_id),
-            } => format!("github-run:{repository_id}/{run_id}/{run_attempt}/{check_run_id}"),
-            Self::Github {
-                repository_id,
-                run_id,
-                run_attempt,
-                check_run_id: None,
-            } => format!("github-run:{repository_id}/{run_id}/{run_attempt}"),
+            Self::Github(job) => format!("github-run:{job}"),
+            Self::Oidc { issuer, job } => format!("oidc-run:{issuer}:{job}"),
             Self::Unproven(RunName(name)) => format!("unproven-run:{name}"),
         }
     }
@@ -232,23 +262,34 @@ pub enum RegisterError {
 #[serde(tag = "proof", rename_all = "kebab-case")]
 pub enum Proof {
     /// A verified GitHub Actions OIDC token, whose claims these are.
-    GithubOidc {
-        repository: String,
-        repository_id: u64,
-        run_id: u64,
-        run_attempt: u64,
-        check_run_id: Option<u64>,
-        workflow_ref: String,
-        workflow_sha: Option<String>,
-        entry_workflow_ref: String,
-        repository_owner_id: u64,
-        event_name: String,
-        actor: Option<String>,
-        admitted_by: Admitted,
+    GithubOidc(JobClaims),
+    /// A verified token of another issuer the policy trusts, by the
+    /// policy's name for it, and its claims.
+    Oidc {
+        issuer: String,
+        #[serde(flatten)]
+        claims: JobClaims,
     },
     /// Nothing: `run` is whatever the caller said.
     #[serde(rename = "none")]
     Unproven { run: RunName },
+}
+
+/// The claims of a verified token that a run's record keeps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct JobClaims {
+    pub repository: String,
+    pub repository_id: u64,
+    pub run_id: u64,
+    pub run_attempt: u64,
+    pub check_run_id: Option<u64>,
+    pub workflow_ref: String,
+    pub workflow_sha: Option<String>,
+    pub entry_workflow_ref: String,
+    pub repository_owner_id: u64,
+    pub event_name: String,
+    pub actor: Option<String>,
+    pub admitted_by: Admitted,
 }
 
 /// A run's usage record, returned to its job and logged when it ends. It
@@ -368,7 +409,8 @@ impl Runs {
     /// Register a job's run, once, and mint its bearer token. The same OIDC
     /// token (by `jti`) registering an active run again gets a new token for
     /// it, replacing the old one, so a job whose response was lost can retry;
-    /// the run keeps its usage and limits.
+    /// the run keeps its usage and limits. A token without a `jti` cannot be
+    /// told from another of the same job, so its run never registers again.
     pub fn register(
         &self,
         identity: RunIdentity,
@@ -379,7 +421,8 @@ impl Runs {
         let key = identity.key();
         let (token, hash) = new_token();
         if let Some(run) = state.runs.get_mut(&key) {
-            if run.jti.as_deref() != Some(identity.jti.as_str())
+            if identity.jti.is_none()
+                || run.jti != identity.jti
                 || run.record.state != RunState::Active
             {
                 return Err(RegisterError::AlreadyRegistered);
@@ -411,7 +454,7 @@ impl Runs {
             ttl_secs = limits.ttl.as_secs(),
             "run registered"
         );
-        let proof = Proof::GithubOidc {
+        let claims = JobClaims {
             repository: identity.repository,
             repository_id: identity.repository_id,
             run_id: identity.run_id,
@@ -425,7 +468,11 @@ impl Runs {
             actor: identity.actor,
             admitted_by: identity.admitted_by,
         };
-        let record = state.insert(key, proof, Some(identity.jti), hash, limits, now);
+        let proof = match identity.issuer {
+            None => Proof::GithubOidc(claims),
+            Some(issuer) => Proof::Oidc { issuer, claims },
+        };
+        let record = state.insert(key, proof, identity.jti, hash, limits, now);
         Ok((token, record))
     }
 
@@ -649,7 +696,7 @@ impl Drop for Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     const WORKFLOW: &str = "owner/repo/.github/workflows/agent.yml@refs/heads/main";
 
@@ -662,12 +709,13 @@ mod tests {
 
     fn identity(run_id: u64) -> RunIdentity {
         RunIdentity {
+            issuer: None,
             repository: "owner/repo".into(),
             repository_id: 7,
             run_id,
             run_attempt: 1,
             check_run_id: None,
-            jti: format!("jti-{run_id}"),
+            jti: Some(format!("jti-{run_id}")),
             workflow_ref: WORKFLOW.into(),
             workflow_sha: None,
             entry_workflow_ref: WORKFLOW.into(),
@@ -748,7 +796,7 @@ mod tests {
         assert!(runs.authenticate("praxis-run-guess", now).is_none());
         // Another OIDC token for the same job can't register it again.
         let mut other_token = identity(1);
-        other_token.jti = "another".into();
+        other_token.jti = Some("another".into());
         assert_eq!(
             runs.register(other_token, limits(), now),
             Err(RegisterError::AlreadyRegistered)
@@ -783,6 +831,95 @@ mod tests {
             runs.register(identity(1), limits(), now),
             Err(RegisterError::AlreadyRegistered)
         );
+    }
+
+    /// `identity` as an issuer the policy calls `issuer` gives it, with a
+    /// `jti` or without.
+    fn issued_by(issuer: &str, jti: Option<&str>, identity: RunIdentity) -> RunIdentity {
+        RunIdentity {
+            issuer: Some(issuer.to_owned()),
+            jti: jti.map(str::to_owned),
+            ..identity
+        }
+    }
+
+    #[test]
+    fn the_same_ids_from_two_issuers_are_two_runs() {
+        let runs = Arc::new(Runs::default());
+        let now = Instant::now();
+        let mut matrix = issued_by("ghes", Some("a"), identity(1));
+        matrix.check_run_id = Some(99);
+        // (who signed the token for repository 7, run 1, attempt 1; subject; proof)
+        let cases = [
+            (identity(1), "github-run:7/1/1", json!("github-oidc")),
+            (
+                issued_by("forge", None, identity(1)),
+                "oidc-run:forge:7/1/1",
+                json!("oidc"),
+            ),
+            (
+                issued_by("ghes", Some("a"), identity(1)),
+                "oidc-run:ghes:7/1/1",
+                json!("oidc"),
+            ),
+            (matrix, "oidc-run:ghes:7/1/1/99", json!("oidc")),
+        ];
+        let mut tokens = Vec::new();
+        for (identity, subject, proof) in cases {
+            let issuer = identity.issuer.clone();
+            let (token, record) = runs.register(identity, limits(), now).unwrap();
+            let key = runs.authenticate(&token, now).unwrap();
+            assert_eq!(key.subject(), subject);
+            assert!(!key.is_unproven(), "{subject}");
+            let json = serde_json::to_value(&record).unwrap();
+            assert_eq!(
+                (&json["proof"], &json["run_id"], &json["repository_id"]),
+                (&proof, &json!(1), &json!(7)),
+                "{subject}"
+            );
+            // Only another issuer's record names it; GitHub's is as it was.
+            assert_eq!(json.get("issuer"), issuer.map(Value::from).as_ref());
+            tokens.push((token, key));
+        }
+        // Each is a run of its own: ending one leaves the others.
+        runs.finish(&tokens[1].1, now);
+        for (token, key) in &tokens {
+            assert_eq!(runs.authenticate(token, now).as_ref(), Some(key));
+        }
+        assert!(runs.admit(&tokens[1].1, now).is_err());
+        let mut others = tokens.iter().filter(|(_, key)| *key != tokens[1].1);
+        assert!(others.all(|(_, key)| runs.record(key, now).unwrap().state == RunState::Active));
+    }
+
+    #[test]
+    fn a_token_without_a_jti_registers_its_run_once_and_never_again() {
+        let now = Instant::now();
+        // (the first token's jti, the second's, whether the second replaces it)
+        let cases = [
+            (Some("a"), Some("a"), true),
+            (Some("a"), Some("b"), false),
+            (Some("a"), None, false),
+            (None, Some("a"), false),
+            // Nothing tells this token from a copy of it, or from another.
+            (None, None, false),
+        ];
+        for (first, second, replaces) in cases {
+            let runs = Runs::default();
+            let (token, _) = runs
+                .register(issued_by("forge", first, identity(1)), limits(), now)
+                .unwrap();
+            let again = runs.register(issued_by("forge", second, identity(1)), limits(), now);
+            assert_eq!(again.is_ok(), replaces, "{first:?} then {second:?}");
+            if !replaces {
+                assert_eq!(again, Err(RegisterError::AlreadyRegistered));
+            }
+            // A refused registration leaves the run's token as it was.
+            assert_eq!(
+                runs.authenticate(&token, now).is_some(),
+                !replaces,
+                "{first:?} then {second:?}"
+            );
+        }
     }
 
     #[test]
