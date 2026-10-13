@@ -6,8 +6,8 @@
 //! that `run_token` authenticates.
 use crate::{
     oidc::testing::{
-        CALLED, CALLED_SHA, CALLER, OWNER_ID, REPOSITORY_ID, TEST_JWKS, WORKFLOW, called_at, jwt,
-        with,
+        CALLED, CALLED_SHA, CALLER, FORGE, FORGE_ISSUER, FORGE_JWKS, FORGE_WORKFLOW, OWNER_ID,
+        REPOSITORY_ID, TEST_JWKS, WORKFLOW, called_at, forge_jwt, jwt, with,
     },
     runs::RECORD_SCHEMA,
 };
@@ -252,7 +252,7 @@ async fn fake_count_tokens(State(fake): State<Fake>, headers: HeaderMap) -> Resp
 }
 
 /// A fake upstream for `cluster`, recording into `upstream`; every one also
-/// serves the test OIDC key set.
+/// serves the test OIDC key set, and the test forge's beside it.
 async fn serve_upstream(upstream: &Arc<Upstream>, cluster: &'static str) -> String {
     let router = Router::new()
         .route("/v1/responses", post(fake_responses))
@@ -261,6 +261,7 @@ async fn serve_upstream(upstream: &Arc<Upstream>, cluster: &'static str) -> Stri
         .route("/v1/messages/count_tokens", post(fake_count_tokens))
         .route("/healthz", get(|| async { "ready\n" }))
         .route("/jwks", get(|| async { TEST_JWKS }))
+        .route("/forge-jwks", get(|| async { FORGE_JWKS }))
         .with_state(Fake {
             upstream: Arc::clone(upstream),
             cluster,
@@ -353,6 +354,23 @@ fn permissive_policy() -> Value {
     policy
 }
 
+/// `proving_policy` that also trusts the test forge for its test workflow,
+/// in a repository with the id GitHub's test repository has. The harness
+/// says where the forge's keys are.
+fn two_issuer_policy() -> Value {
+    let mut policy = proving_policy();
+    policy["issuers"] = json!([{
+        "name": FORGE,
+        "issuer": FORGE_ISSUER,
+        "jwks_url": "http://forge.test/api/actions/.well-known/keys",
+        "allow_http": true,
+        "claims": "forgejo",
+        "workflows": [FORGE_WORKFLOW],
+        "repository_ids": [REPOSITORY_ID],
+    }]);
+    policy
+}
+
 /// What a token of a workflow in a repository of `OTHER_OWNER_ID` says.
 fn other_owners(event: &str) -> Value {
     let workflow = "other/tool/.github/workflows/ci.yml@refs/heads/topic";
@@ -394,6 +412,10 @@ impl Harness {
         let policy_file = dir.path().join("run-token-policy.yaml");
         if let Some(mut contents) = policy {
             contents["jwks_url"] = format!("http://{}/jwks", endpoints[RESPONSES]).into();
+            let issuers = contents.get_mut("issuers").and_then(Value::as_array_mut);
+            for issuer in issuers.into_iter().flatten() {
+                issuer["jwks_url"] = format!("http://{}/forge-jwks", endpoints[RESPONSES]).into();
+            }
             std::fs::write(&policy_file, contents.to_string()).unwrap();
         }
         let tokens_file = dir.path().join("operator-tokens.yaml");
@@ -2114,6 +2136,118 @@ async fn a_run_a_new_entry_admits_is_capped_metered_and_ended_like_any_other() {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
     // Neither counts as a run without proof.
+    assert!(h.broker_usage().await.get("unproven_runs").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_issuers_run_is_apart_from_githubs_and_a_run_like_any_other() {
+    let h = Harness::start_with(Some(two_issuer_policy()), |_| {}).await;
+    // The forge's run 1 of repository 7, and GitHub's.
+    let forge = forge_jwt(1, &json!({}));
+    let (status, body) = h.register(&forge).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let forge_run = body["token"].as_str().unwrap().to_owned();
+    let identity = json!({
+        "proof": "oidc",
+        "issuer": FORGE,
+        "admitted_by": "workflows",
+        "repository": "owner/repo",
+        "repository_id": REPOSITORY_ID,
+        "repository_owner_id": OWNER_ID,
+        "run_id": 1,
+        "run_attempt": 1,
+        "check_run_id": null,
+        "workflow_ref": FORGE_WORKFLOW,
+        "workflow_sha": null,
+        "entry_workflow_ref": FORGE_WORKFLOW,
+        "event_name": "workflow_dispatch",
+        "actor": "someone",
+    });
+    for (name, value) in identity.as_object().unwrap() {
+        assert_eq!(&body["usage"][name], value, "{name}");
+    }
+    let github_run = h.run(1).await;
+    let record = h.usage(&github_run).await;
+    assert_eq!(
+        (&record["proof"], &record["run_id"], record.get("issuer")),
+        (&json!("github-oidc"), &json!(1), None)
+    );
+    // A forge token has no id of its own, so neither the token that
+    // registered the run nor another of its job registers it again, and
+    // the run's token is not replaced.
+    for again in [forge, forge_jwt(1, &json!({}))] {
+        assert_eq!(h.register(&again).await.0, StatusCode::CONFLICT);
+    }
+    assert_eq!(h.usage(&forge_run).await["state"], "active");
+    // (a token, whether it registers)
+    let cases = [
+        (
+            "another run of the forge",
+            forge_jwt(2, &json!({})),
+            StatusCode::CREATED,
+        ),
+        (
+            "another attempt",
+            forge_jwt(1, &json!({"run_attempt": "2"})),
+            StatusCode::CREATED,
+        ),
+        (
+            "a forge token for github's workflow",
+            forge_jwt(3, &json!({"workflow_ref": WORKFLOW})),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "a github token for the forge's workflow",
+            jwt(
+                3,
+                &json!({"job_workflow_ref": FORGE_WORKFLOW, "workflow_ref": FORGE_WORKFLOW}),
+            ),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "a forge token for another event",
+            forge_jwt(3, &json!({"event_name": "push"})),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "an issuer nothing names",
+            forge_jwt(3, &json!({"iss": "http://other.test/api/actions"})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "a forge token for another audience",
+            forge_jwt(3, &json!({"aud": "someone-else"})),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (name, token, expected) in cases {
+        assert_eq!(h.register(&token).await.0, expected, "{name}");
+    }
+    // The forge's run has a cap of its own, which its second response
+    // overshoots; GitHub's run of the same ids still has all of its own.
+    for _ in 0..2 {
+        let (status, body) = h.respond(Some(&forge_run), "", false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, _) = h.respond(Some(&forge_run), "", false).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let (status, body) = h.respond(Some(&github_run), "", false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let usage = h.usage(&forge_run).await;
+    assert_eq!(
+        (&usage["requests"], &usage["tokens"]["total"]),
+        (&json!(2), &json!(2 * RESPONSES_TOTAL))
+    );
+    assert_eq!(h.usage(&github_run).await["requests"], 1);
+    // Ending it leaves GitHub's run as it was.
+    let (status, ended) = h.runs(Method::DELETE, "/v1/runs/self", &forge_run).await;
+    assert_eq!(
+        (status, &ended["state"], &ended["issuer"]),
+        (StatusCode::OK, &json!("finished"), &json!(FORGE))
+    );
+    let (status, _) = h.respond(Some(&forge_run), "", false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.usage(&github_run).await["state"], "active");
     assert!(h.broker_usage().await.get("unproven_runs").is_none());
 }
 
