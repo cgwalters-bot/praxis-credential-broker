@@ -226,10 +226,15 @@ filter_chains:
           - unless:
               path: "/anthropic/v1/messages/count_tokens"
         rules:
+          # 2026-10-13: a run hit 20M raw tokens while reviewing finished
+          # code. Discount cache reads as in the subscription window below;
+          # keep the 20M bound on weighted usage and the 10k reservation.
           - name: run
             algorithm: sliding_window
             window: 6h
             capacity: 20000000
+            weights:
+              cached_input: 0.1
             reserved_tokens: 10000
             reservation_timeout: 30m
       - filter: token_rate_limit
@@ -268,10 +273,17 @@ filter_chains:
           - unless:
               path: "/anthropic/v1/messages/count_tokens"
         rules:
+          # 2026-10-13, 00:50-05:09 UTC: 851 requests used 100,069,361
+          # raw tokens, including 96,477,144 cache reads (~2.8M input,
+          # ~0.75M output), at only 9% of the plan's 5h window (3% of 7d).
+          # Charging cache reads at a tenth gives ~13.24M weighted tokens;
+          # retain the 100M bound, not a provider-utilization controller.
           - name: window
             algorithm: sliding_window
             window: 5h
             capacity: 100000000
+            weights:
+              cached_input: 0.1
             reserved_tokens: 10000
             reservation_timeout: 30m
       - filter: token_rate_limit

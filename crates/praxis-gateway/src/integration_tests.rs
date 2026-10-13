@@ -67,6 +67,7 @@ const RECORDED_STREAM: &str = include_str!("../testdata/codex-responses-stream.s
 /// The `input` the fake Responses upstream answers with `RECORDED_STREAM`.
 const RECORDED_INPUT: &str = "recorded";
 const MESSAGES_TOTAL: u64 = 90;
+const MESSAGES_WEIGHTED: u64 = 72; // 40 input + 20 cache reads * 0.1 + 30 output
 /// The end of a stream api.mistral.ai sent on 2026-10-12 for `zai-glm-5-3`,
 /// its id replaced: the last delta, the chunk that ends the choice and holds
 /// the usage, which nothing in the request asked for, and the terminator.
@@ -1437,7 +1438,7 @@ async fn token_rate_limit_caps_each_providers_window_for_injected_requests() {
     let h = Harness::start(true, |filter| {
         for rule in rules_named(filter, "window") {
             let reserved = rule["reserved_tokens"].as_u64().unwrap();
-            rule["capacity"] = Yaml::from(reserved + MESSAGES_TOTAL.min(RESPONSES_TOTAL) - 1);
+            rule["capacity"] = Yaml::from(reserved + MESSAGES_WEIGHTED.min(RESPONSES_TOTAL) - 1);
         }
     })
     .await;
@@ -1470,6 +1471,66 @@ async fn token_rate_limit_caps_each_providers_window_for_injected_requests() {
         let response = h.call(Method::GET, "/healthz", &[], None).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anthropic_cache_discount_applies_to_run_and_window_without_changing_usage() {
+    for name in ["run", "window"] {
+        let h = Harness::start(true, |filter| {
+            if filter["conditions"][0]["when"]["path_prefix"] != "/anthropic" {
+                return;
+            }
+            for rule in rules_named(filter, name) {
+                assert_eq!(rule["weights"]["cached_input"].as_f64(), Some(0.1));
+                rule["reserved_tokens"] = Yaml::from(10);
+                // A raw 90-token charge would reject the second reservation.
+                rule["capacity"] = Yaml::from(MESSAGES_WEIGHTED + 10);
+            }
+        })
+        .await;
+        let token = h.run(1).await;
+        for _ in 0..2 {
+            let (status, body) = h.injected(Some(&token)).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        }
+        let (status, _) = h.injected(Some(&token)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{name}");
+        let usage = h.usage(&token).await;
+        assert_eq!(usage["tokens"]["total"], json!(2 * MESSAGES_TOTAL));
+        assert_eq!(usage["tokens"]["cache_read"], json!(40));
+    }
+}
+
+#[test]
+fn only_anthropic_caps_discount_cache_reads_and_capacities_are_unchanged() {
+    let mut config: Yaml = serde_yaml::from_str(PRAXIS_YAML).unwrap();
+    let mut count = 0;
+    for filter in filters_mut(&mut config) {
+        if filter["filter"] != "token_rate_limit" {
+            continue;
+        }
+        count += 1;
+        let anthropic = filter["conditions"][0]["when"]["path_prefix"] == "/anthropic";
+        for rule in filter["rules"].as_sequence().unwrap() {
+            let (capacity, window) = match rule["name"].as_str().unwrap() {
+                "run" => (20_000_000, "6h"),
+                "window" => (100_000_000, "5h"),
+                name => panic!("unexpected cap {name}"),
+            };
+            assert_eq!(rule["capacity"].as_u64(), Some(capacity));
+            assert_eq!(rule["window"].as_str(), Some(window));
+            assert_eq!(rule["reserved_tokens"].as_u64(), Some(10_000));
+            assert_eq!(rule["reservation_timeout"].as_str(), Some("30m"));
+            assert!(filter["default_weights"].is_null());
+            if anthropic {
+                assert_eq!(rule["weights"].as_mapping().unwrap().len(), 1);
+                assert_eq!(rule["weights"]["cached_input"].as_f64(), Some(0.1));
+            } else {
+                assert!(rule["weights"].is_null());
+            }
+        }
+    }
+    assert_eq!(count, 6);
 }
 
 #[tokio::test(flavor = "multi_thread")]
