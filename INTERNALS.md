@@ -679,7 +679,7 @@ What it gives up, all of it deliberately:
   work, so it can register a run of its own under a new name and get a
   fresh per-run cap. Against an agent that tries, a run's cap is a
   convention. What still bounds it is the quota below, the providers'
-  window caps (100M tokens per API in any five hours as committed, shared
+   window caps (100M charged tokens per API in any five hours as committed, shared
   by everyone, so one agent that used them up stops every other run until
   the window moves on) and whatever ends the job.
 - **Names are the caller's.** Nothing vouches for an `x-run-id`: a record
@@ -757,7 +757,7 @@ and removed before the request goes upstream. What it grants:
 - requests to the injected routes of the clusters its entry lists, with the
   broker's credential for them, and 403 on any other injected route;
 - as the identity `operator:NAME`, which the per-run `token_rate_limit`
-  rules cap like any run: 20M tokens per API, but in a sliding 6 hours
+   rules cap like any run: 20M charged tokens per API, but in a sliding 6 hours
   rather than once, since an operator does not end;
 - nothing else: it reads and finishes no run (`/v1/runs/self` gets 401),
   registers none, and is refused as a pass-through credential (400), so it
@@ -800,8 +800,8 @@ the name the caller chose), `state` (`active`, `finished` or `expired`), Unix
 times registered, expiring and finished, the number of metered `requests`
 and of `unmetered` ones (successful responses whose usage never arrived,
 as when the client left mid-stream; the cap keeps their reservation),
-`tokens` (`input` uncached, `cache_read`, `output`, `reasoning` within
-output, and `total`, which the caps count), and `models`, the same
+   `tokens` (`input` uncached, `cache_read`, `output`, `reasoning` within
+   output, and `total`, before any cap weighting), and `models`, the same
 `tokens` by the model upstream named.
 
 ## Metering and caps
@@ -883,16 +883,20 @@ response and caps injected use with praxis-ai's own filters:
   `crates/praxis-gateway/testdata` pins the real event shape, and
   `just test-pod`'s mock omits the header as the backend does.
 - **Per-run caps.** A `token_rate_limit` rule keyed on the run
-  (`key: authenticated_subject`) caps each run at 20M tokens over a 6-hour
+  (`key: authenticated_subject`) caps each run at 20M charged tokens over a 6-hour
   window, which spans a whole run. There is one per API, because a
   condition can't select "injected" across both: so a run that uses both
   APIs gets the cap on each, though a run normally uses one. It reserves
   10k tokens per request, refuses with 429 before anything goes upstream,
-  and reconciles with what `token_count` recorded: a response's `total`,
-  which counts cached input in full. A run can overshoot its cap by the
+  and reconciles with what `token_count` recorded. Anthropic's run and window
+  rules charge cache reads at 0.1 and every other token class at 1.0;
+  Responses and Mistral count all tokens in full. Usage records retain raw
+  totals. The observation behind the discount is beside the rules in
+  `praxis.yaml`; it is a fixed weight, not provider-utilization tracking.
+  A run can overshoot its cap by the
   output of its requests in flight.
 - **Windows.** Another `token_rate_limit` per API caps all injected use at
-  100M tokens in a sliding 5-hour window, the providers' usage-limit window:
+  100M charged tokens in a sliding 5-hour window, the providers' usage-limit window:
   each is a subscription with a limit of its own. One run can use up a
   window and lock out the others until it slides.
 
