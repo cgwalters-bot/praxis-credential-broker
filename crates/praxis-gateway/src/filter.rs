@@ -804,11 +804,12 @@ impl Registrar {
                 "runs register WITHOUT PROOF: any client that reaches the listener can use the broker's credentials"
             );
         }
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("{FILTER_NAME}: HTTP client: {e}"))?;
+        let oidc = (!issuers.is_empty())
+            .then(|| Oidc::new(issuers))
+            .transpose()
+            .map_err(|e| format!("{FILTER_NAME}: {e}"))?;
         Ok(Some(Self {
-            oidc: (!issuers.is_empty()).then(|| Oidc::new(client, issuers)),
+            oidc,
             unproven,
             limits,
         }))

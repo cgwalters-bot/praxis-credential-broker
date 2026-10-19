@@ -379,7 +379,10 @@ verifies the token's RS256 signature against GitHub's published key set
 (cached for an hour, refetched at most once a minute for an unknown key id,
 and no longer trusted a day after the last successful fetch), its issuer,
 audience and validity period, and that it was issued after the gateway
-started. Then the policy file, whose `workflows` entry is these fields:
+started. The key set is fetched without following redirects, so that the
+scheme and host of `jwks_url` are the ones the keys come from: a redirect
+is a failed fetch, logged with its status, and `jwks_url` must name where
+the keys are. Then the policy file, whose `workflows` entry is these fields:
 
 | Field | Claim | Default |
 |-------|-------|---------|

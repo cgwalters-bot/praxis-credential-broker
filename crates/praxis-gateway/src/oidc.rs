@@ -23,7 +23,7 @@
 use crate::runs::{Admitted, RunIdentity, unix_now};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
-use reqwest::Client;
+use reqwest::{Client, redirect};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -575,17 +575,24 @@ pub struct Oidc {
 }
 
 impl Oidc {
-    pub fn new(client: Client, issuers: Vec<TrustedIssuer>) -> Self {
+    /// Fetch keys with a client of its own, which follows no redirect: a
+    /// `jwks_url` is checked for https (or `allow_http`) and is trusted for
+    /// its host, so neither may change on the way to the keys.
+    pub fn new(issuers: Vec<TrustedIssuer>) -> Result<Self, String> {
+        let client = Client::builder()
+            .redirect(redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("OIDC key client: {e}"))?;
         LazyLock::force(&ISSUED_AFTER);
         let issuer = |trusted| Issuer {
             client: client.clone(),
             trusted,
             cache: Mutex::default(),
         };
-        Self {
+        Ok(Self {
             issuers: issuers.into_iter().map(issuer).collect(),
             registrations: Semaphore::new(REGISTRATION_CONCURRENCY),
-        }
+        })
     }
 
     /// Verify a job's token and return the run it names, if the policy of
@@ -703,7 +710,11 @@ impl Issuer {
                     cache.keys = keys;
                     cache.fetched = Some(Instant::now());
                 }
-                Err(()) => warn!(jwks_url = %self.trusted.jwks_url, "OIDC key set unavailable"),
+                Err(error) => {
+                    // Debug, escaped: the error can quote the body the
+                    // issuer's host served.
+                    warn!(jwks_url = %self.trusted.jwks_url, ?error, "OIDC key set unavailable");
+                }
             }
         }
         if cache.fetched.is_none_or(|t| t.elapsed() >= JWKS_MAX_STALE) {
@@ -712,28 +723,41 @@ impl Issuer {
         cache.keys.get(kid).cloned().ok_or(OidcError::Invalid)
     }
 
-    async fn fetch(&self) -> Result<HashMap<String, DecodingKey>, ()> {
+    /// The key set at `jwks_url`, or why it could not be had.
+    async fn fetch(&self) -> Result<HashMap<String, DecodingKey>, String> {
         let body = timeout(JWKS_TIMEOUT, async {
             let mut response = self
                 .client
                 .get(&self.trusted.jwks_url)
                 .send()
                 .await
-                .map_err(|_| ())?
-                .error_for_status()
-                .map_err(|_| ())?;
+                .map_err(|e| format!("request failed: {e}"))?;
+            let status = response.status();
+            if status.is_redirection() {
+                return Err(format!(
+                    "answered {status}, a redirect, which is not followed; set jwks_url to where the keys are"
+                ));
+            }
+            if !status.is_success() {
+                return Err(format!("answered {status}"));
+            }
             let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| format!("reading the body failed: {e}"))?
+            {
                 if body.len() + chunk.len() > MAX_JWKS_BYTES {
-                    return Err(());
+                    return Err(format!("the key set is over {MAX_JWKS_BYTES} bytes"));
                 }
                 body.extend_from_slice(&chunk);
             }
             Ok(body)
         })
         .await
-        .map_err(|_| ())??;
-        let set: JwkSet = serde_json::from_slice(&body).map_err(|_| ())?;
+        .map_err(|_| format!("no answer within {JWKS_TIMEOUT:?}"))??;
+        let set: JwkSet =
+            serde_json::from_slice(&body).map_err(|e| format!("not a key set: {e}"))?;
         Ok(set
             .keys
             .iter()
@@ -956,9 +980,10 @@ mod tests {
         serve_issuers(|jwks| vec![TrustedIssuer::github(jwks.to_owned(), policy)]).await
     }
 
-    /// Serve GitHub's test key set at `/jwks` until `down` is set, and the
-    /// test forge's beside it, to verify against the issuers `trusted`
-    /// makes of the first's URL.
+    /// Serve GitHub's test key set at `/jwks` until `down` is set, the
+    /// test forge's beside it, and a redirect to the first at
+    /// `/redirect`, to verify against the issuers `trusted` makes of the
+    /// first's URL.
     async fn serve_issuers(
         trusted: impl FnOnce(&str) -> Vec<TrustedIssuer>,
     ) -> (Oidc, Arc<AtomicBool>) {
@@ -974,6 +999,10 @@ mod tests {
         let router = Router::new()
             .route("/jwks", get(jwks))
             .route("/forge-jwks", get(|| async { FORGE_JWKS }))
+            .route(
+                "/redirect",
+                get(|| async { axum::response::Redirect::temporary("/jwks") }),
+            )
             .with_state(Arc::clone(&down));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -981,7 +1010,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let issuers = trusted(&format!("http://{address}/jwks"));
-        (Oidc::new(Client::new(), issuers), down)
+        (Oidc::new(issuers).unwrap(), down)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1555,6 +1584,23 @@ mod tests {
         down.store(false, Ordering::SeqCst);
         oidc.age_keys(Duration::from_secs(3600)).await;
         assert!(oidc.verify(&jwt(3, &json!({}))).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redirected_key_fetch_is_refused() {
+        // The redirect leads to the very keys that sign the token, so only
+        // not following it makes the keys unavailable.
+        let (oidc, _) = serve_issuers(|jwks| {
+            vec![TrustedIssuer::github(
+                jwks.replace("/jwks", "/redirect"),
+                policy(),
+            )]
+        })
+        .await;
+        assert_eq!(
+            oidc.verify(&jwt(1, &json!({}))).await.err(),
+            Some(OidcError::Unavailable)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
