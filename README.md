@@ -308,7 +308,7 @@ claude
 ```
 
 From another tailnet host, use the broker host's MagicDNS name instead, such
-as `http://xenon.tailf2eb8.ts.net:18080/anthropic`, once the pod is published
+as `http://<host>.<tailnet>.ts.net:18080/anthropic`, once the pod is published
 on the tailnet (see [INTERNALS.md](INTERNALS.md#quadlet)). The old
 `/v1/messages` route without the prefix, and the separate listener on port
 18083, are gone.
