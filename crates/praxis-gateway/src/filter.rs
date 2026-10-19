@@ -7,7 +7,10 @@
 //!   the job's run and returns its bearer token and usage record. If the
 //!   policy has `unproven`, off by default, a request with no
 //!   `Authorization` registers the run its `x-run-id` names instead, with
-//!   no proof of who sends it;
+//!   no proof of who sends it. Which of the two a chain accepts is its
+//!   listener's, by the label `listener` gives it (see [`ListenerPolicy`]);
+//!   a run is admitted only through a chain of the label it registered
+//!   under;
 //! - `GET /v1/runs/self` returns the calling run's usage record;
 //! - `DELETE /v1/runs/self` finishes the run and returns its final record.
 //!
@@ -45,8 +48,8 @@ use crate::{
     },
     operators::{self, Operators},
     runs::{
-        Admission, Limits, MAX_UNPROVEN_RUNS, Quota, Refusal, RegisterError, RunKey, RunName, Runs,
-        TOKEN_PREFIX, Tokens, Usage,
+        Admission, DEFAULT_LISTENER, Limits, Listener, MAX_LISTENER_LABEL, MAX_UNPROVEN_RUNS,
+        Quota, Refusal, RegisterError, RunKey, RunName, Runs, TOKEN_PREFIX, Tokens, Usage,
     },
     usage::{BrokerUsage, Provider},
 };
@@ -63,7 +66,7 @@ use praxis_filter::{
 };
 use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::ErrorKind,
     iter,
     net::IpAddr,
@@ -147,6 +150,13 @@ struct Config {
     /// Chains whose filters name the same registry share its runs.
     #[serde(default = "default_registry")]
     registry: String,
+    /// The label of the listener this chain serves, which picks its entry
+    /// of the policy's `listeners`; `default` is the policy's top level.
+    /// A run is admitted only through chains of the label it registered
+    /// under, so give each listener a chain of its own: Praxis builds each
+    /// listener's filters apart, caps included.
+    #[serde(default = "default_listener")]
+    listener: String,
     /// Where requests carry their run token: a bearer token in
     /// `authorization`, or the bare token in any other header. The first of
     /// these headers a request has is the one that must hold its token, so
@@ -230,7 +240,25 @@ struct PolicyFile {
     max_secs: u64,
     #[serde(default = "default_concurrency")]
     concurrency: usize,
-    /// Also register runs that prove nothing. Off unless present.
+    /// Also register runs that prove nothing, on the default listener.
+    /// Off unless present.
+    unproven: Option<UnprovenConfig>,
+    /// How each other listener registers runs, by its label. Off unless
+    /// present: a chain with another label must have its entry here.
+    #[serde(default)]
+    listeners: BTreeMap<String, ListenerPolicy>,
+}
+
+/// How runs register through a listener other than the default one, whose
+/// settings are the policy's top level. Each mode is off unless present,
+/// and at least one must be.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListenerPolicy {
+    /// Verify OIDC tokens against the policy's entries.
+    #[serde(default)]
+    oidc: bool,
+    /// Register runs that prove nothing, within this listener's own quota.
     unproven: Option<UnprovenConfig>,
 }
 
@@ -239,41 +267,56 @@ struct PolicyFile {
 /// credentials within a run's caps. The gateway cannot tell a job from its
 /// agent or from any other peer, so the network is the only gate, and the
 /// quota is all that bounds how many fresh per-run caps a caller mints.
+/// Each listener that admits it has a quota of its own.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnprovenConfig {
-    /// Registrations admitted in any window, from all callers together.
+    /// Registrations admitted in any window, from all the listener's
+    /// callers together.
     max_registrations: usize,
     #[serde(default = "default_unproven_window_secs")]
     window_secs: u64,
 }
 
 impl UnprovenConfig {
-    /// The quota this asks for, for runs that each last `ttl`. One whose
-    /// runs could outnumber what the registry remembers is refused, so
-    /// that no quota a gateway starts with can find the registry full and
-    /// stall every registration until old runs are forgotten.
-    fn quota(&self, ttl: Duration) -> Result<Quota, String> {
+    /// The quota this asks for.
+    fn quota(&self) -> Result<Quota, String> {
         if self.max_registrations == 0 {
             return Err("unproven.max_registrations must be positive".into());
         }
         if !(1..=MAX_SECS).contains(&self.window_secs) {
             return Err(format!("unproven.window_secs must be from 1 to {MAX_SECS}"));
         }
-        let quota = Quota {
+        Ok(Quota {
             max: self.max_registrations,
             window: Duration::from_secs(self.window_secs),
-        };
-        let remembered = quota.most_remembered(ttl);
-        if remembered > MAX_UNPROVEN_RUNS {
-            return Err(format!(
-                "unproven: at this rate up to {remembered} runs would be remembered at once, and at most {MAX_UNPROVEN_RUNS} are; lower max_registrations or lengthen window_secs"
-            ));
-        }
-        Ok(quota)
+        })
     }
 }
 
+/// Refuse quotas whose runs, each lasting `ttl`, could together outnumber
+/// what the registry remembers, so that no set of quotas a gateway starts
+/// with can find the registry full and stall every registration until old
+/// runs are forgotten.
+fn check_quotas<'a>(
+    quotas: impl IntoIterator<Item = &'a Quota>,
+    ttl: Duration,
+) -> Result<(), String> {
+    let remembered = quotas
+        .into_iter()
+        .map(|quota| quota.most_remembered(ttl))
+        .fold(0, usize::saturating_add);
+    if remembered > MAX_UNPROVEN_RUNS {
+        return Err(format!(
+            "unproven: at these rates up to {remembered} runs would be remembered at once, and at most {MAX_UNPROVEN_RUNS} are, across all listeners; lower max_registrations or lengthen window_secs"
+        ));
+    }
+    Ok(())
+}
+
+fn default_listener() -> String {
+    DEFAULT_LISTENER.to_owned()
+}
 fn default_unproven_window_secs() -> u64 {
     DEFAULT_UNPROVEN_WINDOW_SECS
 }
@@ -293,11 +336,13 @@ fn default_concurrency() -> usize {
     DEFAULT_CONCURRENCY
 }
 
-/// Verifies registrations against the policy.
+/// Verifies registrations through one listener against the policy.
 struct Registrar {
-    /// None if the policy names no workflow: only `unproven` registers.
+    /// None if the policy names no workflow, or the listener takes no OIDC
+    /// token: only `unproven`, if anything, registers.
     oidc: Option<GithubOidc>,
-    /// The quota of registrations without proof, if the policy admits them.
+    /// The listener's quota of registrations without proof, if it admits
+    /// them.
     unproven: Option<Quota>,
     limits: Limits,
 }
@@ -313,6 +358,8 @@ enum RunEndpoints {
 
 pub struct RunTokenFilter {
     runs: Arc<Runs>,
+    /// The listener this chain serves, whose runs alone it admits.
+    listener: Listener,
     usage: Arc<BrokerUsage>,
     token_headers: Vec<HeaderName>,
     public_paths: HashSet<String>,
@@ -360,9 +407,14 @@ impl RunTokenFilter {
         if config.credentials.is_empty() {
             return Err(format!("{FILTER_NAME}: credentials must name a cluster").into());
         }
+        let listener = Listener::new(&config.listener).ok_or_else(|| {
+            format!(
+                "{FILTER_NAME}: listener must be 1 to {MAX_LISTENER_LABEL} letters, digits, '.', '_' or '-'"
+            )
+        })?;
         let endpoints = match config.registration {
             None => RunEndpoints::Absent,
-            Some(registration) => match Registrar::load(&registration.policy_file)? {
+            Some(registration) => match Registrar::load(&registration.policy_file, &listener)? {
                 Some(registrar) => RunEndpoints::Serving(Box::new(registrar)),
                 None => RunEndpoints::Unconfigured,
             },
@@ -387,8 +439,10 @@ impl RunTokenFilter {
         for operator in operators.names() {
             usage.declare_operator(operator);
         }
+        usage.declare_listener(&listener);
         Ok(Box::new(Self {
             runs: Runs::named(&config.registry),
+            listener,
             usage,
             token_headers,
             public_paths: config.public_paths,
@@ -416,7 +470,8 @@ impl RunTokenFilter {
     }
 
     fn run_of(&self, headers: &HeaderMap, now: Instant) -> Option<RunKey> {
-        self.runs.authenticate(self.token(headers)?.1, now)
+        self.runs
+            .authenticate(self.token(headers)?.1, &self.listener, now)
     }
 
     /// Admit an injected request for `cluster` by the token it carries: an
@@ -439,7 +494,7 @@ impl RunTokenFilter {
         let now = Instant::now();
         let key = self
             .runs
-            .authenticate(token, now)
+            .authenticate(token, &self.listener, now)
             .ok_or_else(unauthenticated)?;
         match self.runs.admit(&key, now) {
             Ok(admission) => Ok((key.subject(), Caller::Run(admission))),
@@ -552,10 +607,13 @@ impl RunTokenFilter {
         };
         match self
             .runs
-            .register(identity, registrar.limits, Instant::now())
+            .register(identity, registrar.limits, &self.listener, Instant::now())
         {
             Ok((token, usage)) => json(201, &serde_json::json!({ "token": token, "usage": usage })),
             Err(RegisterError::AlreadyRegistered) => reject(409, "run already registered\n"),
+            Err(RegisterError::OtherListener) => {
+                reject(409, "run registered through another listener\n")
+            }
             Err(RegisterError::Full | RegisterError::OverQuota) => reject(503, "too many runs\n"),
         }
     }
@@ -581,20 +639,30 @@ impl RunTokenFilter {
         let Some(name) = name.to_str().ok().and_then(RunName::new) else {
             return reject(400, "invalid x-run-id\n");
         };
-        match self
-            .runs
-            .register_unproven(name, client, limits, quota, Instant::now())
-        {
+        match self.runs.register_unproven(
+            name,
+            client,
+            limits,
+            quota,
+            &self.listener,
+            Instant::now(),
+        ) {
             Ok((token, usage)) => {
                 self.usage.unproven_registration(true);
                 json(201, &serde_json::json!({ "token": token, "usage": usage }))
             }
-            Err(RegisterError::AlreadyRegistered) => reject(409, "run already registered\n"),
+            Err(RegisterError::AlreadyRegistered | RegisterError::OtherListener) => {
+                reject(409, "run already registered\n")
+            }
             // Counted in /usage rather than logged at a level a deployment
             // keeps: any client can cause as many of these as it likes.
             Err(RegisterError::OverQuota) => {
                 self.usage.unproven_registration(false);
-                debug!(client = ?client, "unproven run registration refused: over quota");
+                debug!(
+                    client = ?client,
+                    listener = %self.listener,
+                    "unproven run registration refused: over quota"
+                );
                 reject(429, "too many unproven registrations\n")
             }
             Err(RegisterError::Full) => reject(503, "too many runs\n"),
@@ -603,9 +671,9 @@ impl RunTokenFilter {
 }
 
 impl Registrar {
-    /// The registrar for the policy in `path`, or `None` if there is no such
-    /// file.
-    fn load(path: &Path) -> Result<Option<Self>, FilterError> {
+    /// The registrar of `listener` for the policy in `path`, or `None` if
+    /// there is no such file.
+    fn load(path: &Path, listener: &Listener) -> Result<Option<Self>, FilterError> {
         let path_error = |e: &dyn std::fmt::Display| {
             FilterError::from(format!("{FILTER_NAME}: {}: {e}", path.display()))
         };
@@ -633,8 +701,26 @@ impl Registrar {
         // A policy for registration without proof only has no entry that
         // admits a token, and then nothing about one either.
         let proves = policy.proves();
-        if proves || file.unproven.is_none() {
+        let unproven_anywhere =
+            file.unproven.is_some() || file.listeners.values().any(|l| l.unproven.is_some());
+        if proves || !unproven_anywhere {
             policy.validate().map_err(|e| path_error(&e))?;
+        }
+        for (label, entry) in &file.listeners {
+            let error = |e: &str| path_error(&format!("listeners: {label:?}: {e}"));
+            if Listener::new(label).is_none_or(|l| l.is_default()) {
+                return Err(error(&format!(
+                    "a label is 1 to {MAX_LISTENER_LABEL} letters, digits, '.', '_' or '-', and not {DEFAULT_LISTENER:?}, whose settings are the policy's top level"
+                )));
+            }
+            if !entry.oidc && entry.unproven.is_none() {
+                return Err(error("registers nothing; give it oidc: true or unproven"));
+            }
+            if entry.oidc && !proves {
+                return Err(error(
+                    "oidc: true, but the policy has no entry that admits a token",
+                ));
+            }
         }
         // Beside only the entries that have events of their own, a reader
         // would take these for a limit on them, which they are not.
@@ -653,14 +739,32 @@ impl Registrar {
             ttl: Duration::from_secs(file.max_secs),
             concurrency: file.concurrency,
         };
-        let unproven = file
-            .unproven
-            .map(|unproven| unproven.quota(limits.ttl))
-            .transpose()
+        // Every listener's quota, this one's or not: together they must
+        // fit what the registry remembers.
+        let quotas = iter::once((DEFAULT_LISTENER, &file.unproven))
+            .chain(
+                file.listeners
+                    .iter()
+                    .map(|(label, entry)| (label.as_str(), &entry.unproven)),
+            )
+            .filter_map(|(label, unproven)| Some((label, unproven.as_ref()?)))
+            .map(|(label, unproven)| Ok((label, unproven.quota()?)))
+            .collect::<Result<HashMap<_, _>, String>>()
             .map_err(|e| path_error(&e))?;
+        check_quotas(quotas.values(), limits.ttl).map_err(|e| path_error(&e))?;
+        let (accepts_oidc, unproven) = match file.listeners.get(listener.as_str()) {
+            _ if listener.is_default() => (proves, quotas.get(DEFAULT_LISTENER).copied()),
+            Some(entry) => (entry.oidc, quotas.get(listener.as_str()).copied()),
+            None => {
+                return Err(path_error(&format!(
+                    "listener \"{listener}\" is not in the policy's listeners"
+                )));
+            }
+        };
         if let Some(quota) = unproven {
             warn!(
                 policy_file = %path.display(),
+                %listener,
                 max_registrations = quota.max,
                 window_secs = quota.window.as_secs(),
                 "runs register WITHOUT PROOF: any client that reaches the listener can use the broker's credentials"
@@ -689,7 +793,7 @@ impl Registrar {
             .build()
             .map_err(|e| format!("{FILTER_NAME}: HTTP client: {e}"))?;
         Ok(Some(Self {
-            oidc: proves.then(|| GithubOidc::new(client, file.jwks_url, policy)),
+            oidc: accepts_oidc.then(|| GithubOidc::new(client, file.jwks_url, policy)),
             unproven,
             limits,
         }))
@@ -940,9 +1044,16 @@ impl HttpFilter for RunTokenFilter {
             }
             match metered.caller {
                 Some(Caller::Run(admission)) => {
-                    if admission.is_unproven() && !admission.usage_free {
-                        self.usage
-                            .settle_unproven(reported.as_ref(), metered.success);
+                    if !admission.usage_free {
+                        if admission.is_unproven() {
+                            self.usage
+                                .settle_unproven(reported.as_ref(), metered.success);
+                        }
+                        self.usage.settle_listener(
+                            admission.listener(),
+                            reported.as_ref(),
+                            metered.success,
+                        );
                     }
                     admission.settle(reported);
                 }
@@ -1201,10 +1312,14 @@ mod tests {
             if let Some(contents) = contents {
                 std::fs::write(&path, contents).unwrap();
             }
-            let loaded = Registrar::load(&path).map(|r| r.is_some()).map_err(|_| ());
+            let loaded = Registrar::load(&path, &Listener::default())
+                .map(|r| r.is_some())
+                .map_err(|_| ());
             assert_eq!(loaded, expected, "{name}");
         }
-        let registrar = Registrar::load(&dir.path().join("valid")).unwrap().unwrap();
+        let registrar = Registrar::load(&dir.path().join("valid"), &Listener::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             registrar.limits,
             Limits {
@@ -1228,11 +1343,145 @@ mod tests {
             ("any workflow of an owner", true, None),
             ("a called workflow and unproven", true, Some(hour(8))),
         ] {
-            let registrar = Registrar::load(&dir.path().join(name)).unwrap().unwrap();
+            let registrar = Registrar::load(&dir.path().join(name), &Listener::default())
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 (registrar.oidc.is_some(), registrar.unproven),
                 (proves, unproven),
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_listener_takes_its_own_entry_of_the_policy() {
+        praxis_ai::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let proving = r#""workflows": ["w"], "owner_ids": [7]"#;
+        let hour = |max| Quota {
+            max,
+            window: Duration::from_secs(DEFAULT_UNPROVEN_WINDOW_SECS),
+        };
+        // (policy, listener, verifies OIDC tokens and its quota, or refused)
+        let cases = [
+            // Only the dedicated listener registers without proof.
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{"unproven": {{"max_registrations": 8}}}}}}}}"#),
+                "default",
+                Some((true, None)),
+            ),
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{"unproven": {{"max_registrations": 8}}}}}}}}"#),
+                "runners",
+                Some((false, Some(hour(8)))),
+            ),
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{"oidc": true}}}}}}"#),
+                "runners",
+                Some((true, None)),
+            ),
+            // Its own quota, beside the default listener's.
+            (
+                format!(r#"{{{proving}, "unproven": {{"max_registrations": 4}}, "listeners": {{"runners": {{"oidc": true, "unproven": {{"max_registrations": 2}}}}}}}}"#),
+                "runners",
+                Some((true, Some(hour(2)))),
+            ),
+            (
+                format!(r#"{{{proving}, "unproven": {{"max_registrations": 4}}, "listeners": {{"runners": {{"unproven": {{"max_registrations": 2}}}}}}}}"#),
+                "default",
+                Some((true, Some(hour(4)))),
+            ),
+            // No proving entry: only the dedicated listener registers.
+            (
+                r#"{"listeners": {"runners": {"unproven": {"max_registrations": 8}}}}"#.to_owned(),
+                "default",
+                Some((false, None)),
+            ),
+            // A chain whose label the policy does not name.
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{"oidc": true}}}}}}"#),
+                "other",
+                None,
+            ),
+            (format!("{{{proving}}}"), "runners", None),
+            // Entries that register nothing, or prove what nothing admits.
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{}}}}}}"#),
+                "default",
+                None,
+            ),
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{"oidc": false}}}}}}"#),
+                "default",
+                None,
+            ),
+            (
+                r#"{"listeners": {"a": {"unproven": {"max_registrations": 8}}, "b": {"oidc": true}}}"#
+                    .to_owned(),
+                "a",
+                None,
+            ),
+            // The default listener is the top level, and labels are plain.
+            (
+                format!(r#"{{{proving}, "listeners": {{"default": {{"oidc": true}}}}}}"#),
+                "default",
+                None,
+            ),
+            (
+                format!(r#"{{{proving}, "listeners": {{"a b": {{"oidc": true}}}}}}"#),
+                "default",
+                None,
+            ),
+            (
+                format!(r#"{{{proving}, "listeners": {{"runners": {{"oidc": true, "admits": ["default"]}}}}}}"#),
+                "runners",
+                None,
+            ),
+            // Every listener's quota counts against the one ceiling, in
+            // each chain's view: 17 and 17 an hour fit, 17 and 18 do not.
+            (
+                r#"{"unproven": {"max_registrations": 17}, "listeners": {"runners": {"unproven": {"max_registrations": 17}}}}"#
+                    .to_owned(),
+                "default",
+                Some((false, Some(hour(17)))),
+            ),
+            (
+                r#"{"unproven": {"max_registrations": 17}, "listeners": {"runners": {"unproven": {"max_registrations": 18}}}}"#
+                    .to_owned(),
+                "default",
+                None,
+            ),
+            (
+                r#"{"listeners": {"a": {"unproven": {"max_registrations": 17}}, "b": {"unproven": {"max_registrations": 18}}}}"#
+                    .to_owned(),
+                "a",
+                None,
+            ),
+        ];
+        for (i, (policy, listener, expected)) in cases.into_iter().enumerate() {
+            let path = dir.path().join(i.to_string());
+            std::fs::write(&path, &policy).unwrap();
+            let listener = Listener::new(listener).unwrap();
+            let loaded = Registrar::load(&path, &listener)
+                .ok()
+                .flatten()
+                .map(|r| (r.oidc.is_some(), r.unproven));
+            assert_eq!(loaded, expected, "{listener}: {policy}");
+        }
+    }
+
+    #[test]
+    fn a_chains_listener_label_is_plain() {
+        for (label, ok) in [("runners", true), ("a b", false), ("", false)] {
+            let config = serde_yaml::from_str(&format!(
+                "{{credentials: {{a: injected}}, listener: {label:?}}}"
+            ))
+            .unwrap();
+            assert_eq!(
+                RunTokenFilter::from_config(&config).is_ok(),
+                ok,
+                "{label:?}"
             );
         }
     }

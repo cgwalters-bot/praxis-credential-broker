@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use serde_yaml::Value as Yaml;
 use sha2::{Digest, Sha256};
 use std::{
+    rc::Rc,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -80,6 +81,8 @@ const CHAT_MODEL: &str = "zai-glm-5-3";
 /// whose every workflow it admits.
 const MAIN: &str = "refs/heads/main";
 const OTHER_OWNER_ID: u64 = 71;
+/// The label of the second listener `Harness::start_with_runners` serves.
+const RUNNERS: &str = "runners";
 
 /// What the fake upstreams received, in order.
 #[derive(Default)]
@@ -311,12 +314,14 @@ fn inline_broker_token(filter: &mut Yaml) {
     }
 }
 
+#[derive(Clone)]
 struct Harness {
     base: String,
+    /// Where the listener labeled `RUNNERS` is, if there is one.
+    runners: Option<String>,
     http: Client,
     upstream: Arc<Upstream>,
-    _policy: tempfile::TempDir,
-    _proxy: ProxyGuard,
+    _guards: Rc<(tempfile::TempDir, ProxyGuard)>,
 }
 
 /// The headers of a request.
@@ -379,6 +384,29 @@ impl Harness {
     /// there is one, a per-run cap of `RUN_MAX_TOKENS`, and `tweak` applied
     /// to each filter.
     async fn start_with(policy: Option<Value>, tweak: impl Fn(&mut Yaml)) -> Self {
+        Self::start_listeners(policy, false, tweak).await
+    }
+
+    /// `start_with` and a second listener labeled `RUNNERS`, whose chain is
+    /// praxis.yaml's but for its run_token's label, as INTERNALS.md says to
+    /// add one. Both share the registry.
+    async fn start_with_runners(policy: Value) -> Self {
+        Self::start_listeners(Some(policy), true, |_| {}).await
+    }
+
+    /// This harness, its requests sent to the `RUNNERS` listener.
+    fn runners(&self) -> Self {
+        Self {
+            base: self.runners.clone().expect("a harness with runners"),
+            ..self.clone()
+        }
+    }
+
+    async fn start_listeners(
+        policy: Option<Value>,
+        with_runners: bool,
+        tweak: impl Fn(&mut Yaml),
+    ) -> Self {
         let with_policy = policy.is_some();
         praxis_ai::install_crypto_provider();
         let _ = tracing_subscriber::fmt()
@@ -418,6 +446,28 @@ impl Harness {
         assert_eq!(listeners.len(), 1, "praxis.yaml has one listener");
         let address = format!("127.0.0.1:{}", free_port());
         listeners[0]["address"] = Yaml::from(address.clone());
+        let runners = with_runners.then(|| {
+            let listeners = config["listeners"].as_sequence_mut().unwrap();
+            let mut listener = listeners[0].clone();
+            let address = format!("127.0.0.1:{}", free_port());
+            let chain = format!("run-token-{RUNNERS}");
+            listener["name"] = Yaml::from(RUNNERS);
+            listener["address"] = Yaml::from(address.clone());
+            let chains = listener["filter_chains"].as_sequence_mut().unwrap();
+            let run_token = chains.iter_mut().find(|c| *c == "run-token").unwrap();
+            *run_token = Yaml::from(chain.clone());
+            listeners.push(listener);
+            let chains = config["filter_chains"].as_sequence_mut().unwrap();
+            let mut run_token = chains
+                .iter()
+                .find(|c| c["name"] == "run-token")
+                .unwrap()
+                .clone();
+            run_token["name"] = Yaml::from(chain);
+            run_token["filters"][0]["listener"] = Yaml::from(RUNNERS);
+            chains.push(run_token);
+            format!("http://{address}")
+        });
         for filter in filters_mut(&mut config) {
             if filter["filter"] == "load_balancer" {
                 for cluster in filter["clusters"].as_sequence_mut().unwrap() {
@@ -451,10 +501,10 @@ impl Harness {
                 .unwrap();
         Self {
             base: format!("http://{address}"),
+            runners,
             http: Client::new(),
             upstream,
-            _policy: dir,
-            _proxy: proxy,
+            _guards: Rc::new((dir, proxy)),
         }
     }
 
@@ -1624,7 +1674,11 @@ async fn without_the_setting_a_registration_without_a_token_is_refused_as_before
             let refused = h.register_with(headers).await;
             assert_eq!(refused, (status, body.to_owned()), "{headers:?}");
         }
-        assert!(h.broker_usage().await.get("unproven_runs").is_none());
+        let broker = h.broker_usage().await;
+        assert!(broker.get("unproven_runs").is_none());
+        // With the default listener only, there are no listeners to tell
+        // apart.
+        assert!(broker.get("listeners").is_none());
         if proves {
             // A proven run registers as ever, and its record says so.
             let (status, body) = h.register(&jwt(1, &json!({}))).await;
@@ -1633,6 +1687,7 @@ async fn without_the_setting_a_registration_without_a_token_is_refused_as_before
                 (&body["usage"]["proof"], &body["usage"]["run_id"]),
                 (&json!("github-oidc"), &json!(1))
             );
+            assert!(body["usage"].get("listener").is_none());
         }
         assert_eq!(h.upstream.calls(), 0);
     }
@@ -1864,6 +1919,165 @@ async fn a_policy_for_registration_without_proof_only_takes_no_oidc_token() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, _) = h.register_with(&[("x-run-id", "next")]).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// `proving_policy`, and the `RUNNERS` listener that registers runs
+/// without proof only, `max` of them an hour.
+fn runners_policy(max: u64) -> Value {
+    let mut policy = proving_policy();
+    policy["listeners"] = json!({RUNNERS: {"unproven": {"max_registrations": max}}});
+    policy
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dedicated_listener_registers_without_proof_and_its_runs_stay_on_it() {
+    let h = Harness::start_with_runners(runners_policy(2)).await;
+    let runners = h.runners();
+
+    // Only the listener that admits it registers without proof; the
+    // default one refuses it as if no listener did, and the dedicated one
+    // takes no OIDC token.
+    let refused = h.register_with(&[("x-run-id", "job-1")]).await;
+    assert_eq!(
+        refused,
+        (StatusCode::UNAUTHORIZED, "OIDC token required\n".to_owned())
+    );
+    let (status, _) = runners.register(&jwt(1, &json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let unproven = runners.unproven_run("job-1").await;
+    let proven = h.run(1).await;
+
+    // Each run is usable, and its record readable, only through the
+    // listener it registered on: through the other its token is unknown.
+    for (on, token, admitted) in [
+        (&runners, &unproven, true),
+        (&h, &unproven, false),
+        (&h, &proven, true),
+        (&runners, &proven, false),
+    ] {
+        let expected = if admitted {
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        let (status, body) = on.respond(Some(token), "", true).await;
+        assert_eq!(status, expected, "{body}");
+        let (status, _) = on.injected(Some(token)).await;
+        assert_eq!(status, expected);
+        let (status, _) = on.runs(Method::GET, "/v1/runs/self", token).await;
+        assert_eq!(status, expected);
+    }
+    let (status, _) = h.runs(Method::DELETE, "/v1/runs/self", &unproven).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.upstream.calls(), 4);
+
+    // The label is in the record of a run of the dedicated listener only,
+    // and /usage counts each listener's runs apart, read through either.
+    let record = runners.usage(&unproven).await;
+    assert_eq!(
+        (&record["proof"], &record["listener"], &record["requests"]),
+        (&json!("none"), &json!(RUNNERS), &json!(2))
+    );
+    assert!(h.usage(&proven).await.get("listener").is_none());
+    for on in [&h, &runners] {
+        let broker = on.broker_usage().await;
+        assert_eq!(
+            (
+                &broker["listeners"]["default"]["requests"],
+                &broker["listeners"][RUNNERS]["requests"],
+                &broker["listeners"][RUNNERS]["tokens"]["total"],
+            ),
+            (
+                &json!(2),
+                &json!(2),
+                &json!(RESPONSES_TOTAL + MESSAGES_TOTAL)
+            )
+        );
+        assert_eq!(broker["unproven_runs"]["registered"], 1);
+    }
+
+    // Its own quota: the second registration is its last for now.
+    runners.unproven_run("job-2").await;
+    let (status, _) = runners.register_with(&[("x-run-id", "job-3")]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // Finished through its own listener, as ever.
+    let (status, finished) = runners
+        .runs(Method::DELETE, "/v1/runs/self", &unproven)
+        .await;
+    assert_eq!(
+        (status, &finished["state"]),
+        (StatusCode::OK, &json!("finished"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_proving_entry_only_the_dedicated_listener_registers() {
+    let policy = json!({"listeners": {RUNNERS: {"unproven": {"max_registrations": 1}}}});
+    let h = Harness::start_with_runners(policy).await;
+    for headers in [
+        &[("x-run-id", "job-1")][..],
+        &[("authorization", "Bearer a.b.c")],
+    ] {
+        let (status, _) = h.register_with(headers).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}");
+    }
+    let token = h.runners().unproven_run("job-1").await;
+    let (status, body) = h.runners().respond(Some(&token), "", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_listener_counts_its_own_quota_and_names_are_taken_on_all() {
+    let mut policy = unproven_policy(1);
+    policy["listeners"] = json!({RUNNERS: {"oidc": true, "unproven": {"max_registrations": 1}}});
+    let h = Harness::start_with_runners(policy).await;
+    let runners = h.runners();
+    h.unproven_run("a").await;
+    // A name the default listener took is taken on the other too, and
+    // that refusal uses none of its quota.
+    let (status, _) = runners.register_with(&[("x-run-id", "a")]).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    runners.unproven_run("b").await;
+    for (on, name) in [(&h, "c"), (&runners, "d")] {
+        let (status, body) = on.register_with(&[("x-run-id", name)]).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many unproven registrations\n"
+            ),
+            "{name}"
+        );
+    }
+    let broker = h.broker_usage().await;
+    assert_eq!(
+        (
+            &broker["unproven_runs"]["registered"],
+            &broker["unproven_runs"]["refused"]
+        ),
+        (&json!(2), &json!(2))
+    );
+
+    // Both take OIDC tokens here, but a proven run's retry for a lost
+    // reply must come through the listener it registered on.
+    let jwt = jwt(1, &json!({}));
+    let (status, _) = runners.register(&jwt).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let bearer = format!("Bearer {jwt}");
+    let refused = h.register_with(&[("authorization", &bearer)]).await;
+    assert_eq!(
+        refused,
+        (
+            StatusCode::CONFLICT,
+            "run registered through another listener\n".to_owned()
+        )
+    );
+    let (status, body) = runners.register(&jwt).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        (&body["usage"]["proof"], &body["usage"]["listener"]),
+        (&json!("github-oidc"), &json!(RUNNERS))
+    );
 }
 
 /// Every token the committed kind of policy refuses, by what it says beyond

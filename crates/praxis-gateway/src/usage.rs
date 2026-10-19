@@ -1,5 +1,5 @@
 //! Bounded broker totals and latest subscription-window response headers.
-use crate::runs::{Tokens, Usage};
+use crate::runs::{DEFAULT_LISTENER, Listener, Tokens, Usage};
 use http::HeaderMap;
 use serde::Serialize;
 use std::{
@@ -116,6 +116,16 @@ pub(crate) struct Snapshot {
     /// admits them. Its provider's `counts` include it.
     #[serde(skip_serializing_if = "Option::is_none")]
     unproven_runs: Option<UnprovenRuns>,
+    /// What the runs of each listener used, by its label, once the
+    /// deployment has a listener other than the default one. Their
+    /// provider's `counts` include them.
+    #[serde(skip_serializing_if = "only_default")]
+    listeners: BTreeMap<String, Counts>,
+}
+
+/// A deployment with only the default listener has nothing to tell apart.
+fn only_default(listeners: &BTreeMap<String, Counts>) -> bool {
+    listeners.keys().all(|label| label == DEFAULT_LISTENER)
 }
 
 impl Default for Snapshot {
@@ -128,6 +138,7 @@ impl Default for Snapshot {
             mistral: Mistral::default(),
             operators: BTreeMap::new(),
             unproven_runs: None,
+            listeners: BTreeMap::new(),
         }
     }
 }
@@ -137,13 +148,16 @@ pub(crate) struct BrokerUsage(Mutex<Snapshot>);
 
 // Like the run registry, configuration reloads retain the named state. Each
 // registry has exactly three counters and four window slots, a counter per
-// operator a tokens file named and one for all runs registered without
-// proof, never per-client keys.
+// operator a tokens file named, one for all runs registered without proof
+// and one per listener label the configuration named, never per-client
+// keys.
 static REGISTRIES: LazyLock<Mutex<HashMap<String, Arc<BrokerUsage>>>> =
     LazyLock::new(Mutex::default);
 
 /// Operators a snapshot lists: those of a few generations of tokens file.
 const MAX_LISTED_OPERATORS: usize = 4 * crate::operators::MAX_OPERATORS;
+/// Listeners a snapshot lists, across reloads that rename them.
+const MAX_LISTED_LISTENERS: usize = 16;
 
 fn unix_time() -> u64 {
     SystemTime::now()
@@ -226,6 +240,39 @@ impl BrokerUsage {
             &mut runs.refused
         };
         *count = count.saturating_add(1);
+    }
+
+    /// List `listener` in the snapshot, at zero until its runs use
+    /// something. Like operators, one a reload drops stays listed until a
+    /// restart, within `MAX_LISTED_LISTENERS`.
+    pub(crate) fn declare_listener(&self, listener: &Listener) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.listeners.contains_key(listener.as_str()) {
+            return;
+        }
+        if state.listeners.len() >= MAX_LISTED_LISTENERS {
+            warn!(
+                %listener,
+                "too many listeners since the gateway started; this one's usage is not counted by label"
+            );
+            return;
+        }
+        state
+            .listeners
+            .insert(listener.as_str().to_owned(), Counts::default());
+    }
+
+    /// Count a response to a request of a run of a declared listener.
+    pub(crate) fn settle_listener(
+        &self,
+        listener: &Listener,
+        usage: Option<&Usage>,
+        success: bool,
+    ) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(counts) = state.listeners.get_mut(listener.as_str()) {
+            counts.settle(usage, success);
+        }
     }
 
     /// Count a response to a request of a run registered without proof.
@@ -559,6 +606,43 @@ mod tests {
             })
         );
         assert_eq!(snapshot["codex"]["counts"]["requests"], 0);
+    }
+
+    #[test]
+    fn listeners_are_listed_only_beside_another_than_the_default() {
+        let usage = BrokerUsage::default();
+        let reported = Usage {
+            tokens: Tokens {
+                total: 5,
+                ..Tokens::default()
+            },
+            model: None,
+        };
+        let [default, runners, undeclared] =
+            ["default", "runners", "undeclared"].map(|label| Listener::new(label).unwrap());
+        usage.declare_listener(&default);
+        usage.settle_listener(&default, Some(&reported), true);
+        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        assert!(snapshot.get("listeners").is_none());
+        usage.declare_listener(&runners);
+        usage.settle_listener(&runners, Some(&reported), true);
+        usage.settle_listener(&runners, None, true);
+        // A label no chain declared is not counted under it.
+        usage.settle_listener(&undeclared, Some(&reported), true);
+        // Declaring again, as a reload does, keeps the counts.
+        usage.declare_listener(&runners);
+        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        let counts = |requests, unmetered, total| {
+            serde_json::json!({
+                "requests": requests,
+                "unmetered": unmetered,
+                "tokens": {"input": 0, "cache_read": 0, "output": 0, "reasoning": 0, "total": total},
+            })
+        };
+        assert_eq!(
+            snapshot["listeners"],
+            serde_json::json!({"default": counts(1, 0, 5), "runners": counts(1, 1, 5)})
+        );
     }
 
     #[test]
