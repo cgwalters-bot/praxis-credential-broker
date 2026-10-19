@@ -1025,9 +1025,9 @@ user bus.
 Xenon, the operator's broker host, runs these units with two drop-ins: the
 tailnet one above for its address `100.121.0.115`, and the run registration
 policy, which has no `unproven`: runs register there by OIDC token only.
-Tailnet clients use its MagicDNS name, `xenon.tailf2eb8.ts.net`, on
-port 18080: `http://xenon.tailf2eb8.ts.net:18080/v1` for Codex and
-`http://xenon.tailf2eb8.ts.net:18080/anthropic` for Claude Code. It used to
+Tailnet clients use its MagicDNS name, `<host>.<tailnet>.ts.net`, on
+port 18080: `http://<host>.<tailnet>.ts.net:18080/v1` for Codex and
+`http://<host>.<tailnet>.ts.net:18080/anthropic` for Claude Code. It used to
 also publish a pass-through Claude listener on port 18083, from a
 `praxis.yaml` bind-mounted out of a checkout, and an injecting gateway on
 18090 from a pod started by hand; both are replaced by the `/anthropic`
