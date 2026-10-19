@@ -646,17 +646,50 @@ register runs, such as a Forgejo instance, each with rules of its own:
 ```yaml
 issuers:
   - name: forge                     # names its runs; lowercase, digits, `-`
-    issuer: https://forge.example/api/actions       # the `iss` claim, exactly
-    jwks_url: https://forge.example/api/actions/.well-known/keys
+    issuer: ISS                     # the `iss` claim, copied from a token
+    jwks_url: ISS/.well-known/keys
     claims: forgejo                 # or github
-    workflows:
-      - OWNER/REPO/.forgejo/workflows/FILE.yml@refs/heads/main
-    repository_ids: [1]
-    # owner_ids, events, any_workflow: as at the top level
+    any_workflow:
+      repositories:
+        repository_ids: [REPOSITORY_ID]   # `repository_id`, from a token
+        # owner_ids: [REPOSITORY_OWNER_ID]  # `repository_owner_id`
+      events: [workflow_dispatch]
+    # workflows, with repository_ids, owner_ids and events narrowing it
+    # only: as at the top level
     # audience: praxis-credential-broker
     # max_token_age_secs: 300
     # allow_http: true              # only for an http:// issuer; see below
 ```
+
+Take `ISS`, `REPOSITORY_ID` and `REPOSITORY_OWNER_ID` from a token the
+forge actually issued rather than writing them from what they should be.
+For Forgejo `iss` is exactly `<ROOT_URL>/api/actions`: the instance's
+configured `ROOT_URL` (which normally ends in `/`, written once) followed
+by `api/actions`. That need not be the URL its users type, and a
+different scheme, port or slash is a different issuer, and the
+token gets 401 as `issuer=unknown` (see the `run registration refused` log
+line [above](#registering-a-run)). A step of the job can print the claims
+and nothing else; asking for an audience the gateway does not accept keeps
+the token itself useless to it:
+
+```sh
+curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=claims-check" | jq -r .value |
+  jq -R 'split(".")[1] | gsub("-"; "+") | gsub("_"; "/") | @base64d | fromjson
+         | {iss, repository_id, repository_owner_id, workflow_ref}'
+```
+
+`any_workflow` pinned to `repository_ids` (or `owner_ids`) is the
+recommended shape for a Forgejo entry. A `workflows` entry is matched
+against the exact text of `workflow_ref`, which spells out the owner and
+repository names, so renaming or transferring the repository silently
+stops its runs from registering: the token is verified and refused as
+`not_allowed`, nothing at startup fails. The ids survive a rename. What
+`any_workflow` gives up is the pin on the workflow file and its ref:
+whoever can push a branch with a workflow to the admitted repository can
+register runs from it, so admit only repositories whose writers may spend
+the broker's credentials, and keep `events` to those that need write
+access.
 
 A token is first read, unverified, for the issuer it claims. That only
 chooses an entry: the token is then verified with that entry's key set
@@ -730,8 +763,30 @@ never admit a forge's token, nor a forge's entry one of GitHub's.
 A Forgejo job gets a token only if its workflow sets
 `enable-openid-connect: true` and its runner is v12.5.0 or later; it asks
 as a GitHub job does, with `ACTIONS_ID_TOKEN_REQUEST_URL` and
-`ACTIONS_ID_TOKEN_REQUEST_TOKEN` and `&audience=`. Ids for the rules:
-`GET /api/v1/repos/OWNER/REPO` has `id` and `owner.id`.
+`ACTIONS_ID_TOKEN_REQUEST_TOKEN` and `&audience=`. The ids are also in
+`GET /api/v1/repos/OWNER/REPO` as `id` and `owner.id`, but a captured token
+shows what the gateway will actually compare.
+
+Operating an entry:
+
+- **Ids restart on a rebuilt instance.** A Forgejo instance numbers
+  repositories and owners from 1. Rebuilt from scratch at the same
+  `ROOT_URL`, it has the same `iss` and new keys, and its first
+  repositories get the low ids again, whoever creates them: the entry
+  then admits those. Update the ids from a fresh token whenever an
+  instance is recreated rather than restored, and before it serves jobs.
+- **All issuers share the registration slots.** At most four
+  registrations are verified at once, whatever their issuer. A key fetch
+  happens under that issuer's key cache lock and takes up to its 5 second
+  timeout when the forge does not answer, and tokens claiming that issuer
+  wait on the lock with a slot held. So while a forge is unreachable,
+  tokens that claim it (anyone can write one) can briefly hold every slot
+  and GitHub registrations get 429, for up to the timeout about once a
+  minute (a failed fetch is retried at most once a minute). Retry 429s.
+- **`events: [issues]`** (or `issue_comment`, or leaving `events` out)
+  lets anyone who can open an issue or comment on the admitted repository
+  start a run that spends credits, which on a forge with open sign-up is
+  anyone. Prefer `workflow_dispatch`, which needs write access.
 
 The gateway logs a warning for each entry as it starts, with its issuer,
 key set URL and whether it allows plaintext. Turning an entry on

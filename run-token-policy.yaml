@@ -67,21 +67,34 @@ repository_ids: [0]
 # issuers:
 #     # Names the issuer's runs in subjects, records and logs.
 #   - name: forge
-#     # The `iss` claim, exactly. For Forgejo, its ROOT_URL and /api/actions.
-#     issuer: https://forge.example/api/actions
-#     jwks_url: https://forge.example/api/actions/.well-known/keys
+#     # The `iss` claim, exactly: copy it from a token the issuer wrote, as
+#     # "Other issuers" in INTERNALS.md shows. Forgejo's is its ROOT_URL
+#     # followed by api/actions; a differing scheme, port or slash is
+#     # refused.
+#     issuer: ISS
+#     jwks_url: ISS/.well-known/keys
 #     # Required. `forgejo`: no job_workflow_ref, so `workflows` are exact
 #     # workflow_ref claims; no jti, so a run registers once with no retry.
 #     # `github`: GitHub's claims, for a GitHub Enterprise Server.
 #     claims: forgejo
-#     workflows:
-#       - "example-owner/example-repo/.forgejo/workflows/agent.yml@refs/heads/main"
-#     repository_ids: [0]
-#     # Optional, with these defaults:
+#     # Recommended for Forgejo: every workflow of repositories pinned by
+#     # the `repository_id` (or `repository_owner_id`) claim, copied from a
+#     # token too. A `workflows` entry matches the exact workflow_ref text,
+#     # owner and repository names included, so a rename silently stops
+#     # registration; the ids survive it.
+#     any_workflow:
+#       repositories:
+#         repository_ids: [0]
+#         # owner_ids: [0]
+#       events: [workflow_dispatch]
+#     # Optional, as at the top level, for this issuer's tokens. As there,
+#     # repository_ids, owner_ids and events narrow `workflows` only, and
+#     # are refused without it; any_workflow has its own `events` above.
+#     # workflows: ["OWNER/REPO/.forgejo/workflows/FILE.yml@refs/heads/main"]
+#     # repository_ids: [0]
 #     # owner_ids: []
 #     # events: [workflow_dispatch]
 #     # audience: praxis-credential-broker
-#     # any_workflow: as above, for this issuer's repositories
 #     # A token issued longer ago is refused whatever its expiry; at most 3600.
 #     # max_token_age_secs: 300
 #     # Needed for an http:// issuer or jwks_url, and off by default: over

@@ -209,7 +209,7 @@ impl Repositories {
                 "{field}: `any: true` admits every repository; remove it or the ids"
             )),
             (false, false) => Err(format!(
-                "{field} needs owner_ids or repository_ids, or `any: true` for every repository on GitHub"
+                "{field} needs owner_ids or repository_ids, or `any: true` for every repository of the issuer"
             )),
             _ => Ok(()),
         }
