@@ -14,9 +14,10 @@ workflow called from elsewhere rather than one by one, and a token that
 registers a run no entry of the policy admits is a vulnerability. A
 deployment can opt in, with
 `unproven` in its registration policy, to registering runs without that
-proof, for whatever reaches the listener; it is off unless the policy says
-so, and a run that registers without proof under a policy that lacks it is
-a vulnerability. Other Claude
+proof, for whatever reaches the listener, or a listener of its own under
+`listeners`; it is off unless the policy says so, and a run that registers
+without proof under a policy that lacks it, or a run admitted through a
+listener of another label than its own, is a vulnerability. Other Claude
 requests are passed through with the caller's own credential, which the
 broker forwards and never stores. Read
 [INTERNALS.md](INTERNALS.md#credential-modes) and its risks before

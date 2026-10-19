@@ -1,4 +1,4 @@
-# The broker's one Praxis listener. credential-proxy, which adds the Codex
+# The broker's Praxis listener. credential-proxy, which adds the Codex
 # credential, is pod-local 127.0.0.1:8080; Praxis listens on 8081 so the two
 # processes do not collide in the pod netns. Routes, by raw request path:
 #
@@ -42,8 +42,21 @@
 # acts on one route has to be conditioned on that same raw path, and on the
 # placeholder when it acts on one credential mode only.
 #
-# The chain is in three parts, so that another listener can share all of
-# it but run_token.
+# The chain is in three parts so that another listener can share all but
+# its run_token, whose `listener` label decides how runs register through it
+# and which runs it admits (see "Registering a run without proof" in
+# INTERNALS.md). Praxis builds each listener's filters apart, so such a
+# listener also has caps of its own, the providers' window caps included.
+# For example, with `listeners: {runners: ...}` in the policy file:
+#
+#   listeners:
+#     - name: runners
+#       address: "ADDRESS:8082"
+#       filter_chains: [gateway, run-token-runners, gateway-upstream]
+#   filter_chains:
+#     - name: run-token-runners
+#       filters:
+#         - <the run-token chain's run_token, with `listener: runners`>
 listeners:
   - name: ai-gateway
     address: "0.0.0.0:8081"
@@ -186,7 +199,9 @@ filter_chains:
         usage_free_paths: ["/anthropic/v1/messages/count_tokens"]
         # Which jobs may register runs is the deployment's file, and so is
         # whether a run may register without proof (its `unproven`, off
-        # unless the file has it).
+        # unless the file has it). This chain is the policy's default
+        # listener; another listener's chain names its label here, as in
+        # `listener: runners`, and admits only the runs registered through it.
         registration:
           policy_file: /etc/praxis-credential-broker/run-token-policy.yaml
         # Long-lived tokens for people; none unless the deployment mounts

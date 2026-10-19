@@ -73,3 +73,18 @@ repository_ids: [0]
 #   max_registrations: 8
 #   # The window, in seconds.
 #   # window_secs: 3600
+#
+# OFF unless present: how runs register through listeners other than the
+# default one, which the top level above configures. Each key is the label
+# a chain's run_token filter gives in praxis.yaml (`listener: runners`); a
+# run is usable only through chains of the label it registered under. An
+# entry takes `oidc: true`, `unproven` or both, with a quota of its own.
+# Reachability of that listener is then the whole gate: the network policy
+# in front of it is part of the trust boundary. Read "On a listener of its
+# own" in INTERNALS.md before uncommenting it.
+# listeners:
+#   runners:
+#     unproven:
+#       max_registrations: 8
+#       # window_secs: 3600
+#     # oidc: true

@@ -714,6 +714,95 @@ in every `request usage` log line and cap key is `github-run:...` or
 registered` with the client's address, a usage record has `proof`, and
 `GET /usage` counts the runs without proof together under `unproven_runs`.
 
+#### On a listener of its own
+
+Rather than open the broker's one listener, registration without proof can
+be turned on for a dedicated listener only, one whose reachability already
+says who the caller is: an address that only the job runners' network
+reaches, through an in-cluster NetworkPolicy or a tailnet ACL that only
+those runners match. The default listener then keeps exactly the behaviour
+above, without `unproven`.
+
+Each chain's `run_token` filter has a `listener` label, `default` unless
+it says otherwise, and the policy file says how runs register through each
+other label:
+
+```yaml
+# run-token-policy.yaml: the top level is the default listener's, as ever
+workflows: [...]
+repository_ids: [...]
+listeners:
+  runners:
+    unproven:
+      max_registrations: 8   # this listener's own quota
+      # window_secs: 3600
+    # oidc: true             # also verify OIDC tokens here; off unless set
+```
+
+```yaml
+# praxis.yaml: a listener that shares every filter but its run_token
+listeners:
+  - name: runners
+    address: "ADDRESS:8082"
+    filter_chains: [gateway, run-token-runners, gateway-upstream]
+filter_chains:
+  - name: run-token-runners
+    filters:
+      - filter: run_token
+        listener: runners
+        # ...the rest as in the run-token chain, but without `operators`:
+        # a dedicated runner listener should accept run tokens only, not
+        # the operators' long-lived tokens
+```
+
+An entry takes `oidc: true`, `unproven` or both, and a chain whose label
+has no entry refuses to start, as does an entry that registers nothing.
+`default` is not an entry: its settings stay the top level's, so a policy
+can leave out top-level `unproven` and turn it on for `runners` alone. Then
+a registration without a token on the default listener gets 401 as above,
+and one on `runners` is a registration without proof with everything this
+section says of it, except:
+
+- **Reachability is the whole gate on that listener.** Anything that can
+  open a connection to its address can register runs and spend the broker's
+  credentials, so the network policy in front of it is part of the trust
+  boundary, and changing it is as much a change to who may use the broker
+  as editing this file. Keep it narrower than the default listener's.
+- **Runs stay on the listener they registered on.** A run's token is
+  unknown through a listener of another label, for injected requests and
+  `/v1/runs/self` alike (401), so a token that leaks from a runner's network
+  is useless from the tailnet's listener and the other way round. A run
+  name is still taken on every listener at once (409), and a proven run's
+  retry for a lost reply must come through its own listener (409 otherwise).
+- **Each listener's quota is its own.** Registrations on `runners` count
+  against its `max_registrations` only, and the default listener's against
+  the top level's. The 1024 runs registered without proof that the registry
+  remembers are one ceiling for all listeners together, and the gateway
+  refuses to start with quotas that could add up to more (so with the
+  defaults at most 34 an hour across all of them). That check reads one
+  policy file, so give every chain of a registry the same one. A label's
+  quota lives in the registry, not the chain, so a reload does not refill
+  it. `unproven_runs` in `/usage` still counts registrations and refusals
+  of all listeners together; the log lines say which listener each was.
+- **Each listener has caps of its own.** Praxis builds each listener's
+  filters apart, so the `token_rate_limit` rules on `runners` count
+  separately from the default listener's: a run's cap is unaffected, since
+  a run is used through one listener only, but each provider's window cap is
+  per listener, and two listeners together can spend up to twice it. Lower
+  the window capacities of one or both if the sum matters. For the same
+  reason give each listener a label of its own; two chains of one label
+  would each cap the same runs.
+
+Each registration is logged with its `listener` and its `mode` (`oidc` or
+`unproven`), never its token. A usage record of a run that registered
+through another listener than the default one has `listener`, and
+`GET /usage` counts each listener's runs apart under `listeners` once
+there is more than the default one.
+
+To turn it on, add the entry to the policy file, the listener and its
+chain to `praxis.yaml`, and the network policy in front of the new address,
+then restart the gateway; none of it is in the shipped files.
+
 ### Who holds what
 
 The run token is for the agent; the OIDC credentials must stay with the
@@ -796,7 +885,9 @@ workflow ref, as the token's claims gave them, with `workflow_sha`
 (`job_workflow_sha`), `entry_workflow_ref` (`workflow_ref`, the caller of a
 reusable workflow), `repository_owner_id`, `event_name`, `actor` and
 `admitted_by`, the policy entry that admitted it; for `none` only `run`,
-the name the caller chose), `state` (`active`, `finished` or `expired`), Unix
+the name the caller chose), `listener` if the run registered through
+[a listener of its own](#on-a-listener-of-its-own) (absent for the default
+one), `state` (`active`, `finished` or `expired`), Unix
 times registered, expiring and finished, the number of metered `requests`
 and of `unmetered` ones (successful responses whose usage never arrived,
 as when the client left mid-stream; the cap keeps their reservation),
@@ -833,7 +924,10 @@ tokens file names, by its name, from zero; a provider's counts include them.
 [registration without proof](#registering-a-run-without-proof): the same
 counts for all such runs together, which a provider's counts include too,
 with `registered`, the registrations admitted, and `refused`, those over
-the quota. Counts use the same `reported_usage` from `token_count` as
+the quota. `listeners` is there only once a chain has a
+[listener label](#on-a-listener-of-its-own) other than `default`: each
+label's runs' counts, `default` included, which a provider's counts include
+too. Counts use the same `reported_usage` from `token_count` as
 run records, for injected inference only. Pass-through, health checks, local
 endpoints and `count_tokens` do not contribute. Incomplete/disconnected responses
 are not settled here; these are observed totals, not rate-limit reservations.
