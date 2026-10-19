@@ -41,10 +41,13 @@
 # match the raw request path: Praxis does not normalize it. A filter that
 # acts on one route has to be conditioned on that same raw path, and on the
 # placeholder when it acts on one credential mode only.
+#
+# The chain is in three parts, so that another listener can share all of
+# it but run_token.
 listeners:
   - name: ai-gateway
     address: "0.0.0.0:8081"
-    filter_chains: [gateway]
+    filter_chains: [gateway, run-token, gateway-upstream]
 filter_chains:
   - name: gateway
     filters:
@@ -164,6 +167,8 @@ filter_chains:
             cluster: anthropic-pass-through
           - path: "/mistral/v1/chat/completions"
             cluster: mistral
+  - name: run-token
+    filters:
       # 4. Run tokens and credential modes, by the cluster the router chose.
       #    It answers /v1/runs itself, refuses a request with more than one
       #    Authorization header (the router matches any of them, conditions
@@ -194,6 +199,8 @@ filter_chains:
           anthropic-pass-through: pass-through
           # The run token is the request's bearer token, as on Responses.
           mistral: injected
+  - name: gateway-upstream
+    filters:
       # 5. Each run's cap. Response filters run in reverse order, so every
       #    token_rate_limit comes before the token_count whose counts it
       #    reconciles with, and run_token before them all. An instance
