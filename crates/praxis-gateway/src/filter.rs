@@ -42,7 +42,7 @@
 use crate::{
     oidc::{
         AnyWorkflow, CalledWorkflow, ClaimSet, DEFAULT_AUDIENCE, DEFAULT_MAX_TOKEN_AGE_SECS,
-        GITHUB_JWKS, GITHUB_NAME, Oidc, OidcError, Policy, TrustedIssuer, present,
+        GITHUB_JWKS, GITHUB_NAME, Oidc, OidcError, Policy, TokenIssuer, TrustedIssuer, present,
     },
     operators::{self, Operators},
     runs::{
@@ -69,7 +69,7 @@ use std::{
     iter,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
     time::Instant,
 };
@@ -378,6 +378,99 @@ fn default_concurrency() -> usize {
     DEFAULT_CONCURRENCY
 }
 
+/// Refusals of one issuer and kind logged per [`REFUSAL_LOG_WINDOW`]; the
+/// rest are counted, and the count is logged with the next that is.
+const REFUSALS_LOGGED_PER_WINDOW: u32 = 5;
+const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// Why a registration that claimed proof was refused, as logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RefusalKind {
+    /// No issuer is trusted: the policy registers only without proof.
+    NoIssuers,
+    /// No bearer token in `Authorization`.
+    NoToken,
+    Malformed,
+    /// A bad signature, audience, issuer, age or validity period.
+    Invalid,
+    /// Verified, but no entry of its issuer's policy admits it.
+    NotAllowed,
+    AlreadyRegistered,
+}
+
+impl RefusalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoIssuers => "no_issuers",
+            Self::NoToken => "no_token",
+            Self::Malformed => "malformed",
+            Self::Invalid => "invalid",
+            Self::NotAllowed => "not_allowed",
+            Self::AlreadyRegistered => "already_registered",
+        }
+    }
+}
+
+/// Logs refused registrations, a few per issuer and kind in each window,
+/// so that a wrong `iss` can be told from a policy that admits nothing,
+/// and a flood of bad tokens does not flood the log. Every unknown issuer
+/// shares one budget, whatever `iss` it claims, so the keys are bounded by
+/// the policy's issuers, and a flood of one kind hides nothing of another
+/// kind or of another trusted issuer.
+#[derive(Default)]
+struct RefusalLog {
+    windows: Mutex<HashMap<(Option<String>, RefusalKind), RefusalWindow>>,
+}
+
+struct RefusalWindow {
+    started: Instant,
+    logged: u32,
+    /// Refusals not logged since the last that was.
+    suppressed: u64,
+}
+
+impl RefusalLog {
+    fn refused(&self, issuer: &TokenIssuer, kind: RefusalKind, now: Instant) {
+        let Some(suppressed) = self.admit(issuer, kind, now) else {
+            return;
+        };
+        info!(
+            issuer = issuer.name(),
+            // A str, so quoted: escaping alone leaves spaces, and with
+            // them `iss` could pass for more fields.
+            claimed_iss = issuer.claimed(),
+            kind = kind.as_str(),
+            suppressed,
+            "run registration refused"
+        );
+    }
+
+    /// Whether to log this refusal, and if so how many went unlogged
+    /// before it.
+    fn admit(&self, issuer: &TokenIssuer, kind: RefusalKind, now: Instant) -> Option<u64> {
+        let key = match issuer {
+            TokenIssuer::Known(name) => Some(name.clone()),
+            TokenIssuer::Unknown(_) => None,
+        };
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let window = windows.entry((key, kind)).or_insert(RefusalWindow {
+            started: now,
+            logged: 0,
+            suppressed: 0,
+        });
+        if now.saturating_duration_since(window.started) >= REFUSAL_LOG_WINDOW {
+            window.started = now;
+            window.logged = 0;
+        }
+        if window.logged >= REFUSALS_LOGGED_PER_WINDOW {
+            window.suppressed += 1;
+            return None;
+        }
+        window.logged += 1;
+        Some(std::mem::take(&mut window.suppressed))
+    }
+}
+
 /// Verifies registrations against the policy.
 struct Registrar {
     /// None if the policy admits no issuer's tokens: only `unproven`
@@ -386,6 +479,7 @@ struct Registrar {
     /// The quota of registrations without proof, if the policy admits them.
     unproven: Option<Quota>,
     limits: Limits,
+    refusals: RefusalLog,
 }
 
 /// The run endpoints of a chain.
@@ -613,27 +707,48 @@ impl RunTokenFilter {
         {
             return self.register_unproven(quota, registrar.limits, headers, client);
         }
+        let jwt = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        // Logged under the issuer the token claims, and nothing else of it.
+        let refused = |kind, status, message| {
+            let issuer = match (&registrar.oidc, jwt) {
+                (Some(oidc), Some(jwt)) => oidc.issuer_of(jwt),
+                (None, Some(jwt)) => TokenIssuer::unknown(jwt),
+                (_, None) => TokenIssuer::Unknown(None),
+            };
+            registrar.refusals.refused(&issuer, kind, Instant::now());
+            reject(status, message)
+        };
         let Some(oidc) = &registrar.oidc else {
-            return reject(403, "workflow may not register runs\n");
+            return refused(
+                RefusalKind::NoIssuers,
+                403,
+                "workflow may not register runs\n",
+            );
         };
         let Ok(_permit) = oidc.registrations.try_acquire() else {
             return reject(429, "too many registrations\n");
         };
-        let Some(jwt) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
-            return reject(401, "OIDC token required\n");
+        let Some(jwt) = jwt else {
+            return refused(RefusalKind::NoToken, 401, "OIDC token required\n");
         };
         let identity = match oidc.verify(jwt).await {
             Ok(identity) => identity,
             Err(OidcError::Unavailable) => return reject(503, "OIDC keys unavailable\n"),
             Err(OidcError::WorkflowNotAllowed) => {
-                return reject(403, "workflow may not register runs\n");
+                return refused(
+                    RefusalKind::NotAllowed,
+                    403,
+                    "workflow may not register runs\n",
+                );
             }
-            Err(OidcError::Malformed | OidcError::Invalid) => {
-                return reject(401, "invalid OIDC token\n");
+            Err(OidcError::Malformed) => {
+                return refused(RefusalKind::Malformed, 401, "invalid OIDC token\n");
+            }
+            Err(OidcError::Invalid) => {
+                return refused(RefusalKind::Invalid, 401, "invalid OIDC token\n");
             }
         };
         match self
@@ -641,7 +756,11 @@ impl RunTokenFilter {
             .register(identity, registrar.limits, Instant::now())
         {
             Ok((token, usage)) => json(201, &serde_json::json!({ "token": token, "usage": usage })),
-            Err(RegisterError::AlreadyRegistered) => reject(409, "run already registered\n"),
+            Err(RegisterError::AlreadyRegistered) => refused(
+                RefusalKind::AlreadyRegistered,
+                409,
+                "run already registered\n",
+            ),
             Err(RegisterError::Full | RegisterError::OverQuota) => reject(503, "too many runs\n"),
         }
     }
@@ -812,6 +931,7 @@ impl Registrar {
             oidc,
             unproven,
             limits,
+            refusals: RefusalLog::default(),
         }))
     }
 }
@@ -1532,5 +1652,223 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A log sink a test can read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        /// The refusals logged since the last call.
+        fn lines(&self) -> Vec<String> {
+            let text = String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap();
+            text.lines()
+                .filter(|line| line.contains("run registration refused"))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    // Current-thread, so the subscriber set for this thread sees it all.
+    #[tokio::test]
+    async fn each_refused_registration_is_logged_without_the_token() {
+        use crate::oidc::testing::{REPOSITORY_ID, TEST_JWKS, WORKFLOW, jwt};
+        use serde_json::json;
+        praxis_ai::install_crypto_provider();
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let captured = captured.clone();
+                move || captured.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/jwks", axum::routing::get(|| async { TEST_JWKS }));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy");
+        let policy = json!({
+            "jwks_url": format!("http://{address}/jwks"),
+            "workflows": [WORKFLOW],
+            "repository_ids": [REPOSITORY_ID],
+        });
+        std::fs::write(&path, policy.to_string()).unwrap();
+        let registrar = Registrar::load(&path).unwrap().unwrap();
+        let registry = format!("test-{}", hex::encode(rand::random::<[u8; 8]>()));
+        let filter = RunTokenFilter {
+            runs: Runs::named(&registry),
+            usage: BrokerUsage::named(&registry),
+            token_headers: vec![header::AUTHORIZATION],
+            public_paths: HashSet::new(),
+            usage_free_paths: HashSet::new(),
+            credentials: HashMap::new(),
+            usage_cors_origins: HashSet::new(),
+            endpoints: RunEndpoints::Absent,
+            operators: Operators::default(),
+        };
+        let register = async |token: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                let value = format!("Bearer {token}");
+                headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+            }
+            match filter.register(&registrar, &headers, None).await {
+                FilterAction::Reject(rejection) => rejection.status,
+                _ => 201,
+            }
+        };
+        captured.lines();
+
+        // A claimed `iss` is escaped and cut short: it cannot add a line,
+        // nor make one long.
+        let hostile = format!("https://forge.test/\n kind=not_allowed {}", "x".repeat(300));
+        let tokens = [
+            (jwt(1, &json!({"iss": hostile})), 401, "unknown", "invalid"),
+            ("not.a.jwt".to_owned(), 401, "unknown", "malformed"),
+            (
+                jwt(1, &json!({"aud": "other"})),
+                401,
+                GITHUB_NAME,
+                "invalid",
+            ),
+            (
+                jwt(1, &json!({"event_name": "push"})),
+                403,
+                GITHUB_NAME,
+                "not_allowed",
+            ),
+        ];
+        for (token, status, issuer, kind) in &tokens {
+            assert_eq!(register(Some(token)).await, *status, "{kind}");
+            let lines = captured.lines();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            assert!(line.contains(&format!("issuer=\"{issuer}\"")), "{line}");
+            assert!(line.contains(&format!("kind=\"{kind}\"")), "{line}");
+            // Nothing of the token but the issuer it claims.
+            for part in token.split('.').filter(|p| p.len() > 8) {
+                assert!(!line.contains(part), "{line}");
+            }
+            if token.starts_with("ey") {
+                let claims = crate::oidc::testing::claims_of(token);
+                for claim in ["jti", "repository", "workflow_ref", "aud"] {
+                    let value = claims[claim].as_str().unwrap();
+                    assert!(!line.contains(value), "{claim}: {line}");
+                }
+            }
+        }
+        // Quoted, and so no more than the one field.
+        assert_eq!(register(Some(&tokens[0].0)).await, 401);
+        let line = captured.lines().remove(0);
+        let quoted = format!(
+            r#"claimed_iss="https://forge.test/\\n kind=not_allowed {}...""#,
+            "x".repeat(100 - "https://forge.test/\n kind=not_allowed ".len())
+        );
+        assert!(line.contains(&quoted), "{line}");
+        assert_eq!(line.matches("kind=").count(), 2, "{line}");
+        assert!(line.contains(r#"kind="invalid""#), "{line}");
+
+        // No token at all, and a run registered twice.
+        assert_eq!(register(None).await, 401);
+        let lines = captured.lines();
+        assert!(lines[0].contains("kind=\"no_token\""), "{lines:?}");
+        let token = jwt(2, &json!({}));
+        assert_eq!(register(Some(&token)).await, 201);
+        let other = jwt(2, &json!({}));
+        assert_eq!(register(Some(&other)).await, 409);
+        let lines = captured.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("kind=\"already_registered\""),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains(&other[..other.len() / 2]), "{lines:?}");
+
+        // A flood of one kind is cut to a few lines, and leaves the
+        // others alone.
+        for _ in 0..50 {
+            assert_eq!(register(Some(&tokens[0].0)).await, 401);
+        }
+        let flood = captured.lines();
+        assert_eq!(
+            flood.len(),
+            REFUSALS_LOGGED_PER_WINDOW as usize - 2,
+            "{flood:?}"
+        );
+        assert_eq!(register(Some(&tokens[3].0)).await, 403);
+        assert_eq!(captured.lines().len(), 1);
+
+        // With no issuer to hold it to, a token is refused under the
+        // issuer it claims, escaped the same way.
+        let path = dir.path().join("unproven");
+        std::fs::write(&path, r#"{"unproven": {"max_registrations": 8}}"#).unwrap();
+        let unproven = Registrar::load(&path).unwrap().unwrap();
+        assert!(unproven.oidc.is_none());
+        let mut headers = HeaderMap::new();
+        let value = format!("Bearer {}", tokens[0].0);
+        headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+        match filter.register(&unproven, &headers, None).await {
+            FilterAction::Reject(rejection) => assert_eq!(rejection.status, 403),
+            _ => panic!("registered with no issuer"),
+        }
+        let lines = captured.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(r#"kind="no_issuers""#), "{lines:?}");
+        assert!(lines[0].contains(r#"issuer="unknown""#), "{lines:?}");
+        assert!(
+            lines[0].contains(r#"claimed_iss="https://forge.test/\\n"#),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn refusals_beyond_a_few_a_window_are_counted_and_the_count_logged() {
+        let log = RefusalLog::default();
+        let start = Instant::now();
+        let unknown = |iss: &str| TokenIssuer::Unknown(Some(iss.to_owned()));
+        let github = TokenIssuer::Known(GITHUB_NAME.to_owned());
+        let budget = u64::from(REFUSALS_LOGGED_PER_WINDOW);
+        // Varying the claimed issuer buys no more lines.
+        for n in 0..budget {
+            let admitted = log.admit(&unknown(&n.to_string()), RefusalKind::Invalid, start);
+            assert_eq!(admitted, Some(0));
+        }
+        for n in 0..10 {
+            let admitted = log.admit(&unknown(&n.to_string()), RefusalKind::Invalid, start);
+            assert_eq!(admitted, None);
+        }
+        // Another issuer or kind has a budget of its own.
+        assert_eq!(log.admit(&github, RefusalKind::Invalid, start), Some(0));
+        assert_eq!(
+            log.admit(&unknown("a"), RefusalKind::Malformed, start),
+            Some(0)
+        );
+        // The next window logs again, with what was left out.
+        let next = start + REFUSAL_LOG_WINDOW;
+        assert_eq!(
+            log.admit(&unknown("a"), RefusalKind::Invalid, next),
+            Some(10)
+        );
+        assert_eq!(
+            log.admit(&unknown("a"), RefusalKind::Invalid, next),
+            Some(0)
+        );
     }
 }

@@ -68,6 +68,8 @@ const HTTP: &str = "http://";
 const SHA_HEX_LEN: usize = 40;
 /// What a `ref` of the policy starts with, as in `job_workflow_ref`.
 const REF_PREFIX: &str = "refs/";
+/// How much of a refused token's unvouched-for `iss` is logged, escaped.
+const MAX_LOGGED_ISS: usize = 100;
 
 /// Registrations live in memory, so tokens issued before this process
 /// started could otherwise register a run a second time.
@@ -567,6 +569,66 @@ fn claimed_issuer(jwt: &str) -> Result<String, OidcError> {
     claims.iss.ok_or(OidcError::Invalid)
 }
 
+/// Whose rules a refused token was held to, for the log: never more of
+/// the token than this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenIssuer {
+    /// The policy's name for the issuer it claims: [`GITHUB_NAME`], or an
+    /// entry of `issuers`.
+    Known(String),
+    /// No issuer the policy trusts, with the `iss` the token claims, if it
+    /// has one, escaped to printable ASCII and cut to
+    /// [`MAX_LOGGED_ISS`] characters: anyone can write it.
+    Unknown(Option<String>),
+}
+
+impl TokenIssuer {
+    /// The issuer a token claims, if nothing trusts it.
+    pub fn unknown(jwt: &str) -> Self {
+        Self::Unknown(claimed_issuer_bounded(jwt).ok().map(|iss| escape_iss(&iss)))
+    }
+
+    /// What it is logged under: unknown issuers share one name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Known(name) => name,
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The `iss` a token of an unknown issuer claims, as logged.
+    pub fn claimed(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unknown(iss) => iss.as_deref(),
+        }
+    }
+}
+
+/// The first `MAX_LOGGED_ISS` characters of `iss`, marked `...` if there
+/// were more, with anything but printable ASCII escaped so it cannot break
+/// a log line.
+fn escape_iss(iss: &str) -> String {
+    let mut chars = iss.chars();
+    let mut out: String = chars
+        .by_ref()
+        .take(MAX_LOGGED_ISS)
+        .flat_map(char::escape_default)
+        .collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+/// [`claimed_issuer`] of a token no longer than `verify` reads.
+fn claimed_issuer_bounded(jwt: &str) -> Result<String, OidcError> {
+    if jwt.len() > MAX_JWT_BYTES {
+        return Err(OidcError::Malformed);
+    }
+    claimed_issuer(jwt)
+}
+
 /// Verifies tokens of the issuers the policy trusts.
 pub struct Oidc {
     issuers: Vec<Issuer>,
@@ -613,6 +675,25 @@ impl Oidc {
             .find(|issuer| issuer.trusted.issuer == claimed)
             .ok_or(OidcError::Invalid)?;
         issuer.verify(jwt, &kid).await
+    }
+
+    /// The issuer `jwt` claims, as a refusal of it is logged. Nothing in
+    /// it is verified: a token can claim a trusted issuer it does not have
+    /// the keys of, and is then logged under that issuer's name.
+    pub fn issuer_of(&self, jwt: &str) -> TokenIssuer {
+        let Ok(claimed) = claimed_issuer_bounded(jwt) else {
+            return TokenIssuer::Unknown(None);
+        };
+        match self.issuers.iter().find(|i| i.trusted.issuer == claimed) {
+            Some(issuer) => TokenIssuer::Known(
+                issuer
+                    .trusted
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| GITHUB_NAME.to_owned()),
+            ),
+            None => TokenIssuer::Unknown(Some(escape_iss(&claimed))),
+        }
     }
 
     /// Pretend the key sets were fetched `by` earlier than they were.
@@ -1584,6 +1665,41 @@ mod tests {
         down.store(false, Ordering::SeqCst);
         oidc.age_keys(Duration::from_secs(3600)).await;
         assert!(oidc.verify(&jwt(3, &json!({}))).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_names_the_issuer_a_token_claims_and_no_more() {
+        let (oidc, _) = serve_issuers(|jwks| {
+            let forge = forge(jwks.replace("/jwks", "/forge-jwks"));
+            vec![TrustedIssuer::github(jwks.to_owned(), policy()), forge]
+        })
+        .await;
+        let known = |name: &str| TokenIssuer::Known(name.to_owned());
+        let unknown = |iss: Option<&str>| TokenIssuer::Unknown(iss.map(str::to_owned));
+        let long = format!("https://forge.test/{}", "a".repeat(200));
+        let cases = [
+            (jwt(1, &json!({})), known(GITHUB_NAME)),
+            (forge_jwt(1, &json!({})), known(FORGE)),
+            (
+                jwt(1, &json!({"iss": "https://forge.test/\"\u{1b}\n"})),
+                unknown(Some(r#"https://forge.test/\"\u{1b}\n"#)),
+            ),
+            // Cut before escaping, so never inside an escape.
+            (
+                jwt(1, &json!({"iss": "\n".repeat(MAX_LOGGED_ISS + 1)})),
+                unknown(Some(&format!("{}...", r"\n".repeat(MAX_LOGGED_ISS)))),
+            ),
+            (
+                jwt(1, &json!({"iss": long})),
+                unknown(Some(&format!("{}...", &long[..MAX_LOGGED_ISS]))),
+            ),
+            (jwt(1, &json!({"iss": null})), unknown(None)),
+            ("not.a.jwt".to_owned(), unknown(None)),
+            ("x".repeat(MAX_JWT_BYTES + 1), unknown(None)),
+        ];
+        for (token, expected) in cases {
+            assert_eq!(oidc.issuer_of(&token), expected, "{expected:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

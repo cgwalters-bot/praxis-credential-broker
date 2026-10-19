@@ -425,6 +425,31 @@ with the same usage and limits, and the old token stops working, so a job
 whose 201 was lost can retry. The gateway keeps only the SHA-256 of a
 token.
 
+A refused registration (401, 403 or 409) is logged at info as `run
+registration refused`, with `issuer`, the policy's name for the issuer the
+token claims (`github` or an entry of [`issuers`](#other-issuers)), and
+`kind`: `no_token`, `malformed`, `invalid` (an algorithm but RS256, an
+unknown key id, a bad signature, a missing or untrusted issuer, the wrong
+audience, a validity period or age it is outside of, or issued before the
+gateway started), `not_allowed` (verified, but no entry admits it),
+`already_registered` or `no_issuers` (the policy trusts no issuer). A
+token that claims an issuer no entry names is logged as `issuer=unknown`
+with `claimed_iss`, the `iss` it claims: its first 100 characters, escaped
+to printable ASCII and quoted; one with no readable `iss` has no
+`claimed_iss`. Nothing vouches for it, and nothing else of the token or
+its claims is logged. So
+an `iss` that differs from the entry's `issuer` shows as `unknown` with the
+value to compare, and a policy that admits nothing as `not_allowed` under
+the issuer's name. The issuer named for `invalid` is only what the token
+claims. Each issuer and kind logs at most 5 lines a minute, every unknown
+issuer sharing one budget; the rest are counted, and the next line logged
+for that issuer and kind has the count in `suppressed`. A flood of bad
+tokens can so hide others of the same issuer and kind for a minute, but
+not those of another, and a count left over when a flood stops shows only
+with the next refusal of that issuer and kind. A 429 for want of a free
+registration slot and a 503 for unavailable keys are not refusals of the
+token and are not logged here; the key fetch logs its own failures.
+
 ### Admitting more workflows
 
 Off by default. The `workflows` entry above names each workflow, in its own
