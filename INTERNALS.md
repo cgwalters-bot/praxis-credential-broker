@@ -966,17 +966,18 @@ and publishing on the host's tailnet address as well is another, checked
 before the pod binds it. These commands run on the host, before Podman binds
 the address; they deliberately avoid a dependency on `tailscaled.service`,
 since user services and the system Tailscale daemon have no safe ordering
-relationship. Use the address itself, not a DNS name: `PublishPort` binds
-and `--assert` checks an address, and that is the boundary.
+relationship. `$BROKER_ADDR` stands for the host's tailnet IPv4 address.
+Use the address itself, not a DNS name: `PublishPort` binds and `--assert`
+checks an address, and that is the boundary.
 
 ```ini
 # praxis-credential-broker.pod.d/tailnet.conf
 [Pod]
-PublishPort=100.64.0.1:18080:8081
+PublishPort=$BROKER_ADDR:18080:8081
 
 [Service]
 ExecStartPre=/usr/bin/tailscale wait --timeout=30s
-ExecStartPre=/usr/bin/tailscale ip --4 --assert=100.64.0.1
+ExecStartPre=/usr/bin/tailscale ip --4 --assert=$BROKER_ADDR
 ```
 
 Every tailnet peer that can reach the port can then use pass-through,
@@ -1020,10 +1021,10 @@ out of it. The gateway container runs with `--no-healthcheck`: Podman 5.8
 cannot create a container with a scheduled health check without a systemd
 user bus.
 
-### Xenon
+### The operator's deployment
 
-Xenon, the operator's broker host, runs these units with two drop-ins: the
-tailnet one above for its address `100.121.0.115`, and the run registration
+The operator's broker host runs these units with two drop-ins: the
+tailnet one above for its own address, and the run registration
 policy, which has no `unproven`: runs register there by OIDC token only.
 Tailnet clients use its MagicDNS name, `<host>.<tailnet>.ts.net`, on
 port 18080: `http://<host>.<tailnet>.ts.net:18080/v1` for Codex and
