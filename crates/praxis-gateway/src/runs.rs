@@ -58,6 +58,9 @@ pub struct Usage {
     pub tokens: Tokens,
     /// The model upstream says served the response.
     pub model: Option<String>,
+    /// Of `tokens.input`, those written to a prompt cache, which are priced
+    /// apart but not recorded apart.
+    pub cache_write: u64,
 }
 
 /// The limits a run is registered with.
@@ -686,6 +689,7 @@ mod tests {
                 ..Tokens::default()
             },
             model: model.map(str::to_owned),
+            cache_write: 0,
         })
     }
 

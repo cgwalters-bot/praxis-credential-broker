@@ -3,7 +3,7 @@ use crate::runs::{Tokens, Usage};
 use http::HeaderMap;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -116,6 +116,10 @@ pub(crate) struct Snapshot {
     /// admits them. Its provider's `counts` include it.
     #[serde(skip_serializing_if = "Option::is_none")]
     unproven_runs: Option<UnprovenRuns>,
+    /// The list-price spend of the trailing week, if the deployment meters
+    /// it. Filled in when the snapshot is taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spend: Option<SpendView>,
 }
 
 impl Default for Snapshot {
@@ -128,17 +132,187 @@ impl Default for Snapshot {
             mistral: Mistral::default(),
             operators: BTreeMap::new(),
             unproven_runs: None,
+            spend: None,
         }
     }
 }
 
+/// Hours of spend kept: the week the board's budget is set for.
+const SPEND_HOURS: u64 = 7 * 24;
+
+/// What one settled response adds to spend.
+#[derive(Clone, Copy, Debug)]
+enum Charge {
+    /// Millionths of a USD.
+    Priced(u64),
+    /// A response with usage whose model the price table has no price for.
+    Unpriced,
+    /// A successful response whose usage never arrived, as `unmetered`
+    /// counts it.
+    Unmetered,
+}
+
+/// Spend, and the responses it leaves out.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Tally {
+    /// Millionths of a USD.
+    micros: u64,
+    unpriced: u64,
+    unmetered: u64,
+}
+
+impl Tally {
+    fn add(&mut self, other: &Tally) {
+        self.micros = self.micros.saturating_add(other.micros);
+        self.unpriced = self.unpriced.saturating_add(other.unpriced);
+        self.unmetered = self.unmetered.saturating_add(other.unmetered);
+    }
+}
+
+/// What the injected requests settled in one hour cost at list price.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bucket {
+    /// Hours since the Unix epoch.
+    hour: u64,
+    tally: Tally,
+}
+
+/// One payer's spend over the trailing week, hour by hour, oldest first: at
+/// most `SPEND_HOURS` buckets, so it rolls an hour at a time rather than
+/// resetting. These buckets are what a restart would need to keep (#35).
+#[derive(Clone, Debug, Default)]
+struct Week(VecDeque<Bucket>);
+
+impl Week {
+    fn add(&mut self, hour: u64, charge: Charge) {
+        self.expire(hour);
+        // A clock that steps back charges the latest hour, so the buckets
+        // stay in order and never outnumber the hours of the week.
+        let bucket = match self.0.back_mut() {
+            Some(last) if last.hour >= hour => last,
+            _ => {
+                self.0.push_back(Bucket {
+                    hour,
+                    tally: Tally::default(),
+                });
+                self.0.back_mut().expect("just pushed")
+            }
+        };
+        let tally = &mut bucket.tally;
+        match charge {
+            Charge::Priced(micros) => tally.micros = tally.micros.saturating_add(micros),
+            Charge::Unpriced => tally.unpriced = tally.unpriced.saturating_add(1),
+            Charge::Unmetered => tally.unmetered = tally.unmetered.saturating_add(1),
+        }
+    }
+
+    /// Drop the hours that are no longer in the week ending with `hour`.
+    fn expire(&mut self, hour: u64) {
+        while self
+            .0
+            .front()
+            .is_some_and(|bucket| bucket.hour + SPEND_HOURS <= hour)
+        {
+            self.0.pop_front();
+        }
+    }
+
+    /// What was settled in the week ending with `hour`.
+    fn sum(&self, hour: u64) -> Tally {
+        let mut sum = Tally::default();
+        for bucket in self.0.iter().filter(|b| b.hour + SPEND_HOURS > hour) {
+            sum.add(&bucket.tally);
+        }
+        sum
+    }
+}
+
+/// List-price spend: the runs' together, apart from each operator's,
+/// because the board's budget is for its runs and an operator's
+/// interactive use is not.
+#[derive(Debug)]
+struct Spend {
+    /// Unix seconds when metering began: before a week has passed since,
+    /// the figures cover less than the week.
+    since: u64,
+    runs: Week,
+    /// Only the operators the snapshot lists, so it is bounded as they are.
+    operators: BTreeMap<String, Week>,
+}
+
+/// A payer's spend, or all of it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct Spent {
+    /// USD.
+    total: f64,
+    /// Responses with usage that no price is counted for; `total` is low by
+    /// what they cost.
+    unpriced_requests: u64,
+    /// Successful responses whose usage never arrived; `total` is low by
+    /// what they cost too.
+    unmetered_requests: u64,
+}
+
+impl From<Tally> for Spent {
+    fn from(tally: Tally) -> Self {
+        Self {
+            // Exact to the cent below $2^53 / 10^6, far beyond any week.
+            total: tally.micros as f64 / 1e6,
+            unpriced_requests: tally.unpriced,
+            unmetered_requests: tally.unmetered,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct SpendView {
+    currency: &'static str,
+    /// API list prices, whatever the credential is billed: what the
+    /// requests would have cost on a metered key.
+    basis: &'static str,
+    /// The date of the price table.
+    prices: &'static str,
+    window_days: u64,
+    since: u64,
+    /// The runs' and every operator's.
+    #[serde(flatten)]
+    all: Spent,
+    runs: Spent,
+    by_operator: BTreeMap<String, Spent>,
+}
+
+impl Spend {
+    fn view(&self, hour: u64) -> SpendView {
+        let runs = self.runs.sum(hour);
+        let mut all = runs;
+        let mut by_operator = BTreeMap::new();
+        for (name, week) in &self.operators {
+            let tally = week.sum(hour);
+            all.add(&tally);
+            by_operator.insert(name.clone(), tally.into());
+        }
+        SpendView {
+            currency: "USD",
+            basis: "list",
+            prices: crate::prices::PRICES,
+            window_days: SPEND_HOURS / 24,
+            since: self.since,
+            all: all.into(),
+            runs: runs.into(),
+            by_operator,
+        }
+    }
+}
+
+/// The counts, and the spend if it is metered. Always lock the counts first.
 #[derive(Default)]
-pub(crate) struct BrokerUsage(Mutex<Snapshot>);
+pub(crate) struct BrokerUsage(Mutex<Snapshot>, Mutex<Option<Spend>>);
 
 // Like the run registry, configuration reloads retain the named state. Each
 // registry has exactly three counters and four window slots, a counter per
 // operator a tokens file named and one for all runs registered without
-// proof, never per-client keys.
+// proof, never per-client keys; and, if spend is metered, a week of hourly
+// buckets for the runs and one for each of those operators.
 static REGISTRIES: LazyLock<Mutex<HashMap<String, Arc<BrokerUsage>>>> =
     LazyLock::new(Mutex::default);
 
@@ -164,10 +338,85 @@ impl BrokerUsage {
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
-        self.0
+        self.snapshot_at(unix_time())
+    }
+
+    fn snapshot_at(&self, now: u64) -> Snapshot {
+        let mut snapshot = self
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        snapshot.spend = self
+            .1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|spend| spend.view(now / 3600));
+        snapshot
+    }
+
+    /// Meter list-price spend from now on, if it is not metered already. It
+    /// is off unless the deployment turns it on: `/usage` is readable by
+    /// anyone who reaches the listener, and a figure in dollars is only as
+    /// true as the price table's date, so the deployment that budgets on it
+    /// opts in. Nothing turns it off again before a restart, so that a
+    /// filter without `spend` sharing the registry never wipes the week.
+    pub(crate) fn meter_spend(&self) {
+        self.meter_spend_at(unix_time());
+    }
+
+    fn meter_spend_at(&self, now: u64) {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut spend = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        spend.get_or_insert_with(|| Spend {
+            since: now,
+            runs: Week::default(),
+            operators: state
+                .operators
+                .keys()
+                .map(|name| (name.clone(), Week::default()))
+                .collect(),
+        });
+    }
+
+    /// Charge what a response cost at list price to the runs, or to the
+    /// operator named, if spend is metered and the operator listed. A
+    /// successful response without usage is counted as unmetered.
+    pub(crate) fn settle_spend(
+        &self,
+        operator: Option<&str>,
+        usage: Option<&Usage>,
+        success: bool,
+    ) {
+        self.settle_spend_at(operator, usage, success, unix_time());
+    }
+
+    fn settle_spend_at(
+        &self,
+        operator: Option<&str>,
+        usage: Option<&Usage>,
+        success: bool,
+        now: u64,
+    ) {
+        // As `Counts::settle` counts them.
+        let charge = match usage {
+            Some(usage) => crate::prices::cost(usage).map_or(Charge::Unpriced, Charge::Priced),
+            None if success => Charge::Unmetered,
+            None => return,
+        };
+        let mut spend = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(spend) = spend.as_mut() else {
+            return;
+        };
+        let week = match operator {
+            None => &mut spend.runs,
+            Some(operator) => match spend.operators.get_mut(operator) {
+                Some(week) => week,
+                None => return,
+            },
+        };
+        week.add(now / 3600, charge);
     }
 
     pub(crate) fn settle(&self, provider: Provider, usage: Option<&Usage>, success: bool) {
@@ -198,6 +447,14 @@ impl BrokerUsage {
         state
             .operators
             .insert(operator.to_owned(), Counts::default());
+        if let Some(spend) = self
+            .1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            spend.operators.insert(operator.to_owned(), Week::default());
+        }
     }
 
     /// Count a response to a declared operator's request.
@@ -410,6 +667,7 @@ mod tests {
                 ..Tokens::default()
             },
             model: None,
+            cache_write: 0,
         };
         let counts = |requests: u64, unmetered: u64, tokens: [u64; 3]| {
             serde_json::json!({
@@ -488,6 +746,7 @@ mod tests {
                 ..Tokens::default()
             },
             model: None,
+            cache_write: 0,
         };
         usage.declare_operator("me");
         usage.settle_operator("me", Some(&reported), true);
@@ -524,6 +783,7 @@ mod tests {
                 ..Tokens::default()
             },
             model: None,
+            cache_write: 0,
         };
         let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
         assert!(snapshot.get("unproven_runs").is_none());
@@ -561,6 +821,101 @@ mod tests {
         assert_eq!(snapshot["codex"]["counts"]["requests"], 0);
     }
 
+    fn priced(model: &str, input: u64) -> Usage {
+        Usage {
+            tokens: Tokens {
+                input,
+                total: input,
+                ..Tokens::default()
+            },
+            model: Some(model.to_owned()),
+            cache_write: 0,
+        }
+    }
+
+    fn spend(usage: &BrokerUsage, now: u64) -> serde_json::Value {
+        serde_json::to_value(usage.snapshot_at(now)).unwrap()["spend"].clone()
+    }
+
+    #[test]
+    fn spend_is_off_until_enabled_and_keeps_runs_and_operators_apart() {
+        let usage = BrokerUsage::default();
+        usage.declare_operator("me");
+        // $4 per million input.
+        let dollars = |n: u64| priced("claude-opus-5-5", n * 250_000);
+        usage.settle_spend_at(None, Some(&dollars(1)), true, 0);
+        assert_eq!(spend(&usage, 0), serde_json::Value::Null);
+        usage.meter_spend_at(100);
+        usage.declare_operator("you");
+        usage.settle_spend_at(None, Some(&dollars(3)), true, 100);
+        usage.settle_spend_at(Some("me"), Some(&dollars(5)), true, 100);
+        usage.settle_spend_at(Some("you"), Some(&dollars(7)), true, 100);
+        usage.settle_spend_at(Some("stranger"), Some(&dollars(11)), true, 100);
+        usage.settle_spend_at(Some("me"), Some(&priced("claude-test", 1)), true, 100);
+        // Without usage, a success is unmetered and a failure not counted.
+        usage.settle_spend_at(None, None, true, 100);
+        usage.settle_spend_at(None, None, false, 100);
+        usage.settle_spend_at(Some("you"), None, true, 100);
+        // Enabling again, as a reload or another filter does, keeps what
+        // was metered and when it began.
+        usage.meter_spend_at(200);
+        let spent = |total: f64, unpriced: u64, unmetered: u64| {
+            serde_json::json!({
+                "total": total,
+                "unpriced_requests": unpriced,
+                "unmetered_requests": unmetered,
+            })
+        };
+        assert_eq!(
+            spend(&usage, 100),
+            serde_json::json!({
+                "currency": "USD",
+                "basis": "list",
+                "prices": crate::prices::PRICES,
+                "window_days": 7,
+                "since": 100,
+                "total": 15.0,
+                "unpriced_requests": 1,
+                "unmetered_requests": 2,
+                "runs": spent(3.0, 0, 1),
+                "by_operator": {"me": spent(5.0, 1, 0), "you": spent(7.0, 0, 1)},
+            })
+        );
+    }
+
+    #[test]
+    fn spend_rolls_off_an_hour_at_a_time_after_a_week() {
+        let usage = BrokerUsage::default();
+        let hour = 3600;
+        let start = 1_000_000 * hour;
+        usage.meter_spend_at(start);
+        // $1 in each of the week's hours and two more, and an unpriced and
+        // an unmetered response in the first.
+        let dollar = priced("claude-opus-5-5", 250_000);
+        usage.settle_spend_at(None, Some(&priced("claude-test", 1)), true, start);
+        usage.settle_spend_at(None, None, true, start);
+        assert_eq!(spend(&usage, start + 59)["runs"]["unpriced_requests"], 1);
+        assert_eq!(spend(&usage, start + 59)["runs"]["unmetered_requests"], 1);
+        for h in 0..SPEND_HOURS + 2 {
+            usage.settle_spend_at(None, Some(&dollar), true, start + h * hour);
+        }
+        let at = |h: u64| spend(&usage, start + h * hour + 59);
+        let buckets = || usage.1.lock().unwrap().as_ref().unwrap().runs.0.len() as u64;
+        assert_eq!(buckets(), SPEND_HOURS);
+        let now = SPEND_HOURS + 1;
+        assert_eq!(at(now)["runs"]["total"], 168.0);
+        assert_eq!(at(now)["runs"]["unpriced_requests"], 0);
+        assert_eq!(at(now)["runs"]["unmetered_requests"], 0);
+        // Each hour without spend drops the oldest hour's.
+        assert_eq!(at(now + 1)["runs"]["total"], 167.0);
+        assert_eq!(at(now + 100)["runs"]["total"], 68.0);
+        assert_eq!(at(now + SPEND_HOURS)["runs"]["total"], 0.0);
+        // A clock that steps back charges the latest hour.
+        usage.settle_spend_at(None, Some(&dollar), true, start);
+        assert_eq!(at(now)["runs"]["total"], 169.0);
+        assert_eq!(buckets(), SPEND_HOURS);
+    }
+
     #[test]
     fn named_state_survives_reload_and_counts_saturate() {
         let usage = BrokerUsage::named("usage-unit-test");
@@ -570,6 +925,7 @@ mod tests {
                 ..Tokens::default()
             },
             model: None,
+            cache_write: 0,
         };
         usage.settle(Provider::Codex, Some(&reported), true);
         usage.settle(Provider::Codex, Some(&reported), true);

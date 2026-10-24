@@ -851,6 +851,38 @@ async fn streamed_responses_and_messages_are_metered_and_capped_per_run() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spend_is_reported_only_when_enabled_and_by_who_spent_it() {
+    let h = Harness::with_policy().await;
+    assert!(h.broker_usage().await.get("spend").is_none());
+    let h = Harness::start(true, |filter| {
+        if filter["filter"] == "run_token" {
+            filter["spend"] = Yaml::from(true);
+        }
+    })
+    .await;
+    let token = h.run(1).await;
+    // The recorded stream: 16 input and 5 output of gpt-6.1-sol, 82
+    // millionths of a USD at list price.
+    for bearer in [token.as_str(), OPERATOR_TOKEN] {
+        let (status, body) = h.respond(Some(bearer), RECORDED_INPUT, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    // The fake Messages upstream names claude-test, which has no price.
+    assert_eq!(h.injected(Some(&token)).await.0, StatusCode::OK);
+    let spend = &h.broker_usage().await["spend"];
+    let spent = |total: f64, unpriced: u64| json!({"total": total, "unpriced_requests": unpriced, "unmetered_requests": 0});
+    assert_eq!(spend["runs"], spent(0.000_082, 1));
+    assert_eq!(
+        spend["by_operator"],
+        json!({OPERATOR: spent(0.000_082, 0), CLAUDE_OPERATOR: spent(0.0, 0)})
+    );
+    assert_eq!(spend["total"], 0.000_164);
+    assert_eq!(spend["unpriced_requests"], 1);
+    assert_eq!(spend["unmetered_requests"], 0);
+    assert!(spend["since"].as_u64().is_some_and(|since| since > 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_codex_stream_is_metered() {
     let h = Harness::with_policy().await;
     let token = h.run(1).await;
