@@ -106,7 +106,11 @@ curl -X POST -H "Authorization: Bearer $OIDC_TOKEN" http://127.0.0.1:18080/v1/ru
 ```
 
 The agent's sandbox must not get the job's `ACTIONS_ID_TOKEN_REQUEST_*`
-variables; see [INTERNALS.md](INTERNALS.md#run-tokens). When the job ends,
+variables; see [INTERNALS.md](INTERNALS.md#run-tokens). Jobs of another
+forge, such as a Forgejo instance, register the same way once the policy
+names their issuer; copy its `iss`, `repository_id` and
+`repository_owner_id` from a token a job there captured, and see
+[Other issuers](INTERNALS.md#other-issuers). When the job ends,
 `DELETE /v1/runs/self` with the run token finishes the run and returns its
 usage record.
 
