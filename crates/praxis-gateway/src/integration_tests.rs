@@ -852,14 +852,15 @@ async fn streamed_responses_and_messages_are_metered_and_capped_per_run() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spend_is_reported_only_when_enabled_and_by_who_spent_it() {
-    let h = Harness::with_policy().await;
-    assert!(h.broker_usage().await.get("spend").is_none());
     let h = Harness::start(true, |filter| {
         if filter["filter"] == "run_token" {
-            filter["spend"] = Yaml::from(true);
+            filter["spend"] = Yaml::from(false);
         }
     })
     .await;
+    assert!(h.broker_usage().await.get("spend").is_none());
+    // The repository's policy turns it on.
+    let h = Harness::with_policy().await;
     let token = h.run(1).await;
     // The recorded stream: 16 input and 5 output of gpt-6.1-sol, 82
     // millionths of a USD at list price.

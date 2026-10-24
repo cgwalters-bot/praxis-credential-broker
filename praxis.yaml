@@ -188,8 +188,9 @@ filter_chains:
         # this file (operator-tokens.yaml is the example).
         operators:
           tokens_file: /etc/praxis-credential-broker/operator-tokens.yaml
-        # `spend: true` adds to /usage what injected requests cost at list
-        # price over the trailing week; off unless set (see INTERNALS.md).
+        # What injected requests cost at list price over the trailing week,
+        # in /usage, for the board's weekly budget (see INTERNALS.md).
+        spend: true
         credentials:
           inference-backend: injected
           anthropic: injected
