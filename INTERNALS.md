@@ -855,9 +855,41 @@ are neither a fresh provider query nor the broker's configured caps.
 much of a plan is used. (Of a response of 2026-10-12, the headers kept
 named no limit; those with `token` in their names were not kept.)
 
+`spend` is there only if `run_token` has `spend: true`: what the same
+settled responses would have cost at API list prices, whatever their
+credential is billed, over the trailing seven days, for a budget across
+every pool. It is `currency` (`USD`), `basis` (`list`), `prices`, the date
+of the table in `crates/praxis-gateway/src/prices.rs`, which is pinned and
+never fetched, `window_days` (7), `since` (Unix seconds when metering
+began: until a week has passed since, the figures cover less than the
+week), the totals of everything, and the same for `runs` (every run's,
+proven or not) and for each operator in `by_operator` (apart from the
+runs' because a board's budget counts its runs and not people's
+interactive use). The totals are `total` in USD, `unpriced_requests`, the
+responses whose model the table has no price for, and
+`unmetered_requests`, successful responses whose usage never arrived
+(counted as the counts' `unmetered` are): `total` is low by what both
+cost, never charged as $0 without saying so. A model is matched by its
+name, or else by its name without a snapshot date (`-YYYYMMDD` or
+`-YYYY-MM-DD`). A response's cost comes from its usage and the model it
+names: uncached input, cache writes, cache reads and output (reasoning
+included) each at its rate, and OpenAI's and Claude Haiku 5.5's long-prompt
+rates above their thresholds. The usage reported does not tell more apart,
+so `total` undercounts Anthropic cache writes with the 1-hour TTL (priced
+at the 5-minute rate), fast mode and data residency (priced at the
+standard rate) and server-side tool fees such as web search (not priced).
+A stream that never ends (a client disconnect, an upstream abort) is
+never settled, so it is missing from `total` and from both counts.
+It is kept in hourly buckets, so the week rolls off an hour at a time; it
+is off by default because the endpoint is unauthenticated and the figure
+is only as current as the table. Once a `run_token` filter turns it on for
+a registry it stays on, even through a reload without `spend: true`, until
+a restart. Like the counts, it resets on restart for now.
+
 The bounded state has three counters and four window slots per named run registry,
 a counter per operator (at most 64 names, across reloads of the tokens file)
-and one for the runs registered without proof.
+and one for the runs registered without proof, and with `spend`, at most 168
+hourly buckets for the runs and for each of those operators.
 It survives configuration reloads, and resets on process restart (`started_at`
 names the start of that state). It stores no credentials, arbitrary headers,
 prompt content, model dimensions or run identifiers; operators' names are the

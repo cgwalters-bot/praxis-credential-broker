@@ -5,6 +5,7 @@
 mod filter;
 mod oidc;
 mod operators;
+mod prices;
 mod runs;
 mod usage;
 

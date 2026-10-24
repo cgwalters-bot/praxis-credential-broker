@@ -54,8 +54,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, header};
 use praxis_ai_filters::{
-    META_TOKEN_CACHE_READ, META_TOKEN_INPUT, META_TOKEN_MODEL, META_TOKEN_OUTPUT,
-    META_TOKEN_REASONING, META_TOKEN_STATUS, META_TOKEN_TOTAL,
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_MODEL,
+    META_TOKEN_OUTPUT, META_TOKEN_REASONING, META_TOKEN_STATUS, META_TOKEN_TOTAL,
 };
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext,
@@ -173,6 +173,11 @@ struct Config {
     registration: Option<RegistrationConfig>,
     /// Admit operator tokens to injected routes.
     operators: Option<OperatorsConfig>,
+    /// Report in `/usage` what injected requests cost at list price over the
+    /// trailing week (see [`crate::prices`]). Once on for a registry, it
+    /// stays on until a restart.
+    #[serde(default)]
+    spend: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,6 +384,9 @@ impl RunTokenFilter {
                 .map_err(|e| format!("{FILTER_NAME}: {e}"))?,
         };
         let usage = BrokerUsage::named(&config.registry);
+        if config.spend {
+            usage.meter_spend();
+        }
         if let RunEndpoints::Serving(registrar) = &endpoints
             && registrar.unproven.is_some()
         {
@@ -746,6 +754,7 @@ fn reported_usage(ctx: &HttpFilterContext<'_>) -> Option<Usage> {
                 .max(input.saturating_add(output)),
         },
         model: ctx.get_metadata(META_TOKEN_MODEL).map(str::to_owned),
+        cache_write: count(META_TOKEN_CACHE_WRITE).unwrap_or(0),
     })
 }
 
@@ -940,17 +949,23 @@ impl HttpFilter for RunTokenFilter {
             }
             match metered.caller {
                 Some(Caller::Run(admission)) => {
-                    if admission.is_unproven() && !admission.usage_free {
+                    if !admission.usage_free {
+                        if admission.is_unproven() {
+                            self.usage
+                                .settle_unproven(reported.as_ref(), metered.success);
+                        }
                         self.usage
-                            .settle_unproven(reported.as_ref(), metered.success);
+                            .settle_spend(None, reported.as_ref(), metered.success);
                     }
                     admission.settle(reported);
                 }
-                Some(Caller::Operator(slot)) if !slot.usage_free => self.usage.settle_operator(
-                    slot.operator().name(),
-                    reported.as_ref(),
-                    metered.success,
-                ),
+                Some(Caller::Operator(slot)) if !slot.usage_free => {
+                    let operator = slot.operator().name();
+                    self.usage
+                        .settle_operator(operator, reported.as_ref(), metered.success);
+                    self.usage
+                        .settle_spend(Some(operator), reported.as_ref(), metered.success);
+                }
                 Some(Caller::Operator(_)) | None => {}
             }
         }
