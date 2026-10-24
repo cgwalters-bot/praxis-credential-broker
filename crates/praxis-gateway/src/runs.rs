@@ -26,6 +26,10 @@ const RETENTION: Duration = Duration::from_secs(24 * 3600);
 pub const MAX_UNPROVEN_RUNS: usize = MAX_RUNS / 4;
 /// The longest identifier a run registered without proof may choose.
 pub const MAX_RUN_NAME: usize = 128;
+/// The longest label a listener may have.
+pub const MAX_LISTENER_LABEL: usize = 64;
+/// The label of the listener a deployment has unless it names others.
+pub const DEFAULT_LISTENER: &str = "default";
 /// Models a record keeps totals for; usage of any further model only counts
 /// in the run's totals.
 const MAX_MODELS: usize = 16;
@@ -133,17 +137,55 @@ pub struct RunName(String);
 
 impl RunName {
     pub fn new(name: &str) -> Option<Self> {
-        let valid = !name.is_empty()
-            && name.len() <= MAX_RUN_NAME
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-        valid.then(|| Self(name.to_owned()))
+        is_plain(name, MAX_RUN_NAME).then(|| Self(name.to_owned()))
     }
 }
 
-/// How many runs may register without proof: `max` in any `window`, from
-/// all callers together.
+/// Whether `name` is 1 to `max` letters, digits, `.`, `_` and `-`, and so
+/// fit for a log line or a subject as it is.
+fn is_plain(name: &str, max: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= max
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The label of the listener a run registered through. A run is admitted
+/// only through a listener of the same label, and its usage is counted
+/// under it. Like a [`RunName`] it is short and plain, but the deployment
+/// chose it, not a caller.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize)]
+pub struct Listener(String);
+
+impl Listener {
+    pub fn new(label: &str) -> Option<Self> {
+        is_plain(label, MAX_LISTENER_LABEL).then(|| Self(label.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.0 == DEFAULT_LISTENER
+    }
+}
+
+impl Default for Listener {
+    fn default() -> Self {
+        Self(DEFAULT_LISTENER.to_owned())
+    }
+}
+
+impl std::fmt::Display for Listener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How many runs may register without proof through one listener: `max` in
+/// any `window`, from all its callers together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quota {
     pub max: usize,
@@ -152,8 +194,8 @@ pub struct Quota {
 
 impl Quota {
     /// The most runs registered within this quota that are remembered at
-    /// once, when each lasts `ttl`. A quota that keeps this within
-    /// `MAX_UNPROVEN_RUNS` never finds the registry full.
+    /// once, when each lasts `ttl`. Quotas whose sum keeps this within
+    /// `MAX_UNPROVEN_RUNS` never find the registry full.
     pub fn most_remembered(&self, ttl: Duration) -> usize {
         let remembered = (ttl + RETENTION).as_nanos();
         let windows = remembered.div_ceil(self.window.as_nanos().max(1));
@@ -225,6 +267,8 @@ pub enum RegisterError {
     Full,
     /// The quota of registrations without proof is used up for now.
     OverQuota,
+    /// The run is registered through another listener.
+    OtherListener,
 }
 
 /// What a run registered with, and so which run a record is of.
@@ -262,6 +306,9 @@ pub struct RunRecord {
     /// `proof` and, beside it, what names the run.
     #[serde(flatten)]
     pub proof: Proof,
+    /// The listener the run registered through, unless the default one.
+    #[serde(skip_serializing_if = "Listener::is_default")]
+    pub listener: Listener,
     pub state: RunState,
     pub registered_at_unix: u64,
     pub expires_at_unix: u64,
@@ -311,8 +358,9 @@ struct State {
     runs: HashMap<RunKey, Run>,
     tokens: HashMap<[u8; 32], RunKey>,
     /// When each registration without proof still inside its quota's
-    /// window was admitted, oldest first.
-    unproven: VecDeque<Instant>,
+    /// window was admitted, oldest first, by the listener it came through:
+    /// each listener's quota is its own.
+    unproven: HashMap<Listener, VecDeque<Instant>>,
 }
 
 /// The runs registered with this process, shared by every chain whose
@@ -368,11 +416,13 @@ impl Runs {
     /// Register a job's run, once, and mint its bearer token. The same OIDC
     /// token (by `jti`) registering an active run again gets a new token for
     /// it, replacing the old one, so a job whose response was lost can retry;
-    /// the run keeps its usage and limits.
+    /// the run keeps its usage, limits and listener, and the retry must come
+    /// through that listener.
     pub fn register(
         &self,
         identity: RunIdentity,
         limits: Limits,
+        listener: &Listener,
         now: Instant,
     ) -> Result<(String, RunRecord), RegisterError> {
         let mut state = self.state(now);
@@ -384,11 +434,19 @@ impl Runs {
             {
                 return Err(RegisterError::AlreadyRegistered);
             }
+            if run.record.listener != *listener {
+                return Err(RegisterError::OtherListener);
+            }
             let old = std::mem::replace(&mut run.token_hash, hash);
             let record = run.record.clone();
             state.tokens.remove(&old);
             state.tokens.insert(hash, key);
-            info!(run_id = identity.run_id, "run token replaced");
+            info!(
+                run_id = identity.run_id,
+                listener = %listener,
+                mode = "oidc",
+                "run token replaced"
+            );
             return Ok((token, record));
         }
         if state.runs.len() >= MAX_RUNS {
@@ -409,6 +467,8 @@ impl Runs {
             actor = ?identity.actor,
             admitted_by = identity.admitted_by.as_str(),
             ttl_secs = limits.ttl.as_secs(),
+            listener = %listener,
+            mode = "oidc",
             "run registered"
         );
         let proof = Proof::GithubOidc {
@@ -425,56 +485,69 @@ impl Runs {
             actor: identity.actor,
             admitted_by: identity.admitted_by,
         };
-        let record = state.insert(key, proof, Some(identity.jti), hash, limits, now);
+        let record = state.insert(key, proof, Some(identity.jti), hash, limits, listener, now);
         Ok((token, record))
     }
 
     /// Register a run nothing vouches for, under the name its caller chose,
-    /// within `quota`. A name registers once: a second registration is
-    /// refused while the first is remembered, whoever sends it, so no
-    /// caller can take over or re-arm another's run by naming it.
+    /// within `listener`'s `quota`. A name registers once, through any
+    /// listener: a second registration is refused while the first is
+    /// remembered, whoever sends it, so no caller can take over or re-arm
+    /// another's run by naming it. However the listeners' quotas add up,
+    /// at most `MAX_UNPROVEN_RUNS` such runs are kept at once.
     pub fn register_unproven(
         &self,
         name: RunName,
         client: Option<IpAddr>,
         limits: Limits,
         quota: Quota,
+        listener: &Listener,
         now: Instant,
     ) -> Result<(String, RunRecord), RegisterError> {
         let mut state = self.state(now);
         let key = RunKey::Unproven(name.clone());
-        if state.runs.contains_key(&key) {
+        let State { runs, unproven, .. } = &mut *state;
+        if runs.contains_key(&key) {
             return Err(RegisterError::AlreadyRegistered);
         }
-        while let Some(oldest) = state.unproven.front()
+        let admitted = unproven.entry(listener.clone()).or_default();
+        while let Some(oldest) = admitted.front()
             && now.saturating_duration_since(*oldest) >= quota.window
         {
-            state.unproven.pop_front();
+            admitted.pop_front();
         }
-        if state.unproven.len() >= quota.max {
+        if admitted.len() >= quota.max {
             return Err(RegisterError::OverQuota);
         }
-        let kept = state.runs.keys().filter(|key| key.is_unproven()).count();
-        if kept >= MAX_UNPROVEN_RUNS || state.runs.len() >= MAX_RUNS {
+        // Across every listener's runs: the ceiling is the registry's.
+        let kept = runs.keys().filter(|key| key.is_unproven()).count();
+        if kept >= MAX_UNPROVEN_RUNS || runs.len() >= MAX_RUNS {
             return Err(RegisterError::Full);
         }
-        state.unproven.push_back(now);
+        admitted.push_back(now);
         info!(
             run = %key.subject(),
             client = ?client,
             ttl_secs = limits.ttl.as_secs(),
+            listener = %listener,
+            mode = "unproven",
             "unproven run registered"
         );
         let (token, hash) = new_token();
-        let record = state.insert(key, Proof::Unproven { run: name }, None, hash, limits, now);
+        let proof = Proof::Unproven { run: name };
+        let record = state.insert(key, proof, None, hash, limits, listener, now);
         Ok((token, record))
     }
 
-    /// The run a bearer token belongs to. A finished or expired run's token
-    /// still reads its record, so the job gets it even if the agent finished
-    /// the run first, but admits no requests.
-    pub fn authenticate(&self, token: &str, now: Instant) -> Option<RunKey> {
-        self.state(now).tokens.get(&token_hash(token)).cloned()
+    /// The run a bearer token belongs to, if it registered through
+    /// `listener`: through any other the token is unknown. A finished or
+    /// expired run's token still reads its record, so the job gets it even
+    /// if the agent finished the run first, but admits no requests.
+    pub fn authenticate(&self, token: &str, listener: &Listener, now: Instant) -> Option<RunKey> {
+        let state = self.state(now);
+        let key = state.tokens.get(&token_hash(token))?;
+        let run = state.runs.get(key)?;
+        (run.record.listener == *listener).then(|| key.clone())
     }
 
     pub fn record(&self, key: &RunKey, now: Instant) -> Option<RunRecord> {
@@ -508,6 +581,7 @@ impl Runs {
         Ok(Admission {
             runs: Arc::clone(self),
             key: key.clone(),
+            listener: run.record.listener.clone(),
             success: false,
             usage_free: false,
             settled: false,
@@ -538,6 +612,7 @@ enum Outcome {
 
 impl State {
     /// Add a run that starts now, and return its record.
+    #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
         key: RunKey,
@@ -545,12 +620,14 @@ impl State {
         jti: Option<String>,
         token_hash: [u8; 32],
         limits: Limits,
+        listener: &Listener,
         now: Instant,
     ) -> RunRecord {
         let registered = unix_now();
         let record = RunRecord {
             schema: RECORD_SCHEMA,
             proof,
+            listener: listener.clone(),
             state: RunState::Active,
             registered_at_unix: registered,
             expires_at_unix: registered.saturating_add(limits.ttl.as_secs()),
@@ -601,6 +678,7 @@ impl State {
 pub struct Admission {
     runs: Arc<Runs>,
     key: RunKey,
+    listener: Listener,
     /// Upstream answered with a success status.
     pub success: bool,
     /// The request uses no tokens, like counting them, whatever upstream
@@ -613,6 +691,11 @@ impl Admission {
     /// Whether the run registered without proof.
     pub fn is_unproven(&self) -> bool {
         self.key.is_unproven()
+    }
+
+    /// The listener the run registered through.
+    pub fn listener(&self) -> &Listener {
+        &self.listener
     }
 
     /// Record what upstream reported for the response.
@@ -650,6 +733,10 @@ impl Drop for Admission {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn default_listener() -> Listener {
+        Listener::default()
+    }
 
     const WORKFLOW: &str = "owner/repo/.github/workflows/agent.yml@refs/heads/main";
 
@@ -690,8 +777,10 @@ mod tests {
     }
 
     fn register(runs: &Runs, run_id: u64, now: Instant) -> (String, RunKey) {
-        let (token, _) = runs.register(identity(run_id), limits(), now).unwrap();
-        let key = runs.authenticate(&token, now).unwrap();
+        let (token, _) = runs
+            .register(identity(run_id), limits(), &default_listener(), now)
+            .unwrap();
+        let key = runs.authenticate(&token, &default_listener(), now).unwrap();
         (token, key)
     }
 
@@ -701,11 +790,11 @@ mod tests {
         let now = Instant::now();
         let (token, key) = register(&a, 1, now);
         assert_eq!(
-            Runs::named("runs-test-shared").authenticate(&token, now),
+            Runs::named("runs-test-shared").authenticate(&token, &default_listener(), now),
             Some(key)
         );
         assert_eq!(
-            Runs::named("runs-test-other").authenticate(&token, now),
+            Runs::named("runs-test-other").authenticate(&token, &default_listener(), now),
             None
         );
     }
@@ -721,8 +810,12 @@ mod tests {
         let subjects: Vec<String> = [identity(1), matrix, retry, identity(2)]
             .into_iter()
             .map(|identity| {
-                let (token, _) = runs.register(identity, limits(), now).unwrap();
-                runs.authenticate(&token, now).unwrap().subject()
+                let (token, _) = runs
+                    .register(identity, limits(), &default_listener(), now)
+                    .unwrap();
+                runs.authenticate(&token, &default_listener(), now)
+                    .unwrap()
+                    .subject()
             })
             .collect();
         assert_eq!(
@@ -740,17 +833,25 @@ mod tests {
     fn a_run_registers_once_and_its_token_authenticates_it() {
         let runs = Runs::default();
         let now = Instant::now();
-        let (token, record) = runs.register(identity(1), limits(), now).unwrap();
+        let (token, record) = runs
+            .register(identity(1), limits(), &default_listener(), now)
+            .unwrap();
         assert!(token.starts_with(TOKEN_PREFIX) && token.len() == TOKEN_PREFIX.len() + 64);
         assert_eq!(record.expires_at_unix - record.registered_at_unix, 600);
         assert_eq!(record.state, RunState::Active);
-        assert!(runs.authenticate(&token, now).is_some());
-        assert!(runs.authenticate("praxis-run-guess", now).is_none());
+        assert!(
+            runs.authenticate(&token, &default_listener(), now)
+                .is_some()
+        );
+        assert!(
+            runs.authenticate("praxis-run-guess", &default_listener(), now)
+                .is_none()
+        );
         // Another OIDC token for the same job can't register it again.
         let mut other_token = identity(1);
         other_token.jti = "another".into();
         assert_eq!(
-            runs.register(other_token, limits(), now),
+            runs.register(other_token, limits(), &default_listener(), now),
             Err(RegisterError::AlreadyRegistered)
         );
     }
@@ -766,7 +867,9 @@ mod tests {
             ttl: Duration::from_secs(1),
             ..limits()
         };
-        let (token, record) = runs.register(identity(1), shorter, now).unwrap();
+        let (token, record) = runs
+            .register(identity(1), shorter, &default_listener(), now)
+            .unwrap();
         assert_ne!(token, lost);
         assert_eq!(
             (
@@ -775,12 +878,15 @@ mod tests {
             ),
             (600, 300)
         );
-        assert_eq!(runs.authenticate(&token, now).as_ref(), Some(&key));
-        assert_eq!(runs.authenticate(&lost, now), None);
+        assert_eq!(
+            runs.authenticate(&token, &default_listener(), now).as_ref(),
+            Some(&key)
+        );
+        assert_eq!(runs.authenticate(&lost, &default_listener(), now), None);
         // Not once the run has ended.
         runs.finish(&key, now);
         assert_eq!(
-            runs.register(identity(1), limits(), now),
+            runs.register(identity(1), limits(), &default_listener(), now),
             Err(RegisterError::AlreadyRegistered)
         );
     }
@@ -870,24 +976,34 @@ mod tests {
         assert!(record.finished_at_unix.is_some());
         assert_eq!(runs.finish(&key, now).unwrap(), record);
         // The token still names the run, for its record, but admits nothing.
-        assert_eq!(runs.authenticate(&token, now).as_ref(), Some(&key));
+        assert_eq!(
+            runs.authenticate(&token, &default_listener(), now).as_ref(),
+            Some(&key)
+        );
         assert_eq!(runs.admit(&key, now).err(), Some(Refusal::Closed));
         // A request admitted before the finish is still recorded.
         in_flight.settle(used(5, None));
         assert_eq!(runs.record(&key, now).unwrap().tokens.total, 5);
         assert_eq!(
-            runs.register(identity(1), limits(), now),
+            runs.register(identity(1), limits(), &default_listener(), now),
             Err(RegisterError::AlreadyRegistered)
         );
 
         let (token, key) = register(&runs, 2, now);
         let expired = now + Duration::from_secs(600);
-        assert_eq!(runs.authenticate(&token, expired).as_ref(), Some(&key));
+        assert_eq!(
+            runs.authenticate(&token, &default_listener(), expired)
+                .as_ref(),
+            Some(&key)
+        );
         assert_eq!(runs.record(&key, expired).unwrap().state, RunState::Expired);
         assert_eq!(runs.admit(&key, expired).err(), Some(Refusal::Closed));
         // Forgotten after the retention period, so the registry stays bounded.
         let forgotten = expired + RETENTION;
-        assert!(runs.authenticate(&token, forgotten).is_none());
+        assert!(
+            runs.authenticate(&token, &default_listener(), forgotten)
+                .is_none()
+        );
         assert!(runs.record(&key, forgotten).is_none());
         assert!(lock(&runs.state).tokens.is_empty());
     }
@@ -899,7 +1015,7 @@ mod tests {
 
     fn unproven(runs: &Runs, name: &str, now: Instant) -> Result<String, RegisterError> {
         let name = RunName::new(name).unwrap();
-        runs.register_unproven(name, None, limits(), QUOTA, now)
+        runs.register_unproven(name, None, limits(), QUOTA, &default_listener(), now)
             .map(|(token, _)| token)
     }
 
@@ -930,7 +1046,7 @@ mod tests {
         let runs = Arc::new(Runs::default());
         let now = Instant::now();
         let token = unproven(&runs, "7", now).unwrap();
-        let key = runs.authenticate(&token, now).unwrap();
+        let key = runs.authenticate(&token, &default_listener(), now).unwrap();
         // Never the subject of a proven run, whatever name is chosen.
         assert_eq!(key.subject(), "unproven-run:7");
         assert!(key.is_unproven());
@@ -969,14 +1085,17 @@ mod tests {
         let runs = Arc::new(Runs::default());
         let now = Instant::now();
         let token = unproven(&runs, "job", now).unwrap();
-        let key = runs.authenticate(&token, now).unwrap();
+        let key = runs.authenticate(&token, &default_listener(), now).unwrap();
         // Unlike a proven run's, a lost token is not replaced: nothing
         // tells the caller that lost it from any other.
         assert_eq!(
             unproven(&runs, "job", now),
             Err(RegisterError::AlreadyRegistered)
         );
-        assert_eq!(runs.authenticate(&token, now), Some(key.clone()));
+        assert_eq!(
+            runs.authenticate(&token, &default_listener(), now),
+            Some(key.clone())
+        );
         runs.finish(&key, now);
         assert_eq!(
             unproven(&runs, "job", now),
@@ -984,7 +1103,7 @@ mod tests {
         );
         // Refused registrations used none of the quota.
         let token = unproven(&runs, "other", now).unwrap();
-        let other = runs.authenticate(&token, now).unwrap();
+        let other = runs.authenticate(&token, &default_listener(), now).unwrap();
         let expired = now + Duration::from_secs(600);
         assert_eq!(
             runs.record(&other, expired).unwrap().state,
@@ -1049,8 +1168,117 @@ mod tests {
                 expected,
                 "{name}"
             );
-            assert!(registry().register(identity(secs), limits(), now).is_ok());
+            assert!(
+                registry()
+                    .register(identity(secs), limits(), &default_listener(), now)
+                    .is_ok()
+            );
         }
+    }
+
+    #[test]
+    fn a_run_is_known_only_through_the_listener_it_registered_on() {
+        let runs = Arc::new(Runs::default());
+        let now = Instant::now();
+        let other = Listener::new("runners").unwrap();
+        let (proven, proven_key) = register(&runs, 1, now);
+        let name = RunName::new("job").unwrap();
+        let (unproven, record) = runs
+            .register_unproven(name, None, limits(), QUOTA, &other, now)
+            .unwrap();
+        for (token, listener, known) in [
+            (&proven, &default_listener(), true),
+            (&proven, &other, false),
+            (&unproven, &other, true),
+            (&unproven, &default_listener(), false),
+        ] {
+            assert_eq!(
+                runs.authenticate(token, listener, now).is_some(),
+                known,
+                "{listener}"
+            );
+        }
+        // A record names its listener, unless it is the default one.
+        assert_eq!(
+            serde_json::to_value(&record).unwrap()["listener"],
+            "runners"
+        );
+        let record = runs.record(&proven_key, now).unwrap();
+        assert!(
+            serde_json::to_value(&record)
+                .unwrap()
+                .get("listener")
+                .is_none()
+        );
+        // A proven run's retry must come through its own listener.
+        assert_eq!(
+            runs.register(identity(1), limits(), &other, now),
+            Err(RegisterError::OtherListener)
+        );
+        // And an admission says whose it is.
+        let admission = runs.admit(&proven_key, now).unwrap();
+        assert!(admission.listener().is_default());
+    }
+
+    #[test]
+    fn each_listener_has_its_own_quota_under_one_ceiling() {
+        let runs = Runs::default();
+        let now = Instant::now();
+        let [a, b] = ["a", "b"].map(|label| Listener::new(label).unwrap());
+        let register = |listener: &Listener, name: &str, quota: Quota| {
+            let name = RunName::new(name).unwrap();
+            runs.register_unproven(name, None, limits(), quota, listener, now)
+                .map(drop)
+        };
+        // Each listener's quota counts its own registrations only.
+        for listener in [&a, &b] {
+            for i in 0..QUOTA.max {
+                assert_eq!(
+                    register(listener, &format!("{listener}-{i}"), QUOTA),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                register(listener, &format!("{listener}-over"), QUOTA),
+                Err(RegisterError::OverQuota)
+            );
+        }
+        // However large the quotas, all listeners together keep at most
+        // MAX_UNPROVEN_RUNS.
+        let unlimited = Quota {
+            max: usize::MAX,
+            window: Duration::from_secs(60),
+        };
+        let kept = 2 * QUOTA.max;
+        for i in kept..MAX_UNPROVEN_RUNS {
+            let listener = if i % 2 == 0 { &a } else { &b };
+            assert_eq!(register(listener, &format!("run-{i}"), unlimited), Ok(()));
+        }
+        for listener in [&a, &b] {
+            assert_eq!(
+                register(listener, "one-more", unlimited),
+                Err(RegisterError::Full)
+            );
+        }
+    }
+
+    #[test]
+    fn a_listener_label_is_short_and_plain() {
+        let longest = "a".repeat(MAX_LISTENER_LABEL);
+        let too_long = "a".repeat(MAX_LISTENER_LABEL + 1);
+        for (label, valid) in [
+            ("runners", true),
+            ("ci.runners-2", true),
+            (longest.as_str(), true),
+            ("", false),
+            (too_long.as_str(), false),
+            ("a b", false),
+            ("a\nb", false),
+            ("a=b", false),
+        ] {
+            assert_eq!(Listener::new(label).is_some(), valid, "{label:?}");
+        }
+        assert!(Listener::default().is_default());
     }
 
     #[test]
@@ -1063,13 +1291,16 @@ mod tests {
         };
         let register = |i: usize| {
             let name = RunName::new(&format!("run-{i}")).unwrap();
-            runs.register_unproven(name, None, limits(), quota, now)
+            runs.register_unproven(name, None, limits(), quota, &default_listener(), now)
                 .map(drop)
         };
         for i in 0..MAX_UNPROVEN_RUNS {
             assert_eq!(register(i), Ok(()), "{i}");
         }
         assert_eq!(register(MAX_UNPROVEN_RUNS), Err(RegisterError::Full));
-        assert!(runs.register(identity(1), limits(), now).is_ok());
+        assert!(
+            runs.register(identity(1), limits(), &default_listener(), now)
+                .is_ok()
+        );
     }
 }

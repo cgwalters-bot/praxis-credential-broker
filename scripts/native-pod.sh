@@ -73,7 +73,8 @@ anthropic_status() {
 
 # POST /v1/runs without an OIDC token: 401 when runs can register, 503
 # without a policy file, and 400 (for the missing x-run-id) when the policy
-# has `unproven`, so that a run registers without one.
+# has `unproven`, so that a run registers without one; 403 when only other
+# listeners of the policy register runs.
 runs_status() {
     curl --silent --output /dev/null --write-out '%{http_code}' --max-time 2 \
         --request POST "http://127.0.0.1:$1/v1/runs"
@@ -117,6 +118,7 @@ case "$mode" in
             401) echo 'run registration: ready' ;;
             400) echo 'run registration: ready, and OPEN: the policy has "unproven", so any client that reaches the port registers runs without proof' ;;
             503) echo 'run registration: no policy, so only pass-through requests are served' ;;
+            403) echo 'run registration: not on this listener; the policy registers runs through its other listeners only' ;;
             *) echo 'run registration: not ready' >&2; exit 1 ;;
         esac
         exit 0
