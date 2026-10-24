@@ -22,6 +22,8 @@ jobs:
           docker build --pull --file Containerfile.proxy --tag "ghcr.io/${repository}-proxy:ci" .
           docker build --pull --file Containerfile.codex --tag "ghcr.io/${repository}-provider-codex:ci" .
           docker build --pull --file Containerfile.gateway --tag "ghcr.io/${repository}-gateway:ci" .
+          # The gateway's user must be able to read its baked-in config.
+          docker run --rm --entrypoint /bin/sh "ghcr.io/${repository}-gateway:ci" -c 'cat /etc/praxis/praxis.yaml >/dev/null'
   publish:
     needs: build
     if: github.event_name != 'pull_request'
@@ -56,6 +58,8 @@ jobs:
           docker build --pull --file Containerfile.proxy --tag "${{ steps.images.outputs.proxy }}:ci" .
           docker build --pull --file Containerfile.codex --tag "${{ steps.images.outputs.provider }}:ci" .
           docker build --pull --file Containerfile.gateway --tag "${{ steps.images.outputs.gateway }}:ci" .
+          # The gateway's user must be able to read its baked-in config.
+          docker run --rm --entrypoint /bin/sh "${{ steps.images.outputs.gateway }}:ci" -c 'cat /etc/praxis/praxis.yaml >/dev/null'
       - name: Log in to GHCR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

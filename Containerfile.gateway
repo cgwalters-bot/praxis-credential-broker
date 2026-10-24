@@ -16,8 +16,10 @@ COPY crates ./crates
 RUN cargo build --release --locked -p praxis-gateway
 FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 LABEL org.opencontainers.image.source="https://github.com/cgwalters-bot/praxis-credential-broker"
+# /etc/praxis is made here, not by the COPY below: BuildKit applies
+# --chmod=0644 to a directory COPY creates, leaving it unsearchable.
 RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc \
-    && mkdir /etc/praxis-credential-broker
+    && mkdir /etc/praxis-credential-broker /etc/praxis
 COPY --from=build /src/target/release/praxis-gateway /usr/local/bin/praxis-gateway
 COPY --chmod=0644 praxis.yaml /etc/praxis/
 COPY --chmod=0755 scripts/praxis-gateway-entrypoint /usr/local/libexec/praxis-gateway-entrypoint
