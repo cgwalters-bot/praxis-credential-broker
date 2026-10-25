@@ -39,6 +39,7 @@
 //! router matches a header against any of its values, conditions against the
 //! first, and the two must agree on which route a request takes.
 use crate::{
+    budget::{Budget, Consumer},
     oidc::{
         AnyWorkflow, CalledWorkflow, DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy,
         present,
@@ -48,7 +49,7 @@ use crate::{
         Admission, Limits, MAX_UNPROVEN_RUNS, Quota, Refusal, RegisterError, RunKey, RunName, Runs,
         TOKEN_PREFIX, Tokens, Usage,
     },
-    usage::{BrokerUsage, Provider},
+    usage::{BrokerUsage, Payer, Provider},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -78,6 +79,7 @@ pub const FILTER_NAME: &str = "run_token";
 const RUNS_PATH: &str = "/v1/runs";
 const RUN_SELF_PATH: &str = "/v1/runs/self";
 const USAGE_PATH: &str = "/usage";
+const GRANT_PATH: &str = "/usage/grant";
 /// Where the review dashboard is served from.
 const DEFAULT_USAGE_ORIGIN: &str = "https://cgwalters-forge.github.io";
 const USAGE_METHODS: HeaderValue = HeaderValue::from_static("GET, OPTIONS");
@@ -178,6 +180,16 @@ struct Config {
     /// stays on until a restart.
     #[serde(default)]
     spend: bool,
+    /// Serve each consumer its grant at `/usage/grant`.
+    budget: Option<BudgetConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetConfig {
+    /// Each consumer's share of each pool (see [`crate::budget`]). Without
+    /// this file nothing is granted.
+    policy_file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +233,10 @@ struct PolicyFile {
     /// if left out.
     #[serde(default, deserialize_with = "present")]
     events: Option<HashSet<String>>,
+    /// Whose budget the runs of `workflows` count against; private if
+    /// left out.
+    #[serde(default, deserialize_with = "present")]
+    consumer: Option<Consumer>,
     /// Workflows admitted wherever they run, such as a reusable workflow
     /// called from another repository. Off unless present.
     #[serde(default)]
@@ -326,6 +342,8 @@ pub struct RunTokenFilter {
     usage_cors_origins: HashSet<String>,
     endpoints: RunEndpoints,
     operators: Operators,
+    /// The deployment's budget, if it has one.
+    budget: Option<Budget>,
 }
 
 /// Who an injected request was admitted for. Either holds one of its
@@ -333,6 +351,15 @@ pub struct RunTokenFilter {
 enum Caller {
     Run(Admission),
     Operator(operators::Slot),
+}
+
+impl Caller {
+    fn consumer(&self) -> Consumer {
+        match self {
+            Self::Run(admission) => admission.consumer,
+            Self::Operator(slot) => slot.operator().consumer(),
+        }
+    }
 }
 
 /// What a request was admitted as, for its usage once the response ends.
@@ -383,6 +410,12 @@ impl RunTokenFilter {
             Some(operators) => Operators::load(&operators.tokens_file, &injected)
                 .map_err(|e| format!("{FILTER_NAME}: {e}"))?,
         };
+        let budget = match &config.budget {
+            None => None,
+            Some(budget) => {
+                Budget::load(&budget.policy_file).map_err(|e| format!("{FILTER_NAME}: {e}"))?
+            }
+        };
         let usage = BrokerUsage::named(&config.registry);
         if config.spend {
             usage.meter_spend();
@@ -392,8 +425,8 @@ impl RunTokenFilter {
         {
             usage.declare_unproven();
         }
-        for operator in operators.names() {
-            usage.declare_operator(operator);
+        for operator in operators.sorted() {
+            usage.declare_operator(operator.name(), operator.consumer());
         }
         Ok(Box::new(Self {
             runs: Runs::named(&config.registry),
@@ -405,6 +438,7 @@ impl RunTokenFilter {
             usage_cors_origins: config.usage_cors_origins,
             endpoints,
             operators,
+            budget,
         }))
     }
 
@@ -456,10 +490,15 @@ impl RunTokenFilter {
         }
     }
 
-    /// Answer `/usage`: the broker's usage, or the preflight a browser sends
-    /// before it lets a page read it. Only an allowed origin gets the CORS
-    /// headers, and never the one for credentials: the read needs none.
-    fn serve_usage(&self, request: &Request) -> FilterAction {
+    /// Answer `/usage` or `/usage/grant`: what `get` answers with the
+    /// headers given, or the preflight a browser sends before it lets a
+    /// page read it. Only an allowed origin gets the CORS headers, and
+    /// never the one for credentials: the read needs none.
+    fn serve_usage(
+        &self,
+        request: &Request,
+        get: impl FnOnce(HeaderMap) -> FilterAction,
+    ) -> FilterAction {
         let origin = request.headers.get(header::ORIGIN).filter(|origin| {
             origin
                 .to_str()
@@ -472,7 +511,7 @@ impl RunTokenFilter {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
         }
         match request.method {
-            Method::GET => json_with(200, &self.usage.snapshot(), headers),
+            Method::GET => get(headers),
             Method::OPTIONS if origin.is_some() => {
                 headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, USAGE_METHODS);
                 headers.insert(header::ACCESS_CONTROL_MAX_AGE, PREFLIGHT_MAX_AGE);
@@ -486,6 +525,27 @@ impl RunTokenFilter {
             Method::OPTIONS => reject(403, "origin not allowed\n"),
             _ => reject(405, "method not allowed\n"),
         }
+    }
+
+    /// The grant of the consumer `?consumer=` names, in percent and of no
+    /// other consumer.
+    fn serve_grant(&self, request: &Request, headers: HeaderMap) -> FilterAction {
+        let Some(budget) = &self.budget else {
+            return reject(404, "no budget is configured\n");
+        };
+        let mut named = request
+            .uri
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|pair| pair.strip_prefix("consumer="));
+        let (Some(name), None) = (named.next(), named.next()) else {
+            return reject(400, "one consumer parameter required\n");
+        };
+        let Some(consumer) = Consumer::parse(name) else {
+            return reject(400, "consumer must be public or private\n");
+        };
+        json_with(200, &self.usage.grant(budget, consumer), headers)
     }
 
     async fn serve_runs(
@@ -626,8 +686,9 @@ impl Registrar {
             Err(e) => return Err(path_error(&e)),
         };
         let file: PolicyFile = serde_yaml::from_str(&text).map_err(|e| path_error(&e))?;
-        // These narrow `workflows` and no other entry.
-        let narrows_workflows = file.events.is_some() || file.entry_workflows.is_some();
+        // These are of `workflows` and no other entry.
+        let narrows_workflows =
+            file.events.is_some() || file.entry_workflows.is_some() || file.consumer.is_some();
         let policy = Policy {
             audience: file.audience,
             workflows: file.workflows,
@@ -635,6 +696,7 @@ impl Registrar {
             owner_ids: file.owner_ids,
             entry_workflows: file.entry_workflows,
             events: file.events.unwrap_or_else(default_events),
+            consumer: file.consumer.unwrap_or_default(),
             called_workflows: file.called_workflows,
             any_workflow: file.any_workflow,
         };
@@ -648,7 +710,7 @@ impl Registrar {
         // would take these for a limit on them, which they are not.
         if proves && !policy.names_workflows() && narrows_workflows {
             return Err(path_error(
-                &"events and entry_workflows apply to `workflows` only; give called_workflows and any_workflow their own events",
+                &"events, entry_workflows and consumer apply to `workflows` only; give called_workflows and any_workflow their own",
             ));
         }
         if file.max_secs == 0 || file.concurrency == 0 {
@@ -807,7 +869,15 @@ impl HttpFilter for RunTokenFilter {
     ) -> Result<FilterAction, FilterError> {
         let path = ctx.request.uri.path();
         if path == USAGE_PATH {
-            return Ok(self.serve_usage(ctx.request));
+            let granted = self.budget.is_some();
+            return Ok(self.serve_usage(ctx.request, |headers| {
+                json_with(200, &self.usage.snapshot(granted), headers)
+            }));
+        }
+        if path == GRANT_PATH {
+            return Ok(self.serve_usage(ctx.request, |headers| {
+                self.serve_grant(ctx.request, headers)
+            }));
         }
         let usage_free = self.usage_free_paths.contains(path);
         if path == RUNS_PATH || path.starts_with("/v1/runs/") {
@@ -923,9 +993,11 @@ impl HttpFilter for RunTokenFilter {
                 admission.success = success;
             }
             if let Some(provider) = metered.provider
+                && let Some(caller) = &metered.caller
                 && let Some(response) = ctx.response_header.as_ref()
             {
-                self.usage.capture(provider, &response.headers);
+                self.usage
+                    .capture(provider, caller.consumer(), &response.headers);
             }
         }
         Ok(FilterAction::Continue)
@@ -947,6 +1019,12 @@ impl HttpFilter for RunTokenFilter {
                 self.usage
                     .settle(provider, reported.as_ref(), metered.success);
             }
+            let consumer = metered.caller.as_ref().map(Caller::consumer);
+            let payer = |operator| Payer {
+                operator,
+                consumer: consumer.unwrap_or_default(),
+                provider: metered.provider,
+            };
             match metered.caller {
                 Some(Caller::Run(admission)) => {
                     if !admission.usage_free {
@@ -955,7 +1033,7 @@ impl HttpFilter for RunTokenFilter {
                                 .settle_unproven(reported.as_ref(), metered.success);
                         }
                         self.usage
-                            .settle_spend(None, reported.as_ref(), metered.success);
+                            .settle_spend(payer(None), reported.as_ref(), metered.success);
                     }
                     admission.settle(reported);
                 }
@@ -963,8 +1041,11 @@ impl HttpFilter for RunTokenFilter {
                     let operator = slot.operator().name();
                     self.usage
                         .settle_operator(operator, reported.as_ref(), metered.success);
-                    self.usage
-                        .settle_spend(Some(operator), reported.as_ref(), metered.success);
+                    self.usage.settle_spend(
+                        payer(Some(operator)),
+                        reported.as_ref(),
+                        metered.success,
+                    );
                 }
                 Some(Caller::Operator(_)) | None => {}
             }

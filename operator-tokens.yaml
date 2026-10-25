@@ -24,3 +24,6 @@ operators:
     clusters: [inference-backend]
     # Optional: requests in flight at once.
     # concurrency: 8
+    # Optional: whose budget grant (budget.yaml, see INTERNALS.md) its use
+    # counts against, public or private.
+    # consumer: private

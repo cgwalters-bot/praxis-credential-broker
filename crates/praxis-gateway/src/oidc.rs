@@ -10,7 +10,10 @@
 //!
 //! Which verified tokens register is the policy's: [`Policy`] has three
 //! forms of entry, and a token registers if any one of them admits it.
-use crate::runs::{Admitted, RunIdentity, unix_now};
+use crate::{
+    budget::Consumer,
+    runs::{Admitted, RunIdentity, unix_now},
+};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use reqwest::Client;
 use serde::Deserialize;
@@ -159,6 +162,8 @@ pub struct AnyWorkflow {
     pub repositories: Repositories,
     #[serde(default, deserialize_with = "present")]
     pub events: Events,
+    #[serde(default)]
+    pub consumer: Consumer,
 }
 
 impl AnyWorkflow {
@@ -191,6 +196,8 @@ pub struct CalledWorkflow {
     pub callers: Repositories,
     #[serde(default, deserialize_with = "present")]
     pub events: Events,
+    #[serde(default)]
+    pub consumer: Consumer,
 }
 
 impl CalledWorkflow {
@@ -273,6 +280,8 @@ pub struct Policy {
     pub entry_workflows: Option<HashSet<String>>,
     /// `event_name` claims, such as `workflow_dispatch`.
     pub events: HashSet<String>,
+    /// Whose budget the runs `workflows` admits count against.
+    pub consumer: Consumer,
     pub called_workflows: Vec<CalledWorkflow>,
     pub any_workflow: Option<AnyWorkflow>,
 }
@@ -333,27 +342,28 @@ impl Policy {
     }
 
     /// The entry that admits the token, the narrowest first, so that a
-    /// run's record names the least permissive setting that covers it.
-    fn admits(&self, claims: &Claims, repository_id: u64, owner_id: u64) -> Option<Admitted> {
-        let called = || {
-            self.called_workflows
-                .iter()
-                .any(|called| called.allows(claims, repository_id, owner_id))
-        };
-        let any = || {
-            self.any_workflow
-                .as_ref()
-                .is_some_and(|any| any.allows(claims, repository_id, owner_id))
-        };
+    /// run's record names the least permissive setting that covers it, and
+    /// that entry's consumer.
+    fn admits(
+        &self,
+        claims: &Claims,
+        repository_id: u64,
+        owner_id: u64,
+    ) -> Option<(Admitted, Consumer)> {
         if self.workflows_allow(claims, repository_id, owner_id) {
-            Some(Admitted::Workflows)
-        } else if called() {
-            Some(Admitted::CalledWorkflows)
-        } else if any() {
-            Some(Admitted::AnyWorkflow)
-        } else {
-            None
+            return Some((Admitted::Workflows, self.consumer));
         }
+        if let Some(called) = self
+            .called_workflows
+            .iter()
+            .find(|called| called.allows(claims, repository_id, owner_id))
+        {
+            return Some((Admitted::CalledWorkflows, called.consumer));
+        }
+        self.any_workflow
+            .as_ref()
+            .filter(|any| any.allows(claims, repository_id, owner_id))
+            .map(|any| (Admitted::AnyWorkflow, any.consumer))
     }
 }
 
@@ -416,7 +426,8 @@ impl GithubOidc {
         let number = |s: &str| s.parse::<u64>().map_err(|_| OidcError::Malformed);
         let repository_id = number(&claims.repository_id)?;
         let owner_id = number(&claims.repository_owner_id)?;
-        let Some(admitted_by) = self.policy.admits(&claims, repository_id, owner_id) else {
+        let Some((admitted_by, consumer)) = self.policy.admits(&claims, repository_id, owner_id)
+        else {
             return Err(OidcError::WorkflowNotAllowed);
         };
         if claims.jti.is_empty() || claims.jti.len() > MAX_JTI {
@@ -436,6 +447,7 @@ impl GithubOidc {
             event_name: claims.event_name,
             actor: claims.actor,
             admitted_by,
+            consumer,
         })
     }
 
@@ -1166,7 +1178,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_identity_carries_the_claims_it_was_admitted_on() {
         let policy = Policy {
-            called_workflows: entries("{called_workflows: [{workflow: lib/agentic/.github/workflows/job.yml, ref: refs/heads/main, callers: {owner_ids: [70]}}]}").called_workflows,
+            called_workflows: entries("{called_workflows: [{workflow: lib/agentic/.github/workflows/job.yml, ref: refs/heads/main, callers: {owner_ids: [70]}, consumer: public}]}").called_workflows,
             ..policy()
         };
         let (oidc, _) = serve_jwks_for(policy).await;
@@ -1184,6 +1196,7 @@ mod tests {
                 identity.event_name.as_str(),
                 identity.actor.as_deref(),
                 identity.admitted_by,
+                identity.consumer,
             ),
             (
                 "lib/agentic/.github/workflows/job.yml@refs/heads/main",
@@ -1194,13 +1207,20 @@ mod tests {
                 "workflow_dispatch",
                 Some("someone"),
                 Admitted::CalledWorkflows,
+                Consumer::Public,
             )
         );
-        // The policy's own workflow is still admitted as that.
+        // The policy's own workflow is still admitted as that, for the
+        // consumer of its own entry.
         let identity = oidc.verify(&jwt(2, &json!({}))).await.unwrap();
         assert_eq!(
-            (identity.admitted_by, identity.workflow_sha, identity.actor),
-            (Admitted::Workflows, None, None)
+            (
+                identity.admitted_by,
+                identity.workflow_sha,
+                identity.actor,
+                identity.consumer
+            ),
+            (Admitted::Workflows, None, None, Consumer::Private)
         );
     }
 

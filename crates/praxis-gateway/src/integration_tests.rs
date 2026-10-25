@@ -884,6 +884,72 @@ async fn spend_is_reported_only_when_enabled_and_by_who_spent_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_is_served_its_own_grant_once_a_budget_is_mounted() {
+    let h = Harness::with_policy().await;
+    let response = h
+        .call(Method::GET, "/usage/grant?consumer=public", &[], None)
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let dir = tempfile::tempdir().unwrap();
+    let budget = dir.path().join("budget.yaml");
+    std::fs::write(
+        &budget,
+        "shares: {public: {codex: 70, anthropic: 70}, private: {codex: 30}}",
+    )
+    .unwrap();
+    let mut policy = proving_policy();
+    policy["consumer"] = json!("public");
+    let h = Harness::start_with(Some(policy), |filter| {
+        if filter["filter"] == "run_token" {
+            filter["budget"]["policy_file"] = Yaml::from(budget.to_str().unwrap());
+        }
+    })
+    .await;
+    let token = h.run(1).await;
+    for bearer in [token.as_str(), OPERATOR_TOKEN] {
+        let (status, body) = h.respond(Some(bearer), RECORDED_INPUT, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let h = &h;
+    let grant = |query: &'static str| async move {
+        let response = h
+            .call(Method::GET, &format!("/usage/grant{query}"), &[], None)
+            .await;
+        let status = response.status();
+        (status, response.text().await.unwrap())
+    };
+    let (status, body) = grant("?consumer=public").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let public: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(public["schema"], "praxis-broker-grant/v1");
+    assert_eq!(public["consumer"], "public");
+    // The fixture's windows, first read part-way used, so restored; and
+    // nothing read of Anthropic, so left out.
+    let codex = &public["pools"]["codex"];
+    assert_eq!(codex["windows"]["primary"]["used_percent"], 42.5);
+    assert_eq!(codex["windows"]["primary"]["share_percent"], 70.0);
+    assert_eq!(
+        (&codex["stale"], &codex["hold"]),
+        (&json!(true), &json!(true))
+    );
+    assert!(public["pools"].get("anthropic").is_none());
+    assert_eq!(public["hold"], true);
+    assert!(!body.contains("30.0"), "{body}");
+    let (status, body) = grant("?consumer=private").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("70.0"), "{body}");
+    for query in ["", "?consumer=board", "?consumer=public&consumer=private"] {
+        assert_eq!(grant(query).await.0, StatusCode::BAD_REQUEST, "{query}");
+    }
+    // /usage has only the public consumer's spend: its run's, and no
+    // private operator's.
+    let spend = &h.broker_usage().await["spend"];
+    assert_eq!(spend["runs"]["total"], 0.000_082);
+    assert_eq!(spend["by_operator"], json!({}));
+    assert_eq!(spend["total"], 0.000_082);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_codex_stream_is_metered() {
     let h = Harness::with_policy().await;
     let token = h.run(1).await;

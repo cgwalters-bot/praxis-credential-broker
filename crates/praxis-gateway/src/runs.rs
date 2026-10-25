@@ -5,6 +5,7 @@
 //! request's run as its authenticated identity, and a `token_rate_limit`
 //! rule keyed on it caps the run. This module only records what each run
 //! used, for the job to read back.
+use crate::budget::Consumer;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -92,6 +93,8 @@ pub struct RunIdentity {
     pub event_name: String,
     pub actor: Option<String>,
     pub admitted_by: Admitted,
+    /// The consumer of the entry that admitted it.
+    pub consumer: Consumer,
 }
 
 /// The form of policy entry that admitted a run's OIDC token, by its key
@@ -303,6 +306,7 @@ struct Run {
     /// registered without proof has none: nothing could tell its caller
     /// from another, so it never registers again.
     jti: Option<String>,
+    consumer: Consumer,
     concurrency: usize,
     expires: Instant,
     retain_until: Instant,
@@ -428,7 +432,15 @@ impl Runs {
             actor: identity.actor,
             admitted_by: identity.admitted_by,
         };
-        let record = state.insert(key, proof, Some(identity.jti), hash, limits, now);
+        let record = state.insert(
+            key,
+            proof,
+            Some(identity.jti),
+            identity.consumer,
+            hash,
+            limits,
+            now,
+        );
         Ok((token, record))
     }
 
@@ -469,7 +481,9 @@ impl Runs {
             "unproven run registered"
         );
         let (token, hash) = new_token();
-        let record = state.insert(key, Proof::Unproven { run: name }, None, hash, limits, now);
+        // Whoever it is, it is not the public board's.
+        let proof = Proof::Unproven { run: name };
+        let record = state.insert(key, proof, None, Consumer::Private, hash, limits, now);
         Ok((token, record))
     }
 
@@ -511,6 +525,7 @@ impl Runs {
         Ok(Admission {
             runs: Arc::clone(self),
             key: key.clone(),
+            consumer: run.consumer,
             success: false,
             usage_free: false,
             settled: false,
@@ -546,6 +561,7 @@ impl State {
         key: RunKey,
         proof: Proof,
         jti: Option<String>,
+        consumer: Consumer,
         token_hash: [u8; 32],
         limits: Limits,
         now: Instant,
@@ -570,6 +586,7 @@ impl State {
                 record: record.clone(),
                 token_hash,
                 jti,
+                consumer,
                 concurrency: limits.concurrency,
                 expires: now + limits.ttl,
                 retain_until: now + limits.ttl + RETENTION,
@@ -604,6 +621,8 @@ impl State {
 pub struct Admission {
     runs: Arc<Runs>,
     key: RunKey,
+    /// Whose budget the run's use counts against.
+    pub consumer: Consumer,
     /// Upstream answered with a success status.
     pub success: bool,
     /// The request uses no tokens, like counting them, whatever upstream
@@ -678,6 +697,7 @@ mod tests {
             event_name: "workflow_dispatch".into(),
             actor: None,
             admitted_by: Admitted::Workflows,
+            consumer: Consumer::Public,
         }
     }
 
