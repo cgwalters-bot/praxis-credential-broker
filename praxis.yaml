@@ -11,6 +11,7 @@
 #   /v1/runs (prefix)                  run registration, answered by run_token
 #   /usage (exact), GET                local broker usage, answered by run_token,
 #                                      with CORS for the review dashboard
+#   /usage/grant (exact), GET          one consumer's budget grant, likewise
 #
 # Each route that reaches a provider has a credential mode, given per
 # cluster in run_token's `credentials` below:
@@ -150,6 +151,8 @@ filter_chains:
             cluster: run-endpoints
           - path: "/usage"
             cluster: run-endpoints
+          - path: "/usage/grant"
+            cluster: run-endpoints
           - path: "/anthropic/v1/messages"
             headers:
               authorization: "Bearer praxis-substitute:anthropic"
@@ -191,6 +194,10 @@ filter_chains:
         # What injected requests cost at list price over the trailing week,
         # in /usage, for the board's weekly budget (see INTERNALS.md).
         spend: true
+        # Each consumer's share of each pool, served at /usage/grant; none
+        # unless the deployment mounts this file (see INTERNALS.md).
+        budget:
+          policy_file: /etc/praxis-credential-broker/budget.yaml
         credentials:
           inference-backend: injected
           anthropic: injected
@@ -426,7 +433,8 @@ filter_chains:
             endpoints: ["api.mistral.ai:443"]
             tls:
               sni: "api.mistral.ai"
-          # Never connected to: run_token answers /v1/runs and /usage locally.
+          # Never connected to: run_token answers /v1/runs, /usage and
+          # /usage/grant locally.
           - name: run-endpoints
             endpoints: ["127.0.0.1:9"]
 # The Responses filter makes Praxis read each request body in full before any

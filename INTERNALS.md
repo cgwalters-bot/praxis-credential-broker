@@ -31,6 +31,7 @@ published as `127.0.0.1:18080`:
 | `/mistral/v1/chat/completions` (exact) | `POST` | `mistral` | injected | the broker's Mistral API key |
 | `/v1/runs` (prefix) | see [run tokens](#run-tokens) | answered by `run_token` | | |
 | `/usage` (exact) | `GET` | answered locally by `run_token` | none needed | none |
+| `/usage/grant` (exact) | `GET` | answered locally by `run_token` | none needed | none |
 
 Any other path gets 404. Upstream, `/anthropic/v1/...` is rewritten to
 `/v1/...` and the query string is kept, so Claude Code uses
@@ -743,7 +744,8 @@ deployment can mount `/etc/praxis-credential-broker/operator-tokens.yaml`,
 a copy of `operator-tokens.yaml`, naming up to 16 operators. Each entry has
 a `name`, the `token_sha256` of its token, the injected `clusters` the
 token may use (`inference-backend`, `anthropic`), and optionally its
-`concurrency` (default 8). `scripts/create-operator-token NAME CLUSTERS`
+`concurrency` (default 8) and the `consumer` of its
+[budget grant](#budget-grants) (default `private`). `scripts/create-operator-token NAME CLUSTERS`
 mints a token (`praxis-operator-` and 64 hex digits) into a file only its
 owner can read and prints the entry; the token is never printed. Use only
 tokens it minted: the hash protects a random token, not one a person chose.
@@ -884,12 +886,105 @@ It is kept in hourly buckets, so the week rolls off an hour at a time; it
 is off by default because the endpoint is unauthenticated and the figure
 is only as current as the table. Once a `run_token` filter turns it on for
 a registry it stays on, even through a reload without `spend: true`, until
-a restart. Like the counts, it resets on restart for now.
+a restart. Like the counts, it resets on restart for now. Once a
+[budget](#budget-grants) grants shares, `spend` is the public consumer's
+only: `runs` is the public runs', `by_operator` lists only the public
+operators, and the totals are theirs.
+
+### Budget grants
+
+Off by default. The budget is owned privately and delegated out: a policy
+the deployment mounts at `/etc/praxis-credential-broker/budget.yaml` (the
+file `run_token`'s `budget.policy_file` names; it is not in this
+repository) gives each consumer a share of each pool, and
+`GET /usage/grant?consumer=NAME` serves that consumer its grant: its share
+and its use, in percent of the whole window, and nothing of any other
+consumer's or in dollars. Without the file `/usage/grant` answers 404; a
+file that is not valid stops the gateway from starting, as a policy file
+does.
+
+There are two consumers, `public` and `private`. Every admission rule names
+one with `consumer`: the `workflows` entry of the run-token policy (beside
+it, like `events`), each `called_workflows` entry, `any_workflow`, and each
+operator in the tokens file. A rule that names none is `private`, and so
+are runs registered without proof, whatever the policy says, and any use
+the broker does not see. A deployment whose board budgets its runs names
+`consumer: public` on the entries that admit them by OIDC token and on the
+board's own operator.
+
+```yaml
+# Each consumer's share of each pool, in percent of every one of its
+# windows: anthropic, codex, mistral. The shares of a pool add up to at most
+# 100. A consumer missing here, or a pool missing from its shares, is
+# granted nothing: its grant holds.
+shares:
+  public: {anthropic: 70, codex: 70, mistral: 70}
+  private: {anthropic: 30, codex: 30, mistral: 30}
+# Mistral has no window: its shares are of this weekly list-price cap, in
+# USD. Required if any consumer has a share of mistral.
+mistral_weekly_usd: 50
+```
+
+**Attribution.** Providers report a window's utilization for the whole
+account, not per caller. Each injected response carries the current
+reading (the headers of [`/usage`](#broker-usage-endpoint)), and the rise
+since the previous reading is charged to the consumer of the rule that
+admitted the request; a lower reading charges nobody. When a window passes
+its reset, the next reading is all charged to its request's consumer. Use
+between two brokered requests, such as the operator's own unbrokered use,
+so lands on the next one, which overcounts and so holds early, never late.
+The gateway keeps no reading across a restart (#35), so a window it first
+reads part-way used is *restored*: both consumers are charged all of that
+use, and it is stale until it resets. Mistral's use is the consumer's
+list-price spend over the trailing week, from the [spend](#broker-usage-endpoint)
+meter, as a percent of `mistral_weekly_usd`; without `spend: true` there is
+none, and its pool is left out.
+
+**Pacing.** A window of more than five hours (the 7-day ones, and
+Mistral's week) is paced: `allowed_percent = share × (elapsed fraction +
+0.1)`, up to the share, where the elapsed fraction is of the window from
+its start (its reset less its length), and for Mistral of the week since
+metering began. The 5-hour windows are not paced: allowed is the share. A
+window holds when its `used_percent` exceeds `allowed_percent`, or when its
+reading is stale: more than five hours old, or restored.
+
+```json
+{
+  "schema": "praxis-broker-grant/v1",
+  "consumer": "public",
+  "observed_at": 1792900000,
+  "hold": false,
+  "pools": {
+    "anthropic": {"hold": false, "stale": false, "windows": {
+      "unified_7d": {"share_percent": 70.0, "allowed_percent": 31.5, "used_percent": 18.2, "resets_at": 1793300000, "hold": false},
+      "unified_5h": {"share_percent": 70.0, "allowed_percent": 70.0, "used_percent": 12.0, "resets_at": 1792910000, "hold": false}}},
+    "codex": {"hold": false, "stale": false, "windows": {
+      "secondary": {"share_percent": 70.0, "allowed_percent": 31.5, "used_percent": 5.1, "resets_at": 1793280000, "hold": false},
+      "primary": {"share_percent": 70.0, "allowed_percent": 70.0, "used_percent": 2.0, "resets_at": 1792905000, "hold": false}}},
+    "mistral": {"hold": false, "stale": false, "windows": {
+      "spend_7d": {"share_percent": 70.0, "allowed_percent": 31.5, "used_percent": 0.4, "resets_at": null, "hold": false}}}
+  }
+}
+```
+
+`observed_at` is when the grant was computed. A window is named as in
+`/usage`, and Codex's are those its plan has. A pool is `stale` if any of
+its windows is and holds if any of them does; a pool of the consumer's
+shares with nothing read yet is left out of `pools`, which means hold. The
+top-level `hold` is true if any of the consumer's pools holds or is left
+out, and for a consumer the policy does not name. Percentages are rounded
+to hundredths after `hold` is decided. A query without exactly one
+`consumer` of `public` or `private` gets 400. Like `/usage`, the endpoint is
+unauthenticated, with the same CORS, so whoever reaches the listener can
+read either consumer's grant; and `/usage` still has the whole account's
+windows and counts.
 
 The bounded state has three counters and four window slots per named run registry,
 a counter per operator (at most 64 names, across reloads of the tokens file)
 and one for the runs registered without proof, and with `spend`, at most 168
-hourly buckets for the runs and for each of those operators.
+hourly buckets for the runs of each consumer, for each of those operators
+and for each consumer's Mistral spend; and, for grants, each of the four
+windows' latest reading with what each consumer used of it.
 It survives configuration reloads, and resets on process restart (`started_at`
 names the start of that state). It stores no credentials, arbitrary headers,
 prompt content, model dimensions or run identifiers; operators' names are the
@@ -984,7 +1079,15 @@ the same container:
 Volume=%h/.config/praxis-credential-broker/operator-tokens.yaml:/etc/praxis-credential-broker/operator-tokens.yaml:ro,Z
 ```
 
-The Mistral key, if the deployment serves `/mistral`, is a third, once
+So is the [budget](#budget-grants), if the deployment grants shares:
+
+```ini
+# ~/.config/containers/systemd/praxis-credential-broker-praxis.container.d/budget.conf
+[Container]
+Volume=%h/.config/praxis-credential-broker/budget.yaml:/etc/praxis-credential-broker/budget.yaml:ro,Z
+```
+
+The Mistral key, if the deployment serves `/mistral`, is another, once
 `scripts/init-mistral-key` has stored the secret; a unit that names a secret
 Podman does not have fails to start:
 

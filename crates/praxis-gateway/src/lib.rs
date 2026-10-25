@@ -2,6 +2,7 @@
 //! registry: `run_token`, for per-run bearer tokens and operator tokens. Usage parsing and the
 //! caps, per window and per run, are praxis-ai's own `token_count` and
 //! `token_rate_limit`.
+mod budget;
 mod filter;
 mod oidc;
 mod operators;

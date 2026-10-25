@@ -1,15 +1,20 @@
 //! Bounded broker totals and latest subscription-window response headers.
-use crate::runs::{Tokens, Usage};
+use crate::{
+    budget::{Attributed, Budget, Consumer, FIVE_HOURS, Grant, MistralSpend, Reading, WEEK},
+    runs::{Tokens, Usage},
+};
 use http::HeaderMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::warn;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A provider, and its pool in a budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Provider {
     Anthropic,
     Codex,
@@ -120,6 +125,12 @@ pub(crate) struct Snapshot {
     /// it. Filled in when the snapshot is taken.
     #[serde(skip_serializing_if = "Option::is_none")]
     spend: Option<SpendView>,
+    /// The windows of `WINDOWS`, as charged to each consumer, for grants.
+    #[serde(skip)]
+    attributed: [Option<Attributed>; 4],
+    /// The listed operators whose consumer is public.
+    #[serde(skip)]
+    public_operators: BTreeSet<String>,
 }
 
 impl Default for Snapshot {
@@ -133,9 +144,19 @@ impl Default for Snapshot {
             operators: BTreeMap::new(),
             unproven_runs: None,
             spend: None,
+            attributed: Default::default(),
+            public_operators: BTreeSet::new(),
         }
     }
 }
+
+/// The windows a grant has, by their names in `/usage`.
+const WINDOWS: [(Provider, &str); 4] = [
+    (Provider::Anthropic, "unified_5h"),
+    (Provider::Anthropic, "unified_7d"),
+    (Provider::Codex, "primary"),
+    (Provider::Codex, "secondary"),
+];
 
 /// Hours of spend kept: the week the board's budget is set for.
 const SPEND_HOURS: u64 = 7 * 24;
@@ -235,9 +256,12 @@ struct Spend {
     /// Unix seconds when metering began: before a week has passed since,
     /// the figures cover less than the week.
     since: u64,
-    runs: Week,
+    /// By consumer.
+    runs: [Week; 2],
     /// Only the operators the snapshot lists, so it is bounded as they are.
     operators: BTreeMap<String, Week>,
+    /// Mistral's part of all of the above, by consumer, for its grants.
+    mistral: [Week; 2],
 }
 
 /// A payer's spend, or all of it.
@@ -282,11 +306,19 @@ struct SpendView {
 }
 
 impl Spend {
-    fn view(&self, hour: u64) -> SpendView {
-        let runs = self.runs.sum(hour);
+    /// The spend of the week ending with `hour`; only the public
+    /// consumer's if `public_operators`, the operators it has, is given.
+    fn view(&self, hour: u64, public_operators: Option<&BTreeSet<String>>) -> SpendView {
+        let mut runs = self.runs[Consumer::Public.index()].sum(hour);
+        if public_operators.is_none() {
+            runs.add(&self.runs[Consumer::Private.index()].sum(hour));
+        }
         let mut all = runs;
         let mut by_operator = BTreeMap::new();
         for (name, week) in &self.operators {
+            if public_operators.is_some_and(|public| !public.contains(name)) {
+                continue;
+            }
             let tally = week.sum(hour);
             all.add(&tally);
             by_operator.insert(name.clone(), tally.into());
@@ -302,6 +334,16 @@ impl Spend {
             by_operator,
         }
     }
+}
+
+/// Whom a settled response's spend is charged to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Payer<'a> {
+    /// The operator named, or else the runs.
+    pub operator: Option<&'a str>,
+    pub consumer: Consumer,
+    /// The provider that answered, if its usage is counted.
+    pub provider: Option<Provider>,
 }
 
 /// The counts, and the spend if it is metered. Always lock the counts first.
@@ -337,23 +379,55 @@ impl BrokerUsage {
         )
     }
 
-    pub(crate) fn snapshot(&self) -> Snapshot {
-        self.snapshot_at(unix_time())
+    /// The snapshot `/usage` serves. Once a budget grants shares, its spend
+    /// is only the public consumer's, which is the board's to read.
+    pub(crate) fn snapshot(&self, granted: bool) -> Snapshot {
+        self.snapshot_at(unix_time(), granted)
     }
 
-    fn snapshot_at(&self, now: u64) -> Snapshot {
+    fn snapshot_at(&self, now: u64, granted: bool) -> Snapshot {
         let mut snapshot = self
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        let public = granted.then_some(&snapshot.public_operators);
         snapshot.spend = self
             .1
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map(|spend| spend.view(now / 3600));
+            .map(|spend| spend.view(now / 3600, public));
         snapshot
+    }
+
+    /// `consumer`'s grant under `budget`.
+    pub(crate) fn grant(&self, budget: &Budget, consumer: Consumer) -> Grant {
+        self.grant_at(budget, consumer, unix_time())
+    }
+
+    fn grant_at(&self, budget: &Budget, consumer: Consumer, now: u64) -> Grant {
+        let attributed = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .attributed
+            .clone();
+        let mistral = self
+            .1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|spend| MistralSpend {
+                micros: spend.mistral[consumer.index()].sum(now / 3600).micros,
+                since: spend.since,
+            });
+        let windows: Vec<_> = WINDOWS
+            .iter()
+            .zip(&attributed)
+            .map(|(&(provider, name), window)| (provider, name, window.as_ref()))
+            .collect();
+        budget.grant(consumer, &windows, mistral, now)
     }
 
     /// Meter list-price spend from now on, if it is not metered already. It
@@ -371,34 +445,25 @@ impl BrokerUsage {
         let mut spend = self.1.lock().unwrap_or_else(PoisonError::into_inner);
         spend.get_or_insert_with(|| Spend {
             since: now,
-            runs: Week::default(),
+            runs: Default::default(),
             operators: state
                 .operators
                 .keys()
                 .map(|name| (name.clone(), Week::default()))
                 .collect(),
+            mistral: Default::default(),
         });
     }
 
-    /// Charge what a response cost at list price to the runs, or to the
-    /// operator named, if spend is metered and the operator listed. A
-    /// successful response without usage is counted as unmetered.
-    pub(crate) fn settle_spend(
-        &self,
-        operator: Option<&str>,
-        usage: Option<&Usage>,
-        success: bool,
-    ) {
-        self.settle_spend_at(operator, usage, success, unix_time());
+    /// Charge what a response from `provider` cost at list price to the
+    /// runs, or to the operator named, and to `consumer`, if spend is
+    /// metered and the operator listed. A successful response without
+    /// usage is counted as unmetered.
+    pub(crate) fn settle_spend(&self, payer: Payer<'_>, usage: Option<&Usage>, success: bool) {
+        self.settle_spend_at(payer, usage, success, unix_time());
     }
 
-    fn settle_spend_at(
-        &self,
-        operator: Option<&str>,
-        usage: Option<&Usage>,
-        success: bool,
-        now: u64,
-    ) {
+    fn settle_spend_at(&self, payer: Payer<'_>, usage: Option<&Usage>, success: bool, now: u64) {
         // As `Counts::settle` counts them.
         let charge = match usage {
             Some(usage) => crate::prices::cost(usage).map_or(Charge::Unpriced, Charge::Priced),
@@ -409,14 +474,18 @@ impl BrokerUsage {
         let Some(spend) = spend.as_mut() else {
             return;
         };
-        let week = match operator {
-            None => &mut spend.runs,
+        let consumer = payer.consumer.index();
+        let week = match payer.operator {
+            None => &mut spend.runs[consumer],
             Some(operator) => match spend.operators.get_mut(operator) {
                 Some(week) => week,
                 None => return,
             },
         };
         week.add(now / 3600, charge);
+        if payer.provider == Some(Provider::Mistral) {
+            spend.mistral[consumer].add(now / 3600, charge);
+        }
     }
 
     pub(crate) fn settle(&self, provider: Provider, usage: Option<&Usage>, success: bool) {
@@ -431,29 +500,34 @@ impl BrokerUsage {
 
     /// List `operator` in the snapshot, at zero until it uses something.
     /// Operators removed from the tokens file stay listed until a restart,
-    /// so the map never outgrows `MAX_LISTED_OPERATORS`.
-    pub(crate) fn declare_operator(&self, operator: &str) {
+    /// so the map never outgrows `MAX_LISTED_OPERATORS`. Its `consumer` is
+    /// the one it was last declared with.
+    pub(crate) fn declare_operator(&self, operator: &str, consumer: Consumer) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.operators.contains_key(operator) {
-            return;
+        if !state.operators.contains_key(operator) {
+            if state.operators.len() >= MAX_LISTED_OPERATORS {
+                warn!(
+                    operator,
+                    "too many operators since the gateway started; this one's usage is not counted by name"
+                );
+                return;
+            }
+            state
+                .operators
+                .insert(operator.to_owned(), Counts::default());
+            if let Some(spend) = self
+                .1
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                spend.operators.insert(operator.to_owned(), Week::default());
+            }
         }
-        if state.operators.len() >= MAX_LISTED_OPERATORS {
-            warn!(
-                operator,
-                "too many operators since the gateway started; this one's usage is not counted by name"
-            );
-            return;
-        }
-        state
-            .operators
-            .insert(operator.to_owned(), Counts::default());
-        if let Some(spend) = self
-            .1
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-        {
-            spend.operators.insert(operator.to_owned(), Week::default());
+        if consumer == Consumer::Public {
+            state.public_operators.insert(operator.to_owned());
+        } else {
+            state.public_operators.remove(operator);
         }
     }
 
@@ -492,35 +566,83 @@ impl BrokerUsage {
         runs.counts.settle(usage, success);
     }
 
-    pub(crate) fn capture(&self, provider: Provider, headers: &HeaderMap) {
-        self.capture_at(provider, headers, unix_time());
+    /// Keep the windows a response to `consumer`'s request reports, and
+    /// charge `consumer` what they rose by.
+    pub(crate) fn capture(&self, provider: Provider, consumer: Consumer, headers: &HeaderMap) {
+        self.capture_at(provider, consumer, headers, unix_time());
     }
 
-    fn capture_at(&self, provider: Provider, headers: &HeaderMap, now: u64) {
+    fn capture_at(&self, provider: Provider, consumer: Consumer, headers: &HeaderMap, now: u64) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // By index in `WINDOWS`: a complete reading, or None for a window
+        // the plan does not have.
+        let mut read = Vec::new();
         match provider {
             Provider::Anthropic => {
-                if let Some(window) = anthropic_window(headers, "5h", now) {
-                    state.anthropic.unified_5h = Some(window);
-                }
-                if let Some(window) = anthropic_window(headers, "7d", now) {
-                    state.anthropic.unified_7d = Some(window);
+                let Anthropic {
+                    unified_5h,
+                    unified_7d,
+                    ..
+                } = &mut state.anthropic;
+                for (index, slot, name, window_secs) in [
+                    (0, unified_5h, "5h", FIVE_HOURS),
+                    (1, unified_7d, "7d", WEEK),
+                ] {
+                    if let Some(window) = anthropic_window(headers, name, now) {
+                        if let (Some(utilization), Some(resets_at)) =
+                            (window.utilization, window.reset)
+                        {
+                            read.push((
+                                index,
+                                Some(Reading {
+                                    used_percent: utilization * 100.0,
+                                    resets_at,
+                                    window_secs,
+                                }),
+                            ));
+                        }
+                        *slot = Some(window);
+                    }
                 }
             }
             Provider::Codex => {
                 let Codex {
                     primary, secondary, ..
                 } = &mut state.codex;
-                for (slot, name) in [(primary, "primary"), (secondary, "secondary")] {
+                for (index, slot, name) in [(2, primary, "primary"), (3, secondary, "secondary")] {
                     match codex_window(headers, name, now) {
                         // A window the plan does not have comes as zeros.
-                        Some(window) if window.window_minutes == Some(0) => *slot = None,
-                        Some(window) => *slot = Some(window),
+                        Some(window) if window.window_minutes == Some(0) => {
+                            *slot = None;
+                            read.push((index, None));
+                        }
+                        Some(window) => {
+                            if let (Some(used_percent), Some(minutes), Some(after)) = (
+                                window.used_percent,
+                                window.window_minutes,
+                                window.reset_after_seconds,
+                            ) {
+                                read.push((
+                                    index,
+                                    Some(Reading {
+                                        used_percent,
+                                        resets_at: now.saturating_add(after),
+                                        window_secs: minutes.saturating_mul(60),
+                                    }),
+                                ));
+                            }
+                            *slot = Some(window);
+                        }
                         None => {}
                     }
                 }
             }
             Provider::Mistral => {}
+        }
+        for (index, reading) in read {
+            let window = &mut state.attributed[index];
+            *window =
+                reading.map(|reading| Attributed::charge(window.as_ref(), reading, consumer, now));
         }
     }
 }
@@ -598,9 +720,14 @@ mod tests {
     #[test]
     fn fixtures_capture_only_typed_windows_and_update_independently() {
         let usage = BrokerUsage::default();
-        usage.capture_at(Provider::Anthropic, &fixture("anthropic"), 10);
-        usage.capture_at(Provider::Codex, &fixture("codex"), 20);
-        let snapshot = usage.snapshot();
+        usage.capture_at(
+            Provider::Anthropic,
+            Consumer::Private,
+            &fixture("anthropic"),
+            10,
+        );
+        usage.capture_at(Provider::Codex, Consumer::Private, &fixture("codex"), 20);
+        let snapshot = usage.snapshot(false);
         let five = snapshot.anthropic.unified_5h.unwrap();
         assert_eq!(five.utilization, Some(0.42));
         assert_eq!(five.reset, Some(1791115200));
@@ -618,15 +745,15 @@ mod tests {
         let secondary = snapshot.codex.secondary.unwrap();
         assert_eq!(secondary.window_minutes, Some(10080));
         assert_eq!(secondary.reset_after_seconds, Some(345600));
-        let serialized = serde_json::to_string(&usage.snapshot()).unwrap();
+        let serialized = serde_json::to_string(&usage.snapshot(false)).unwrap();
         assert!(!serialized.contains("SYNTHETIC"));
         let mut update = HeaderMap::new();
         update.insert("x-codex-primary-used-percent", "55".parse().unwrap());
-        usage.capture_at(Provider::Codex, &update, 30);
-        assert_eq!(usage.snapshot().codex.primary.unwrap().observed_at, 30);
-        assert_eq!(usage.snapshot().codex.secondary.unwrap(), secondary);
-        usage.capture_at(Provider::Codex, &HeaderMap::new(), 40);
-        assert_eq!(usage.snapshot().codex.primary.unwrap().observed_at, 30);
+        usage.capture_at(Provider::Codex, Consumer::Private, &update, 30);
+        assert_eq!(usage.snapshot(false).codex.primary.unwrap().observed_at, 30);
+        assert_eq!(usage.snapshot(false).codex.secondary.unwrap(), secondary);
+        usage.capture_at(Provider::Codex, Consumer::Private, &HeaderMap::new(), 40);
+        assert_eq!(usage.snapshot(false).codex.primary.unwrap().observed_at, 30);
         // As chatgpt.com answered on 2026-10-05, for a plan whose only
         // window is the weekly one.
         let mut weekly_only = HeaderMap::new();
@@ -640,8 +767,8 @@ mod tests {
         ] {
             weekly_only.insert(name, value.parse().unwrap());
         }
-        usage.capture_at(Provider::Codex, &weekly_only, 50);
-        let codex = usage.snapshot().codex;
+        usage.capture_at(Provider::Codex, Consumer::Private, &weekly_only, 50);
+        let codex = usage.snapshot(false).codex;
         assert_eq!(codex.primary.unwrap().window_minutes, Some(10080));
         assert_eq!(codex.secondary, None);
     }
@@ -690,8 +817,8 @@ mod tests {
             // may come from.
             let mut headers = fixture("anthropic");
             headers.extend(fixture("codex"));
-            usage.capture_at(provider, &headers, 10);
-            let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+            usage.capture_at(provider, Consumer::Private, &headers, 10);
+            let snapshot = serde_json::to_value(usage.snapshot(false)).unwrap();
             for other in ["anthropic", "codex", "mistral"] {
                 let want = if other == field {
                     counts(1, 1, [24, 20, 44])
@@ -748,17 +875,17 @@ mod tests {
             model: None,
             cache_write: 0,
         };
-        usage.declare_operator("me");
+        usage.declare_operator("me", Consumer::Private);
         usage.settle_operator("me", Some(&reported), true);
         usage.settle_operator("me", None, true);
         usage.settle_operator("me", None, false);
         // Declaring again keeps the counts; an undeclared name is not kept.
-        usage.declare_operator("me");
+        usage.declare_operator("me", Consumer::Private);
         usage.settle_operator("stranger", Some(&reported), true);
         for i in 0..2 * MAX_LISTED_OPERATORS {
-            usage.declare_operator(&format!("o{i}"));
+            usage.declare_operator(&format!("o{i}"), Consumer::Private);
         }
-        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        let snapshot = serde_json::to_value(usage.snapshot(false)).unwrap();
         let operators = snapshot["operators"].as_object().unwrap();
         assert_eq!(operators.len(), MAX_LISTED_OPERATORS);
         assert!(!operators.contains_key("stranger"));
@@ -785,11 +912,11 @@ mod tests {
             model: None,
             cache_write: 0,
         };
-        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        let snapshot = serde_json::to_value(usage.snapshot(false)).unwrap();
         assert!(snapshot.get("unproven_runs").is_none());
         usage.declare_unproven();
         assert_eq!(
-            serde_json::to_value(usage.snapshot()).unwrap()["unproven_runs"],
+            serde_json::to_value(usage.snapshot(false)).unwrap()["unproven_runs"],
             serde_json::json!({
                 "registered": 0,
                 "refused": 0,
@@ -807,7 +934,7 @@ mod tests {
         usage.settle_unproven(None, false);
         // Declaring again, as a reload does, keeps the counts.
         usage.declare_unproven();
-        let snapshot = serde_json::to_value(usage.snapshot()).unwrap();
+        let snapshot = serde_json::to_value(usage.snapshot(false)).unwrap();
         assert_eq!(
             snapshot["unproven_runs"],
             serde_json::json!({
@@ -834,28 +961,148 @@ mod tests {
     }
 
     fn spend(usage: &BrokerUsage, now: u64) -> serde_json::Value {
-        serde_json::to_value(usage.snapshot_at(now)).unwrap()["spend"].clone()
+        serde_json::to_value(usage.snapshot_at(now, false)).unwrap()["spend"].clone()
+    }
+
+    const RUNS: Payer<'static> = Payer {
+        operator: None,
+        consumer: Consumer::Private,
+        provider: None,
+    };
+
+    fn operator(name: &str) -> Payer<'_> {
+        Payer {
+            operator: Some(name),
+            ..RUNS
+        }
+    }
+
+    /// Once grants exist, `/usage` has only the public consumer's spend,
+    /// and Mistral's is kept by consumer for their grants.
+    #[test]
+    fn granted_spend_is_the_public_consumers() {
+        use Consumer::{Private, Public};
+        let usage = BrokerUsage::default();
+        usage.meter_spend_at(0);
+        usage.declare_operator("board", Public);
+        usage.declare_operator("me", Private);
+        let dollars = |n: u64| priced("claude-opus-5-5", n * 250_000);
+        let mistral = Some(Provider::Mistral);
+        for (operator, consumer, provider, n) in [
+            (None, Public, None, 1),
+            (None, Private, None, 2),
+            (None, Public, mistral, 4),
+            (Some("board"), Public, mistral, 8),
+            (Some("me"), Private, mistral, 16),
+        ] {
+            let payer = Payer {
+                operator,
+                consumer,
+                provider,
+            };
+            usage.settle_spend_at(payer, Some(&dollars(n)), true, 0);
+        }
+        let all = serde_json::to_value(usage.snapshot_at(0, false)).unwrap();
+        assert_eq!(all["spend"]["total"], 31.0);
+        assert_eq!(all["spend"]["runs"]["total"], 7.0);
+        let public = serde_json::to_value(usage.snapshot_at(0, true)).unwrap();
+        assert_eq!(public["spend"]["total"], 13.0);
+        assert_eq!(public["spend"]["runs"]["total"], 5.0);
+        assert_eq!(
+            public["spend"]["by_operator"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["board"]
+        );
+        // Declared again as private, as a reload does, it is left out.
+        usage.declare_operator("board", Private);
+        let public = serde_json::to_value(usage.snapshot_at(0, true)).unwrap();
+        assert_eq!(public["spend"]["by_operator"], serde_json::json!({}));
+        let spend = usage.1.lock().unwrap();
+        let mistral = &spend.as_ref().unwrap().mistral;
+        assert_eq!(mistral[Public.index()].sum(0).micros, 12_000_000);
+        assert_eq!(mistral[Private.index()].sum(0).micros, 16_000_000);
+    }
+
+    /// The windows of the fixtures are charged to the consumer whose
+    /// response carried them, by the names `/usage` gives them.
+    #[test]
+    fn captured_windows_are_charged_to_the_requests_consumer() {
+        use Consumer::{Private, Public};
+        let budget = Budget::parse(
+            "shares: {public: {anthropic: 50, codex: 50}, private: {anthropic: 50, codex: 50}}",
+        )
+        .unwrap();
+        // Before the fixture's 5-hour window resets.
+        let now = 1_791_110_000;
+        let usage = BrokerUsage::default();
+        usage.capture_at(Provider::Anthropic, Public, &fixture("anthropic"), now);
+        usage.capture_at(Provider::Codex, Public, &fixture("codex"), now);
+        let used = |consumer| {
+            let grant = serde_json::to_value(usage.grant_at(&budget, consumer, now)).unwrap();
+            let window = |pool: &str, name: &str| {
+                let window = &grant["pools"][pool]["windows"][name];
+                (
+                    window["used_percent"].as_f64().unwrap(),
+                    window["resets_at"].as_u64().unwrap(),
+                )
+            };
+            [
+                window("anthropic", "unified_5h"),
+                window("anthropic", "unified_7d"),
+                window("codex", "primary"),
+                window("codex", "secondary"),
+            ]
+        };
+        // Read part-way through, each window is charged to both in full.
+        let first = [
+            (42.0, 1_791_115_200),
+            (81.0, 1_791_676_800),
+            (42.5, now + 1200),
+            (81.0, now + 345_600),
+        ];
+        assert_eq!(used(Public), first);
+        assert_eq!(used(Private), first);
+        let mut rise = HeaderMap::new();
+        rise.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.5".parse().unwrap(),
+        );
+        rise.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            "1791115200".parse().unwrap(),
+        );
+        usage.capture_at(Provider::Anthropic, Private, &rise, now);
+        assert_eq!(used(Public)[0].0, 42.0);
+        assert_eq!(used(Private)[0].0, 50.0);
+        // A plan without the window clears it.
+        let mut weekly_only = HeaderMap::new();
+        weekly_only.insert("x-codex-secondary-window-minutes", "0".parse().unwrap());
+        usage.capture_at(Provider::Codex, Private, &weekly_only, now);
+        assert!(usage.0.lock().unwrap().attributed[3].is_none());
     }
 
     #[test]
     fn spend_is_off_until_enabled_and_keeps_runs_and_operators_apart() {
         let usage = BrokerUsage::default();
-        usage.declare_operator("me");
+        usage.declare_operator("me", Consumer::Private);
         // $4 per million input.
         let dollars = |n: u64| priced("claude-opus-5-5", n * 250_000);
-        usage.settle_spend_at(None, Some(&dollars(1)), true, 0);
+        usage.settle_spend_at(RUNS, Some(&dollars(1)), true, 0);
         assert_eq!(spend(&usage, 0), serde_json::Value::Null);
         usage.meter_spend_at(100);
-        usage.declare_operator("you");
-        usage.settle_spend_at(None, Some(&dollars(3)), true, 100);
-        usage.settle_spend_at(Some("me"), Some(&dollars(5)), true, 100);
-        usage.settle_spend_at(Some("you"), Some(&dollars(7)), true, 100);
-        usage.settle_spend_at(Some("stranger"), Some(&dollars(11)), true, 100);
-        usage.settle_spend_at(Some("me"), Some(&priced("claude-test", 1)), true, 100);
+        usage.declare_operator("you", Consumer::Private);
+        usage.settle_spend_at(RUNS, Some(&dollars(3)), true, 100);
+        usage.settle_spend_at(operator("me"), Some(&dollars(5)), true, 100);
+        usage.settle_spend_at(operator("you"), Some(&dollars(7)), true, 100);
+        usage.settle_spend_at(operator("stranger"), Some(&dollars(11)), true, 100);
+        usage.settle_spend_at(operator("me"), Some(&priced("claude-test", 1)), true, 100);
         // Without usage, a success is unmetered and a failure not counted.
-        usage.settle_spend_at(None, None, true, 100);
-        usage.settle_spend_at(None, None, false, 100);
-        usage.settle_spend_at(Some("you"), None, true, 100);
+        usage.settle_spend_at(RUNS, None, true, 100);
+        usage.settle_spend_at(RUNS, None, false, 100);
+        usage.settle_spend_at(operator("you"), None, true, 100);
         // Enabling again, as a reload or another filter does, keeps what
         // was metered and when it began.
         usage.meter_spend_at(200);
@@ -892,15 +1139,15 @@ mod tests {
         // $1 in each of the week's hours and two more, and an unpriced and
         // an unmetered response in the first.
         let dollar = priced("claude-opus-5-5", 250_000);
-        usage.settle_spend_at(None, Some(&priced("claude-test", 1)), true, start);
-        usage.settle_spend_at(None, None, true, start);
+        usage.settle_spend_at(RUNS, Some(&priced("claude-test", 1)), true, start);
+        usage.settle_spend_at(RUNS, None, true, start);
         assert_eq!(spend(&usage, start + 59)["runs"]["unpriced_requests"], 1);
         assert_eq!(spend(&usage, start + 59)["runs"]["unmetered_requests"], 1);
         for h in 0..SPEND_HOURS + 2 {
-            usage.settle_spend_at(None, Some(&dollar), true, start + h * hour);
+            usage.settle_spend_at(RUNS, Some(&dollar), true, start + h * hour);
         }
         let at = |h: u64| spend(&usage, start + h * hour + 59);
-        let buckets = || usage.1.lock().unwrap().as_ref().unwrap().runs.0.len() as u64;
+        let buckets = || usage.1.lock().unwrap().as_ref().unwrap().runs[1].0.len() as u64;
         assert_eq!(buckets(), SPEND_HOURS);
         let now = SPEND_HOURS + 1;
         assert_eq!(at(now)["runs"]["total"], 168.0);
@@ -911,7 +1158,7 @@ mod tests {
         assert_eq!(at(now + 100)["runs"]["total"], 68.0);
         assert_eq!(at(now + SPEND_HOURS)["runs"]["total"], 0.0);
         // A clock that steps back charges the latest hour.
-        usage.settle_spend_at(None, Some(&dollar), true, start);
+        usage.settle_spend_at(RUNS, Some(&dollar), true, start);
         assert_eq!(at(now)["runs"]["total"], 169.0);
         assert_eq!(buckets(), SPEND_HOURS);
     }
@@ -931,14 +1178,14 @@ mod tests {
         usage.settle(Provider::Codex, Some(&reported), true);
         usage.settle(Provider::Codex, None, true);
         usage.settle(Provider::Codex, None, false);
-        let snapshot = BrokerUsage::named("usage-unit-test").snapshot();
+        let snapshot = BrokerUsage::named("usage-unit-test").snapshot(false);
         assert_eq!(snapshot.codex.counts.requests, 2);
         assert_eq!(snapshot.codex.counts.unmetered, 1);
         assert_eq!(snapshot.codex.counts.tokens.total, u64::MAX);
         assert_eq!(snapshot.anthropic.counts.requests, 0);
         assert_eq!(
             BrokerUsage::named("usage-unit-other")
-                .snapshot()
+                .snapshot(false)
                 .codex
                 .counts
                 .requests,

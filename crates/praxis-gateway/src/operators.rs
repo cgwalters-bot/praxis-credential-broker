@@ -10,6 +10,7 @@
 //! authenticated identity under its own name, so the `token_rate_limit`
 //! rule keyed on the identity caps it like a run, and `/usage` counts it
 //! apart from the runs.
+use crate::budget::Consumer;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -52,6 +53,9 @@ struct Entry {
     /// Requests of the operator in flight at once.
     #[serde(default = "default_concurrency")]
     concurrency: usize,
+    /// Whose budget its use counts against.
+    #[serde(default)]
+    consumer: Consumer,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,12 +70,17 @@ pub struct Operator {
     name: String,
     clusters: HashSet<String>,
     concurrency: usize,
+    consumer: Consumer,
     in_flight: AtomicUsize,
 }
 
 impl Operator {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn consumer(&self) -> Consumer {
+        self.consumer
     }
 
     /// The operator as an authenticated subject, which budgets are keyed
@@ -188,6 +197,7 @@ impl Operators {
                 name: entry.name,
                 clusters: entry.clusters,
                 concurrency: entry.concurrency,
+                consumer: entry.consumer,
                 in_flight: AtomicUsize::new(0),
             };
             if by_hash.insert(hash, Arc::new(operator)).is_some() {
@@ -197,11 +207,16 @@ impl Operators {
         Ok(Self { by_hash })
     }
 
+    /// The operators, sorted by name.
+    pub fn sorted(&self) -> Vec<&Operator> {
+        let mut operators: Vec<_> = self.by_hash.values().map(AsRef::as_ref).collect();
+        operators.sort_unstable_by_key(|o| o.name());
+        operators
+    }
+
     /// The operators' names, sorted.
     pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<_> = self.by_hash.values().map(|o| o.name()).collect();
-        names.sort_unstable();
-        names
+        self.sorted().into_iter().map(Operator::name).collect()
     }
 
     /// The operator a bearer token belongs to.
@@ -250,6 +265,22 @@ mod tests {
                 Some(vec!["me", "you"]),
             ),
             ("none", "operators: []".to_owned(), Some(vec![])),
+            (
+                "a consumer",
+                format!(
+                    "operators: [{}]",
+                    entry("me", TOKEN, "clusters: [codex], consumer: public")
+                ),
+                Some(vec!["me"]),
+            ),
+            (
+                "no such consumer",
+                format!(
+                    "operators: [{}]",
+                    entry("me", TOKEN, "clusters: [codex], consumer: board")
+                ),
+                None,
+            ),
             ("not yaml", "operators: [".to_owned(), None),
             ("no list", "{}".to_owned(), None),
             (
@@ -362,10 +393,10 @@ mod tests {
     fn only_the_whole_token_authenticates_its_operator() {
         let text = format!("operators: [{}]", entry("me", TOKEN, "clusters: [codex]"));
         let operators = Operators::parse(&text, &injected()).unwrap();
-        assert_eq!(
-            operators.authenticate(TOKEN).unwrap().subject(),
-            "operator:me"
-        );
+        let operator = operators.authenticate(TOKEN).unwrap();
+        assert_eq!(operator.subject(), "operator:me");
+        // A rule that names no consumer is the private one's.
+        assert_eq!(operator.consumer(), Consumer::Private);
         for wrong in [
             "",
             "praxis-operator-",
