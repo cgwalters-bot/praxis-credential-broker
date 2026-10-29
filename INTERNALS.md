@@ -63,7 +63,30 @@ provider-owned.
 
 The proxy accepts only `POST /v1/responses`, strips caller authorization,
 cookies, account, hop-by-hop, and proxy headers, and forwards to a fixed HTTPS
-endpoint. The client cannot choose a URL, authority, or provider profile. It
+endpoint. The client cannot choose a URL, authority, or provider profile.
+Other request headers go upstream unchanged, except `proxy-*`,
+`openai-organization`, `openai-project`, `host`, `content-length`,
+`forwarded`, `x-forwarded-*`, `x-real-ip`, `accept-encoding` and those named
+in `Connection`, and any header the agent may inject (`authorization`,
+`chatgpt-account-id`), which the injected credential replaces. Names are
+compared with `_` read as `-` and case ignored, as many backends read them, so
+`chatgpt_account_id` is stripped too. `accept-encoding` is stripped so the
+backend answers uncompressed: the proxy does not decompress, and could not
+read the usage out of a compressed response. This denylist is written for
+chatgpt.com: other providers' credential headers such as `x-api-key`,
+`api-key` and `anthropic-*` go through, which is harmless only while
+`UPSTREAM` is the Codex endpoint, and must be denied before it points
+anywhere else. So the
+`session_id` and `x-client-request-id` headers that Codex routes the prompt
+cache by arrive, and a request with neither gets both from its body's
+`prompt_cache_key`, if that is a token of at most 64 ASCII letters, digits,
+`-`, `_`, `.` or `:`. Each upstream request logs one `upstream usage` line
+with its route, status, model and token counts (`input` includes `cached`),
+whether the client sent each routing header, and the first 12 hex digits of
+the SHA-256 of `prompt_cache_key`; no header value, prompt or credential.
+Because clients steer cache routing on the shared account and get
+`cached_tokens` back, one consumer can probe whether another's prompt prefix
+is warm; that is acceptable only while the consumers trust each other. It
 runs with `CLIENT_AUTH_MODE=disabled`: Praxis has already authenticated the
 run, and the proxy listens only on the pod's loopback, where only Praxis
 connects; the pod publishes only Praxis's port. Its `required` mode, a static client API key,
