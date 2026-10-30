@@ -884,6 +884,91 @@ async fn spend_is_reported_only_when_enabled_and_by_who_spent_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cache_hit_rates_are_reported_only_when_enabled_and_by_key_hash() {
+    const KEY: &str = "SYNTHETIC-CACHE-KEY";
+    let h = Harness::with_policy().await;
+    let token = h.run(1).await;
+    assert_eq!(h.respond(Some(&token), "", false).await.0, StatusCode::OK);
+    assert!(h.broker_usage().await.get("cache").is_none());
+
+    let h = Harness::start(true, |filter| {
+        if filter["filter"] == "run_token" {
+            filter["cache_stats"] = Yaml::from(true);
+        }
+    })
+    .await;
+    let token = h.run(1).await;
+    let body = json!({"model": "gpt-test", "input": "", "prompt_cache_key": KEY});
+    // A session is the key's, whichever run sends it; a run each keeps
+    // them under the per-run cap.
+    for (run, stream) in [(1, false), (2, true), (3, false)] {
+        let auth = match run {
+            1 => format!("Bearer {token}"),
+            run => format!("Bearer {}", h.run(run).await),
+        };
+        let mut body = body.clone();
+        body["stream"] = stream.into();
+        let response = h
+            .call(
+                Method::POST,
+                "/v1/responses",
+                &[("authorization", &auth)],
+                Some(body),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    // Without a key, and on the Messages API, the routes count it but no
+    // session does.
+    assert_eq!(
+        h.respond(Some(OPERATOR_TOKEN), "", false).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(h.injected(Some(&token)).await.0, StatusCode::OK);
+    let usage = h.broker_usage().await;
+    let cache = &usage["cache"];
+    let rate = |requests: u64, input: u64, cached: u64, hit_rate: f64| json!({"requests": requests, "input": input, "cached": cached, "hit_rate": hit_rate});
+    // Responses: 70 in, of which 30 cached. Messages: 40 in and 20 read.
+    let codex = rate(4, 280, 120, 0.4286);
+    let anthropic = rate(1, 60, 20, 0.3333);
+    assert_eq!(
+        cache["routes"],
+        json!([
+            {"provider": "anthropic", "model": "claude-test", "last_hour": anthropic, "last_day": anthropic},
+            {"provider": "codex", "model": "gpt-test", "last_hour": codex, "last_day": codex},
+        ])
+    );
+    let sessions = cache["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(
+        session["cache_key"],
+        hex::encode(&Sha256::digest(KEY)[..6]),
+        "the hash credential-proxy logs"
+    );
+    assert_eq!(
+        (
+            &session["provider"],
+            &session["requests"],
+            &session["first_input"],
+            &session["later"]
+        ),
+        (
+            &json!("codex"),
+            &json!(3),
+            &json!(70),
+            &rate(2, 140, 60, 0.4286)
+        )
+    );
+    assert!(cache["since"].as_u64().is_some_and(|since| since > 0));
+    let serialized = usage.to_string();
+    for secret in [KEY, token.as_str(), OPERATOR_TOKEN] {
+        assert!(!serialized.contains(secret));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_consumer_is_served_its_own_grant_once_a_budget_is_mounted() {
     let h = Harness::with_policy().await;
     let response = h

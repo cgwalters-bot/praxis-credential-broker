@@ -40,6 +40,7 @@
 //! first, and the two must agree on which route a request takes.
 use crate::{
     budget::{Budget, Consumer},
+    cache,
     oidc::{
         AnyWorkflow, CalledWorkflow, DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy,
         present,
@@ -180,6 +181,12 @@ struct Config {
     /// stays on until a restart.
     #[serde(default)]
     spend: bool,
+    /// Report in `/usage` the share of injected requests' input read from
+    /// the prompt cache, by model and by `prompt_cache_key` session (see
+    /// [`crate::cache`]). Once on for a registry, it stays on until a
+    /// restart.
+    #[serde(default)]
+    cache_stats: bool,
     /// Serve each consumer its grant at `/usage/grant`.
     budget: Option<BudgetConfig>,
 }
@@ -369,6 +376,9 @@ struct Metered {
     success: bool,
     /// Whose request it is, unless it is pass-through.
     caller: Option<Caller>,
+    /// The hash of the request's `prompt_cache_key`, if cache hit rates are
+    /// counted and it has one.
+    cache_key: Option<String>,
 }
 
 impl RunTokenFilter {
@@ -419,6 +429,9 @@ impl RunTokenFilter {
         let usage = BrokerUsage::named(&config.registry);
         if config.spend {
             usage.meter_spend();
+        }
+        if config.cache_stats {
+            usage.count_cache();
         }
         if let RunEndpoints::Serving(registrar) = &endpoints
             && registrar.unproven.is_some()
@@ -970,11 +983,18 @@ impl HttpFilter for RunTokenFilter {
         } else {
             None
         };
+        // Praxis has read the whole body already, for the protocol filters.
+        // Only Codex sends a prompt_cache_key, so only its bodies are parsed.
+        let cache_key = provider
+            .filter(|provider| *provider == Provider::Codex && self.usage.counts_cache())
+            .and(ctx.buffered_request_body.as_deref())
+            .and_then(cache::key_hash);
         ctx.extensions.insert(Metered {
             mode,
             provider,
             success: false,
             caller,
+            cache_key,
         });
         Ok(FilterAction::Continue)
     }
@@ -1018,6 +1038,10 @@ impl HttpFilter for RunTokenFilter {
             if let Some(provider) = metered.provider {
                 self.usage
                     .settle(provider, reported.as_ref(), metered.success);
+                if let Some(reported) = &reported {
+                    self.usage
+                        .settle_cache(provider, metered.cache_key.as_deref(), reported);
+                }
             }
             let consumer = metered.caller.as_ref().map(Caller::consumer);
             let payer = |operator| Payer {
