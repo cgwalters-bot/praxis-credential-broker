@@ -1,6 +1,7 @@
 //! Bounded broker totals and latest subscription-window response headers.
 use crate::{
     budget::{Attributed, Budget, Consumer, FIVE_HOURS, Grant, MistralSpend, Reading, WEEK},
+    cache::{CacheStats, CacheView},
     runs::{Tokens, Usage},
 };
 use http::HeaderMap;
@@ -13,7 +14,7 @@ use std::{
 use tracing::warn;
 
 /// A provider, and its pool in a budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Provider {
     Anthropic,
@@ -22,6 +23,15 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
+    /// Its name, as `/usage` spells it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Codex => "codex",
+            Self::Mistral => "mistral",
+        }
+    }
+
     /// The provider whose credential the broker injects for `cluster`.
     pub(crate) fn for_cluster(cluster: Option<&str>) -> Option<Self> {
         match cluster? {
@@ -125,6 +135,10 @@ pub(crate) struct Snapshot {
     /// it. Filled in when the snapshot is taken.
     #[serde(skip_serializing_if = "Option::is_none")]
     spend: Option<SpendView>,
+    /// Prompt-cache hit rates, if the deployment counts them. Filled in
+    /// when the snapshot is taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<CacheView>,
     /// The windows of `WINDOWS`, as charged to each consumer, for grants.
     #[serde(skip)]
     attributed: [Option<Attributed>; 4],
@@ -144,6 +158,7 @@ impl Default for Snapshot {
             operators: BTreeMap::new(),
             unproven_runs: None,
             spend: None,
+            cache: None,
             attributed: Default::default(),
             public_operators: BTreeSet::new(),
         }
@@ -346,15 +361,21 @@ pub(crate) struct Payer<'a> {
     pub provider: Option<Provider>,
 }
 
-/// The counts, and the spend if it is metered. Always lock the counts first.
+/// The counts, the spend if it is metered, and the prompt-cache hit rates if
+/// they are counted. Always lock the counts first.
 #[derive(Default)]
-pub(crate) struct BrokerUsage(Mutex<Snapshot>, Mutex<Option<Spend>>);
+pub(crate) struct BrokerUsage(
+    Mutex<Snapshot>,
+    Mutex<Option<Spend>>,
+    Mutex<Option<CacheStats>>,
+);
 
 // Like the run registry, configuration reloads retain the named state. Each
 // registry has exactly three counters and four window slots, a counter per
 // operator a tokens file named and one for all runs registered without
-// proof, never per-client keys; and, if spend is metered, a week of hourly
-// buckets for the runs and one for each of those operators.
+// proof, never per-client keys; if spend is metered, a week of hourly
+// buckets for the runs and one for each of those operators; and if cache
+// hit rates are counted, the bounded slots and sessions of `CacheStats`.
 static REGISTRIES: LazyLock<Mutex<HashMap<String, Arc<BrokerUsage>>>> =
     LazyLock::new(Mutex::default);
 
@@ -398,7 +419,45 @@ impl BrokerUsage {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|spend| spend.view(now / 3600, public));
+        snapshot.cache = self
+            .2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|cache| cache.view(now));
         snapshot
+    }
+
+    /// Count prompt-cache hit rates from now on, if they are not counted
+    /// already. Off unless the deployment turns it on, because `/usage` is
+    /// readable by anyone who reaches the listener and a session's hash,
+    /// sizes and times tell whoever knows or can guess its key when it is
+    /// in use. Like spend, nothing turns it off again before a restart.
+    pub(crate) fn count_cache(&self) {
+        self.2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| CacheStats::new(unix_time()));
+    }
+
+    pub(crate) fn counts_cache(&self) -> bool {
+        self.2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Count a response from `provider` with `usage` in the hit rates, if
+    /// they are counted, and in the session `cache_key` names, if any.
+    pub(crate) fn settle_cache(&self, provider: Provider, cache_key: Option<&str>, usage: &Usage) {
+        if let Some(cache) = self
+            .2
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            cache.settle(provider, cache_key, usage, unix_time());
+        }
     }
 
     /// `consumer`'s grant under `budget`.

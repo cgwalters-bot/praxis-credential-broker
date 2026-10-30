@@ -3,6 +3,7 @@
 //! caps, per window and per run, are praxis-ai's own `token_count` and
 //! `token_rate_limit`.
 mod budget;
+mod cache;
 mod filter;
 mod oidc;
 mod operators;

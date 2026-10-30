@@ -914,6 +914,36 @@ a restart. Like the counts, it resets on restart for now. Once a
 only: `runs` is the public runs', `by_operator` lists only the public
 operators, and the totals are theirs.
 
+`cache` is there only if `run_token` has `cache_stats: true`: how much of
+the input of settled injected responses the provider read from its prompt
+cache, so that the cache share can be read without the logs. `routes` has,
+for each provider and model with a response in the last day, `last_hour` and
+`last_day`, each `requests`, `input` (cached included), `cached` and
+`hit_rate` (`cached ÷ input`, null without input), in five-minute slots, so
+the hour is that to five minutes; and `since`, when counting began. A
+session is the Codex requests whose body names one `prompt_cache_key`, if
+that is a key credential-proxy hashes too (1 to 64 ASCII letters, digits,
+`-`, `_`, `.` or `:`). `sessions` lists the ten seen in the last day with
+the most requests since each began: its `cache_key`, the first 12 hex
+digits of the key's SHA-256, the same hash credential-proxy's `upstream
+usage` line has; its `provider`, `requests`, `first_input`, the input of its
+first request, which warms the cache, `later`, the same four figures as a
+route's for the requests after it, so that a session's later `hit_rate`
+shows how well the cache held, and `last_seen` (Unix seconds). The first
+time a session's later `hit_rate` is under 50% from its third request on,
+the gateway logs one warning with its hash and counts. Nothing else of a
+request is kept: no key, prompt, run or credential. At most 64 provider and
+model pairs are kept apart; the rest, and a model name over 64 bytes, are
+counted under `(other)`, one per provider. At most 1024 sessions are kept,
+each forgotten a day after its last request, or, when there are that many,
+the least recently seen first; a session forgotten and seen again starts
+over, and may be warned of again. It is off by default because
+`/usage` is unauthenticated and a session's hash, sizes and times tell
+whoever knows or can guess its key, and anyone else how active the broker
+is, when it is in use; it is the whole broker's, whatever the
+[budget](#budget-grants) grants. Like spend, once on for a registry it stays
+on until a restart, and it resets on restart.
+
 ### Budget grants
 
 Off by default. The budget is owned privately and delegated out: a policy
@@ -1006,12 +1036,13 @@ The bounded state has three counters and four window slots per named run registr
 a counter per operator (at most 64 names, across reloads of the tokens file)
 and one for the runs registered without proof, and with `spend`, at most 168
 hourly buckets for the runs of each consumer, for each of those operators
-and for each consumer's Mistral spend; and, for grants, each of the four
+and for each consumer's Mistral spend; with `cache_stats`, the bounded
+slots and sessions above; and, for grants, each of the four
 windows' latest reading with what each consumer used of it.
 It survives configuration reloads, and resets on process restart (`started_at`
 names the start of that state). It stores no credentials, arbitrary headers,
-prompt content, model dimensions or run identifiers; operators' names are the
-deployment's own. Header fixtures in testdata use
+prompt content, model dimensions (except `cache`'s bounded ones) or run
+identifiers; operators' names are the deployment's own. Header fixtures in testdata use
 synthetic values in the provider header shapes.
 
 Subscription inference has no per-token bill, so without a cap only a job's
