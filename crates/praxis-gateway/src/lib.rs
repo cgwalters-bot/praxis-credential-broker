@@ -30,6 +30,13 @@ pub fn register_filters(registry: &mut FilterRegistry) -> Result<(), praxis_filt
     )
 }
 
+/// Keep the usage windows in the file at `path` across restarts: load
+/// what it has, and rewrite it as they change. Call it before building the
+/// filters.
+pub fn keep_usage_state(path: std::path::PathBuf) {
+    usage::keep_state(path);
+}
+
 /// Praxis AI's full filter registry plus this crate's filters.
 ///
 /// # Errors

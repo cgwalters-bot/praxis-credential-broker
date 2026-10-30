@@ -51,7 +51,7 @@ impl Consumer {
 }
 
 /// What one response said of one window, for the whole account.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Reading {
     pub used_percent: f64,
     pub resets_at: u64,
@@ -60,13 +60,18 @@ pub struct Reading {
 
 /// A window's latest reading and what each consumer used of it since it
 /// last reset, in percent of the window.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Attributed {
     reading: Reading,
     observed_at: u64,
     /// The gateway first read this window part-way used, so whose that use
-    /// was is unknown until it resets: it keeps nothing across a restart
-    /// (#35). Each consumer is charged all of it meanwhile.
+    /// was is unknown until it resets: without a usage state file it keeps
+    /// nothing across a restart. Each consumer is charged all of it
+    /// meanwhile.
+    part_way: bool,
+    /// Loaded from the usage state file, and not read since.
+    #[serde(skip)]
     restored: bool,
     used: [f64; 2],
 }
@@ -76,12 +81,12 @@ impl Attributed {
     /// `consumer`'s request, follows `previous`.
     pub fn charge(previous: Option<&Self>, reading: Reading, consumer: Consumer, now: u64) -> Self {
         let mut used = [0.0; 2];
-        let restored = match previous {
+        let part_way = match previous {
             Some(previous) if now < previous.reading.resets_at => {
                 used = previous.used;
                 let rise = reading.used_percent - previous.reading.used_percent;
                 used[consumer.index()] += rise.max(0.0);
-                previous.restored
+                previous.part_way
             }
             // Reset since the previous reading: all of it is since then.
             Some(_) => {
@@ -96,8 +101,17 @@ impl Attributed {
         Self {
             reading,
             observed_at: now,
-            restored,
+            part_way,
+            restored: false,
             used,
+        }
+    }
+
+    /// The window as loaded from the usage state file.
+    pub fn restore(self) -> Self {
+        Self {
+            restored: true,
+            ..self
         }
     }
 }
@@ -279,6 +293,13 @@ impl Budget {
                     continue;
                 };
                 let reading = window.reading;
+                // A reading kept across a restart is old because the gateway
+                // was down, when nothing brokered was used: it is good until
+                // its window resets, and then is no reading at all.
+                if window.restored && now >= reading.resets_at {
+                    continue;
+                }
+                let old = !window.restored && now.saturating_sub(window.observed_at) > FIVE_HOURS;
                 read.push((
                     name,
                     Window {
@@ -286,8 +307,7 @@ impl Budget {
                         start: reading.resets_at.saturating_sub(reading.window_secs),
                         secs: reading.window_secs,
                         resets_at: Some(reading.resets_at),
-                        stale: window.restored
-                            || now.saturating_sub(window.observed_at) > FIVE_HOURS,
+                        stale: window.part_way || old,
                     },
                 ));
             }
@@ -353,27 +373,27 @@ mod tests {
         let mut window: Option<Attributed> = None;
         for (name, t, used, resets_at, consumer, want) in steps {
             let next = Attributed::charge(window.as_ref(), reading(used, resets_at), consumer, t);
-            assert_eq!((next.used, next.restored), (want, false), "{name}");
+            assert_eq!((next.used, next.part_way), (want, false), "{name}");
             window = Some(next);
         }
     }
 
     #[test]
-    fn a_window_first_read_part_way_is_restored_until_it_resets() {
+    fn a_window_first_read_part_way_is_so_until_it_resets() {
         let reset = T0 + WEEK;
         let first = Attributed::charge(None, reading(20.0, reset), Consumer::Private, T0);
         // Each consumer is charged all of it, and it holds.
-        assert_eq!((first.used, first.restored), ([20.0; 2], true));
+        assert_eq!((first.used, first.part_way), ([20.0; 2], true));
         let later =
             Attributed::charge(Some(&first), reading(25.0, reset), Consumer::Public, T0 + 1);
-        assert_eq!((later.used, later.restored), ([25.0, 20.0], true));
+        assert_eq!((later.used, later.part_way), ([25.0, 20.0], true));
         let after = Attributed::charge(
             Some(&later),
             reading(1.0, reset + WEEK),
             Consumer::Public,
             reset,
         );
-        assert_eq!((after.used, after.restored), ([1.0, 0.0], false));
+        assert_eq!((after.used, after.part_way), ([1.0, 0.0], false));
     }
 
     fn budget() -> Budget {
@@ -426,11 +446,12 @@ mod tests {
 
     /// A week's window as read at `observed_at` and charged `used`, and
     /// started at `T0`.
-    fn week(used: [f64; 2], observed_at: u64, restored: bool) -> Attributed {
+    fn week(used: [f64; 2], observed_at: u64, part_way: bool) -> Attributed {
         Attributed {
             reading: reading(used[0] + used[1], T0 + WEEK),
             observed_at,
-            restored,
+            part_way,
+            restored: false,
             used,
         }
     }
@@ -443,6 +464,7 @@ mod tests {
                 window_secs: FIVE_HOURS,
             },
             observed_at,
+            part_way: false,
             restored: false,
             used,
         }
@@ -483,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_restored_readings_hold() {
+    fn stale_and_part_way_readings_hold_and_restored_ones_do_not() {
         let now = T0 + WEEK / 2;
         let cases = [
             ("fresh", week([1.0, 0.0], now, false), false),
@@ -493,7 +515,14 @@ mod tests {
                 false,
             ),
             ("older", week([1.0, 0.0], now - FIVE_HOURS - 1, false), true),
-            ("restored", week([1.0, 0.0], now, true), true),
+            ("part-way", week([1.0, 0.0], now, true), true),
+            // Kept across a restart, and its window has not reset yet.
+            ("restored", week([1.0, 0.0], T0 + 1, false).restore(), false),
+            (
+                "restored part-way",
+                week([1.0, 0.0], T0 + 1, true).restore(),
+                true,
+            ),
         ];
         for (name, window, hold) in cases {
             let grant = budget().grant(
@@ -518,6 +547,19 @@ mod tests {
             assert_eq!(pool.windows["unified_7d"].hold, hold, "{name}");
             assert!(!pool.windows["unified_5h"].hold, "{name}");
         }
+    }
+
+    /// A window kept across a restart whose reset has passed since is no
+    /// reading: left out, and its pool unread holds.
+    #[test]
+    fn a_restored_window_past_its_reset_is_no_reading() {
+        let window = week([1.0, 0.0], T0 + 1, false).restore();
+        let windows = [(Provider::Anthropic, "unified_7d", Some(&window))];
+        let grant = budget().grant(Consumer::Public, &windows, None, T0 + WEEK - 1);
+        assert!(!grant.pools[&Provider::Anthropic].hold);
+        let grant = budget().grant(Consumer::Public, &windows, None, T0 + WEEK);
+        assert!(grant.hold);
+        assert!(!grant.pools.contains_key(&Provider::Anthropic));
     }
 
     #[test]
