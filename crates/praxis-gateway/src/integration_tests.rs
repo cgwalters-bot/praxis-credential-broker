@@ -973,6 +973,52 @@ async fn a_recorded_codex_stream_is_metered() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_codex_run_keeps_usage_split_by_upstream_model() {
+    // Exercise both JSON and SSE usage alongside the recorded Codex stream.
+    for stream in [false, true] {
+        let h = Harness::with_policy().await;
+        let token = h.run(1).await;
+        for _ in 0..2 {
+            let (status, body) = h.respond(Some(&token), RECORDED_INPUT, true).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, body) = h.respond(Some(&token), "", stream).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let usage = h.usage(&token).await;
+        assert_eq!(usage["schema"], RECORD_SCHEMA);
+        assert_eq!(usage["requests"], 3);
+        assert_eq!(usage["unmetered"], 0);
+        // All requests ask for gpt-test, but the recorded upstream names
+        // gpt-6.1-sol. Attribution must use the response, not the request.
+        assert_eq!(
+            usage["models"],
+            json!({
+                "gpt-6.1-sol": {"input": 32, "cache_read": 0, "output": 10, "reasoning": 0, "total": 42},
+                "gpt-test": {"input": 40, "cache_read": 30, "output": 30, "reasoning": 5, "total": 100},
+            })
+        );
+        let totals =
+            json!({"input": 72, "cache_read": 30, "output": 40, "reasoning": 5, "total": 142});
+        assert_eq!(usage["tokens"], totals);
+        assert_eq!(h.broker_usage().await["codex"]["counts"]["tokens"], totals);
+
+        let (status, finished) = h.runs(Method::DELETE, "/v1/runs/self", &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(finished["state"], "finished");
+        assert_eq!(finished["models"], usage["models"]);
+        assert_eq!(finished["tokens"], totals);
+        assert_eq!(h.usage(&token).await, finished);
+        // Nothing from the upstream response beyond model names and counts
+        // belongs in the run record (its existing run identity is separate).
+        let record = finished.to_string();
+        for excluded in ["resp_RECORDED", "msg_RECORDED", "Reply with ok.", &token] {
+            assert!(!record.contains(excluded), "record contains {excluded}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mistral_chat_completions_are_injected_metered_and_capped_like_the_other_apis() {
     let h = Harness::with_policy().await;
     let token = h.run(1).await;
