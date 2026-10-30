@@ -7,8 +7,10 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::{Arc, LazyLock, Mutex, PoisonError},
-    time::{SystemTime, UNIX_EPOCH},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, PoisonError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::warn;
 
@@ -62,7 +64,7 @@ struct UnprovenRuns {
     counts: Counts,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Status {
     Allowed,
@@ -70,20 +72,28 @@ enum Status {
     Rejected,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AnthropicWindow {
     utilization: Option<f64>,
     reset: Option<u64>,
     status: Option<Status>,
     observed_at: u64,
+    /// Loaded from the usage state file, and not read since.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restored: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CodexWindow {
     used_percent: Option<f64>,
     window_minutes: Option<u64>,
     reset_after_seconds: Option<u64>,
     observed_at: u64,
+    /// Loaded from the usage state file, and not read since.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restored: bool,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -375,8 +385,55 @@ impl BrokerUsage {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(name.to_owned())
-                .or_default(),
+                .or_insert_with(|| {
+                    let usage = Self::default();
+                    let restored = RESTORED
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(name);
+                    if let Some(windows) = restored {
+                        usage.restore(windows);
+                    }
+                    Arc::new(usage)
+                }),
         )
+    }
+
+    /// The windows the usage state file keeps.
+    fn windows(&self) -> Windows {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Windows {
+            unified_5h: state.anthropic.unified_5h.clone(),
+            unified_7d: state.anthropic.unified_7d.clone(),
+            primary: state.codex.primary.clone(),
+            secondary: state.codex.secondary.clone(),
+            attributed: state.attributed.clone(),
+        }
+    }
+
+    /// Take up `windows` from the usage state file, as restored until a
+    /// response reads them again.
+    fn restore(&self, windows: Windows) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let anthropic = |window: Option<AnthropicWindow>| {
+            window.map(|window| AnthropicWindow {
+                restored: true,
+                ..window
+            })
+        };
+        let codex = |window: Option<CodexWindow>| {
+            window.map(|window| CodexWindow {
+                restored: true,
+                ..window
+            })
+        };
+        state.anthropic.unified_5h = anthropic(windows.unified_5h);
+        state.anthropic.unified_7d = anthropic(windows.unified_7d);
+        state.codex.primary = codex(windows.primary);
+        state.codex.secondary = codex(windows.secondary);
+        state.attributed = windows
+            .attributed
+            .map(|window| window.map(Attributed::restore));
     }
 
     /// The snapshot `/usage` serves. Once a budget grants shares, its spend
@@ -577,6 +634,7 @@ impl BrokerUsage {
         // By index in `WINDOWS`: a complete reading, or None for a window
         // the plan does not have.
         let mut read = Vec::new();
+        let mut changed = false;
         match provider {
             Provider::Anthropic => {
                 let Anthropic {
@@ -602,6 +660,7 @@ impl BrokerUsage {
                             ));
                         }
                         *slot = Some(window);
+                        changed = true;
                     }
                 }
             }
@@ -615,6 +674,7 @@ impl BrokerUsage {
                         Some(window) if window.window_minutes == Some(0) => {
                             *slot = None;
                             read.push((index, None));
+                            changed = true;
                         }
                         Some(window) => {
                             if let (Some(used_percent), Some(minutes), Some(after)) = (
@@ -632,6 +692,7 @@ impl BrokerUsage {
                                 ));
                             }
                             *slot = Some(window);
+                            changed = true;
                         }
                         None => {}
                     }
@@ -644,7 +705,155 @@ impl BrokerUsage {
             *window =
                 reading.map(|reading| Attributed::charge(window.as_ref(), reading, consumer, now));
         }
+        drop(state);
+        if let (true, Some(file)) = (changed, STATE_FILE.get()) {
+            file.changed();
+        }
     }
+}
+
+/// The schema of the usage state file.
+const STATE_SCHEMA: &str = "praxis-broker-usage-state/v1";
+
+/// How long a change waits for others before the state file is written:
+/// the windows change on every response.
+const STATE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One registry's windows, as the usage state file keeps them. Nothing
+/// else is kept, so `started_at` and the counts are the running process's.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Windows {
+    unified_5h: Option<AnthropicWindow>,
+    unified_7d: Option<AnthropicWindow>,
+    primary: Option<CodexWindow>,
+    secondary: Option<CodexWindow>,
+    /// The windows of `WINDOWS`, as charged to each consumer.
+    attributed: [Option<Attributed>; 4],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StateFile {
+    schema: String,
+    registries: BTreeMap<String, Windows>,
+}
+
+/// The windows loaded from the state file, by registry, until it is named.
+static RESTORED: Mutex<BTreeMap<String, Windows>> = Mutex::new(BTreeMap::new());
+
+/// The usage state file, if the gateway keeps one.
+static STATE_FILE: OnceLock<StateWriter> = OnceLock::new();
+
+/// Writes the state file as the windows change, at most once an interval.
+struct StateWriter {
+    path: PathBuf,
+    dirty: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl StateWriter {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            dirty: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn changed(&self) {
+        *self.dirty.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.wake.notify_one();
+    }
+
+    /// Wait for a change, then `interval` more, and write `windows()` as
+    /// they are then: every change meanwhile is in that one write, and the
+    /// newest state is always written.
+    fn write_next(
+        &self,
+        interval: Duration,
+        windows: impl FnOnce() -> BTreeMap<String, Windows>,
+    ) -> Result<(), String> {
+        let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*dirty {
+            dirty = self
+                .wake
+                .wait(dirty)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(dirty);
+        std::thread::sleep(interval);
+        // Before reading the windows, so that a change after is written
+        // next time.
+        *self.dirty.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        write_state(&self.path, windows())
+    }
+}
+
+/// Every registry's windows.
+fn all_windows() -> BTreeMap<String, Windows> {
+    REGISTRIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(name, usage)| (name.clone(), usage.windows()))
+        .collect()
+}
+
+/// Replace the state file at `path` with `registries`, through a
+/// temporary file beside it, so a reader sees the old file or the new one.
+fn write_state(path: &Path, registries: BTreeMap<String, Windows>) -> Result<(), String> {
+    let file = StateFile {
+        schema: STATE_SCHEMA.to_owned(),
+        registries,
+    };
+    let text = serde_json::to_vec(&file).map_err(|e| e.to_string())?;
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&text)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)
+    };
+    write().map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The windows in the state file at `path`, by registry.
+fn read_state(path: &Path) -> Result<BTreeMap<String, Windows>, String> {
+    let read = || -> Result<_, String> {
+        let text = std::fs::read(path).map_err(|e| e.to_string())?;
+        let file: StateFile = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
+        if file.schema != STATE_SCHEMA {
+            return Err(format!("schema {:?}, not {STATE_SCHEMA:?}", file.schema));
+        }
+        Ok(file.registries)
+    };
+    read().map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Keep the windows in the state file at `path` across restarts: take up
+/// what it has, and rewrite it as they change. A file that is missing or
+/// not valid is no reading, never a reason not to start. Call it once,
+/// before any filter is built.
+pub(crate) fn keep_state(path: PathBuf) {
+    let registries = read_state(&path).unwrap_or_else(|e| {
+        warn!("usage state not loaded, so no window has a reading: {e}");
+        BTreeMap::new()
+    });
+    *RESTORED.lock().unwrap_or_else(PoisonError::into_inner) = registries;
+    let Ok(()) = STATE_FILE.set(StateWriter::new(path)) else {
+        return;
+    };
+    let writer = STATE_FILE.get().expect("just set");
+    std::thread::spawn(move || {
+        loop {
+            if let Err(e) = writer.write_next(STATE_INTERVAL, all_windows) {
+                warn!("usage state not written: {e}");
+            }
+        }
+    });
 }
 
 fn text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -679,6 +888,7 @@ fn anthropic_window(headers: &HeaderMap, window: &str, now: u64) -> Option<Anthr
         reset,
         status,
         observed_at: now,
+        restored: false,
     })
 }
 
@@ -693,6 +903,7 @@ fn codex_window(headers: &HeaderMap, window: &str, now: u64) -> Option<CodexWind
             window_minutes,
             reset_after_seconds,
             observed_at: now,
+            restored: false,
         },
     )
 }
@@ -1161,6 +1372,198 @@ mod tests {
         usage.settle_spend_at(RUNS, Some(&dollar), true, start);
         assert_eq!(at(now)["runs"]["total"], 169.0);
         assert_eq!(buckets(), SPEND_HOURS);
+    }
+
+    /// The fixtures' windows as read at `now`, and the usage that read them.
+    fn read_fixtures(now: u64) -> BrokerUsage {
+        let usage = BrokerUsage::default();
+        usage.capture_at(
+            Provider::Anthropic,
+            Consumer::Public,
+            &fixture("anthropic"),
+            now,
+        );
+        usage.capture_at(Provider::Codex, Consumer::Public, &fixture("codex"), now);
+        usage
+    }
+
+    fn round_trip(usage: &BrokerUsage, path: &Path) -> BrokerUsage {
+        let registries = BTreeMap::from([("default".to_owned(), usage.windows())]);
+        write_state(path, registries).unwrap();
+        let restored = BrokerUsage::default();
+        restored.restore(read_state(path).unwrap().remove("default").unwrap());
+        restored
+    }
+
+    #[test]
+    fn windows_round_trip_restored_with_their_observed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let usage = read_fixtures(20);
+        usage.settle(Provider::Codex, None, true);
+        let restored = round_trip(&usage, &path);
+        let (before, after) = (usage.snapshot(false), restored.snapshot(false));
+        let five = after.anthropic.unified_5h.clone().unwrap();
+        assert_eq!((five.observed_at, five.restored), (20, true));
+        assert_eq!(
+            five,
+            AnthropicWindow {
+                restored: true,
+                ..before.anthropic.unified_5h.unwrap()
+            }
+        );
+        assert_eq!(after.codex.secondary.as_ref().unwrap().observed_at, 20);
+        // The windows only: the counts are the running process's.
+        assert_eq!(after.codex.counts.unmetered, 0);
+        let json = serde_json::to_value(&after).unwrap();
+        assert_eq!(json["codex"]["primary"]["restored"], true);
+        // A live response replaces a restored window.
+        let mut update = HeaderMap::new();
+        update.insert("x-codex-primary-used-percent", "55".parse().unwrap());
+        restored.capture_at(Provider::Codex, Consumer::Public, &update, 30);
+        let json = serde_json::to_value(restored.snapshot(false)).unwrap();
+        assert!(json["codex"]["primary"].get("restored").is_none());
+        assert_eq!(json["codex"]["secondary"]["restored"], true);
+    }
+
+    /// A restored Codex window resets when its stored `observed_at` and
+    /// `reset_after_seconds` say, however much later it is loaded; and its
+    /// grant is a reading, attributed as it was, until then.
+    #[test]
+    fn a_restored_window_is_granted_on_until_its_reset() {
+        let budget = Budget::parse(
+            "shares: {public: {anthropic: 50, codex: 50}, private: {anthropic: 50, codex: 50}}",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let read_at = 1_791_100_000;
+        let usage = read_fixtures(read_at);
+        // The fixtures were first read part-way: whose use it was is
+        // unknown, so a reading from zero stands in for one attributed.
+        usage.0.lock().unwrap().attributed[2] = Some(Attributed::charge(
+            None,
+            Reading {
+                used_percent: 0.0,
+                resets_at: read_at + 1200,
+                window_secs: FIVE_HOURS,
+            },
+            Consumer::Public,
+            read_at,
+        ));
+        let mut rise = HeaderMap::new();
+        rise.insert("x-codex-primary-used-percent", "10".parse().unwrap());
+        rise.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        rise.insert(
+            "x-codex-primary-reset-after-seconds",
+            "1200".parse().unwrap(),
+        );
+        usage.capture_at(Provider::Codex, Consumer::Private, &rise, read_at);
+        let restored = round_trip(&usage, &path);
+        let codex = |now| {
+            let grant = restored.grant_at(&budget, Consumer::Private, now);
+            serde_json::to_value(&grant).unwrap()["pools"]["codex"].clone()
+        };
+        let now = read_at + 1000;
+        let primary = &codex(now)["windows"]["primary"];
+        assert_eq!(primary["resets_at"], read_at + 1200);
+        assert_eq!(primary["used_percent"], 10.0);
+        assert_eq!(primary["hold"], false);
+        // The secondary window, first read part-way, still holds.
+        assert_eq!(codex(now)["windows"]["secondary"]["hold"], true);
+        // Past its reset it is no reading.
+        assert!(codex(read_at + 1200)["windows"].get("primary").is_none());
+    }
+
+    #[test]
+    fn a_missing_corrupt_or_wrong_schema_file_is_no_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let cases = [
+            None,
+            Some("{\"schema\": \"praxis-broker-usage-state/v1\", \"regis"),
+            Some("{\"schema\": \"praxis-broker-usage-state/v2\", \"registries\": {}}"),
+            Some(
+                "{\"schema\": \"praxis-broker-usage-state/v1\", \"registries\": {\"default\": {\"primary\": 7}}}",
+            ),
+        ];
+        for text in cases {
+            if let Some(text) = text {
+                std::fs::write(&path, text).unwrap();
+            }
+            let e = read_state(&path).unwrap_err();
+            assert!(e.contains("usage-state.json"), "{text:?}: {e}");
+        }
+        std::fs::write(&path, "{\"schema\": \"praxis-broker-usage-state/v1\", \"registries\": {\"default\": {\"unified_5h\": null, \"unified_7d\": null, \"primary\": null, \"secondary\": null, \"attributed\": [null, null, null, null]}}}").unwrap();
+        assert_eq!(read_state(&path).unwrap()["default"], Windows::default());
+    }
+
+    /// A burst of changes is one write, of the newest windows.
+    #[test]
+    fn a_burst_of_changes_is_coalesced_into_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let writer = Arc::new(StateWriter::new(path.clone()));
+        let usage = Arc::new(BrokerUsage::default());
+        let writes = Arc::new(Mutex::new(0));
+        let thread = {
+            let (writer, usage, writes) = (writer.clone(), usage.clone(), writes.clone());
+            std::thread::spawn(move || {
+                writer
+                    .write_next(Duration::from_millis(300), || {
+                        *writes.lock().unwrap() += 1;
+                        BTreeMap::from([("default".to_owned(), usage.windows())])
+                    })
+                    .unwrap()
+            })
+        };
+        for percent in 1..=50 {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-primary-used-percent",
+                percent.to_string().parse().unwrap(),
+            );
+            usage.capture_at(Provider::Codex, Consumer::Public, &headers, percent);
+            writer.changed();
+        }
+        thread.join().unwrap();
+        assert_eq!(*writes.lock().unwrap(), 1);
+        assert!(!*writer.dirty.lock().unwrap());
+        let written = read_state(&path).unwrap().remove("default").unwrap();
+        assert_eq!(written.primary.unwrap().used_percent, Some(50.0));
+    }
+
+    /// A reader never finds the file half-written, however often it is
+    /// replaced.
+    #[test]
+    fn a_write_replaces_the_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let usage = read_fixtures(20);
+        // Large enough that a write in place could be seen part-done.
+        let registries = || {
+            (0..200)
+                .map(|i| (format!("registry-{i}"), usage.windows()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        write_state(&path, registries()).unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert_eq!(read_state(&path).unwrap().len(), 200);
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for _ in 0..50 {
+            write_state(&path, registries()).unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
     }
 
     #[test]

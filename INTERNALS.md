@@ -875,7 +875,9 @@ an entirely absent/invalid window leaves the prior observation and timestamp
 intact. Codex reports a window the plan lacks with `window_minutes: 0` (a plan
 with only a weekly limit has it as `primary` and a zero `secondary`), and such a
 window is null. Windows update independently and may be stale; these passive observations
-are neither a fresh provider query nor the broker's configured caps.
+are neither a fresh provider query nor the broker's configured caps. A window
+loaded from [usage state](#budget-grants) across a restart has `"restored":
+true` until a response reads it again.
 `mistral` has `counts` only: no header of its responses is known to say how
 much of a plan is used. (Of a response of 2026-10-12, the headers kept
 named no limit; those with `token` in their names were not kept.)
@@ -956,9 +958,12 @@ admitted the request; a lower reading charges nobody. When a window passes
 its reset, the next reading is all charged to its request's consumer. Use
 between two brokered requests, such as the operator's own unbrokered use,
 so lands on the next one, which overcounts and so holds early, never late.
-The gateway keeps no reading across a restart (#35), so a window it first
-reads part-way used is *restored*: both consumers are charged all of that
-use, and it is stale until it resets. Mistral's use is the consumer's
+A window the gateway first reads part-way used, as it does after a restart
+without usage state (below), is *part-way*: both consumers
+are charged all of that use, and it is stale until it resets. With usage
+state, a restarted gateway takes up each window as attributed before, and
+a window loaded from it counts as read, however old, until its stored
+reset; after that it is no reading. Mistral's use is the consumer's
 list-price spend over the trailing week, from the [spend](#broker-usage-endpoint)
 meter, as a percent of `mistral_weekly_usd`; without `spend: true` there is
 none, and its pool is left out.
@@ -969,7 +974,8 @@ Mistral's week) is paced: `allowed_percent = share × (elapsed fraction +
 its start (its reset less its length), and for Mistral of the week since
 metering began. The 5-hour windows are not paced: allowed is the share. A
 window holds when its `used_percent` exceeds `allowed_percent`, or when its
-reading is stale: more than five hours old, or restored.
+reading is stale: more than five hours old (unless loaded from usage
+state), or part-way.
 
 ```json
 {
@@ -1009,7 +1015,25 @@ hourly buckets for the runs of each consumer, for each of those operators
 and for each consumer's Mistral spend; and, for grants, each of the four
 windows' latest reading with what each consumer used of it.
 It survives configuration reloads, and resets on process restart (`started_at`
-names the start of that state). It stores no credentials, arbitrary headers,
+names the start of that state), except the windows if the gateway keeps
+them.
+
+**Usage state.** `praxis-gateway --usage-state PATH` keeps the four windows
+of every registry, as `/usage` has them and as the grants attribute them,
+in the JSON file at `PATH` (schema `praxis-broker-usage-state/v1`), and
+nothing else: not the counts, the operators' totals or the spend. At
+startup it loads them, each with its `observed_at` as stored, so an old
+reading still looks old and a Codex window still resets at its stored
+`observed_at` plus `reset_after_seconds`. A loaded window has `"restored":
+true` in `/usage` until a response reads it again. A file that is missing,
+unreadable or of another schema is no reading: the gateway logs a warning
+and starts without. When a window changes, the gateway rewrites the file
+five seconds later with the windows as they are then, so a burst of
+responses is one write, through a temporary file beside it (`PATH.tmp`)
+renamed over it, so a reader never sees half of one. The directory must be
+writable. Without the flag nothing is kept, as before.
+
+It stores no credentials, arbitrary headers,
 prompt content, model dimensions or run identifiers; operators' names are the
 deployment's own. Header fixtures in testdata use
 synthetic values in the provider header shapes.

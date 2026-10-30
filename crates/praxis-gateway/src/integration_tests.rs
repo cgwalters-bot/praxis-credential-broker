@@ -923,7 +923,7 @@ async fn a_consumer_is_served_its_own_grant_once_a_budget_is_mounted() {
     let public: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(public["schema"], "praxis-broker-grant/v1");
     assert_eq!(public["consumer"], "public");
-    // The fixture's windows, first read part-way used, so restored; and
+    // The fixture's windows, first read part-way used, so stale; and
     // nothing read of Anthropic, so left out.
     let codex = &public["pools"]["codex"];
     assert_eq!(codex["windows"]["primary"]["used_percent"], 42.5);
