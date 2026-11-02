@@ -30,11 +30,11 @@
 #                 stored: Messages with any other Authorization
 #
 # Every request that reaches a provider is metered by token_count, and run_token
-# logs its usage. Injected requests are also capped per run and per sliding
-# 5h window, one per provider, by token_rate_limit (Codex's and Claude's own
-# limit window; Mistral publishes none for its plans, so its window here is
-# only the broker's bound); pass-through requests spend the caller's own
-# limits.
+# logs its usage. Injected requests are also capped per run by
+# token_rate_limit, and Mistral's in a sliding 5h window too: it publishes no
+# limit for its plans, so that is the only bound on what it bills. Codex and
+# Claude have no shared window here, because the providers enforce their own
+# limits. Pass-through requests spend the caller's own limits.
 #
 # THE FILTER ORDER AND THE CONDITIONS ARE SECURITY-CRITICAL; see
 # INTERNALS.md, and run `just test-gateway` after any change. Conditions and
@@ -219,11 +219,15 @@ filter_chains:
               path_prefix: "/v1/responses"
               methods: [POST]
         rules:
+          # 2026-11-02: traffic is 92% cache reads, so charge them as on
+          # Anthropic below.
           - name: run
             algorithm: sliding_window
             window: 6h
             capacity: 20000000
             reserved_tokens: 10000
+            weights:
+              cached_input: 0.1
             reservation_timeout: 30m
       - filter: token_rate_limit
         key: authenticated_subject
@@ -237,8 +241,8 @@ filter_chains:
               path: "/anthropic/v1/messages/count_tokens"
         rules:
           # 2026-10-13: a run hit 20M raw tokens while reviewing finished
-          # code. Discount cache reads as in the subscription window below;
-          # keep the 20M bound on weighted usage and the 10k reservation.
+          # code. Discount cache reads; keep the 20M bound on weighted usage
+          # and the 10k reservation.
           - name: run
             algorithm: sliding_window
             window: 6h
@@ -260,42 +264,9 @@ filter_chains:
             capacity: 20000000
             reserved_tokens: 10000
             reservation_timeout: 30m
-      # 6. The broker's own subscriptions, one 5h window each.
-      - filter: token_rate_limit
-        conditions:
-          - when:
-              path_prefix: "/v1/responses"
-              methods: [POST]
-        rules:
-          - name: window
-            algorithm: sliding_window
-            window: 5h
-            capacity: 100000000
-            reserved_tokens: 10000
-            reservation_timeout: 30m
-      - filter: token_rate_limit
-        conditions:
-          - when:
-              path_prefix: "/anthropic"
-              methods: [POST]
-              headers:
-                authorization: "Bearer praxis-substitute:anthropic"
-          - unless:
-              path: "/anthropic/v1/messages/count_tokens"
-        rules:
-          # 2026-10-13, 00:50-05:09 UTC: 851 requests used 100,069,361
-          # raw tokens, including 96,477,144 cache reads (~2.8M input,
-          # ~0.75M output), at only 9% of the plan's 5h window (3% of 7d).
-          # Charging cache reads at a tenth gives ~13.24M weighted tokens;
-          # retain the 100M bound, not a provider-utilization controller.
-          - name: window
-            algorithm: sliding_window
-            window: 5h
-            capacity: 100000000
-            weights:
-              cached_input: 0.1
-            reserved_tokens: 10000
-            reservation_timeout: 30m
+      # 6. Mistral's window. Codex and Claude had one too, until a shared 100M
+      #    bound on raw tokens stopped every run on 2026-11-02 with the
+      #    provider's own window far from full.
       - filter: token_rate_limit
         conditions:
           - when:

@@ -59,6 +59,7 @@ const MISTRAL_PATH: &str = "/mistral/v1/chat/completions";
 /// Usage the fake upstream reports, and what a run record makes of it.
 const RESPONSES_USAGE: &str = r#"{"input_tokens":70,"input_tokens_details":{"cached_tokens":30},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":100}"#;
 const RESPONSES_TOTAL: u64 = 100;
+const RESPONSES_WEIGHTED: u64 = 73; // 40 input + 30 cache reads * 0.1 + 30 output
 /// A stream chatgpt.com's Codex backend sent on 2026-10-05, its ids
 /// replaced: 16 tokens in, none of them cached, and 5 out. Its usage also
 /// attributes the tokens to each message, which `token_count` must not
@@ -75,6 +76,7 @@ const MESSAGES_WEIGHTED: u64 = 72; // 40 input + 20 cache reads * 0.1 + 30 outpu
 const MISTRAL_STREAM: &str = include_str!("../testdata/mistral-chat-stream.sse");
 /// That usage, for a response that is not streamed.
 const CHAT_USAGE: &str = r#"{"prompt_tokens":24,"total_tokens":44,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":0}}"#;
+const CHAT_TOTAL: u64 = 44;
 const CHAT_MODEL: &str = "zai-glm-5-3";
 /// The ref `permissive_policy` admits the called workflow at, and the owner
 /// whose every workflow it admits.
@@ -1531,13 +1533,13 @@ async fn a_request_the_client_leaves_keeps_its_reservation_against_the_run() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn token_rate_limit_caps_each_providers_window_for_injected_requests() {
+async fn only_mistral_has_a_window_across_runs() {
     // Room for one request's reservation, but not for another's on top of
     // what the first one used.
     let h = Harness::start(true, |filter| {
         for rule in rules_named(filter, "window") {
             let reserved = rule["reserved_tokens"].as_u64().unwrap();
-            rule["capacity"] = Yaml::from(reserved + MESSAGES_WEIGHTED.min(RESPONSES_TOTAL) - 1);
+            rule["capacity"] = Yaml::from(reserved + CHAT_TOTAL - 1);
         }
     })
     .await;
@@ -1547,24 +1549,17 @@ async fn token_rate_limit_caps_each_providers_window_for_injected_requests() {
         run_id += 1;
         h.run(run_id).await
     };
-    let (status, body) = h.respond(Some(&token().await), "", true).await;
+    let (status, body) = h.chat(Some(&token().await), true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, _) = h.respond(Some(&token().await), "", true).await;
+    let (status, _) = h.chat(Some(&token().await), true).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    // The Messages API has a window of its own.
-    let (status, body) = h.injected(Some(&token().await)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, _) = h.injected(Some(&token().await)).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    // Pass-through spends the caller's own subscription, not the window.
+    // The subscriptions enforce their own limits.
     for _ in 0..2 {
-        let (status, _) = h.message(CALLER_OAUTH, None).await;
-        assert_eq!(status, StatusCode::OK);
+        let (status, body) = h.respond(Some(&token().await), "", true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = h.injected(Some(&token().await)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
-    assert_eq!(
-        h.upstream.clusters(),
-        [RESPONSES, INJECTED, PASS_THROUGH, PASS_THROUGH]
-    );
     // The health check is not metered.
     for _ in 0..3 {
         let response = h.call(Method::GET, "/healthz", &[], None).await;
@@ -1573,45 +1568,64 @@ async fn token_rate_limit_caps_each_providers_window_for_injected_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn anthropic_cache_discount_applies_to_run_and_window_without_changing_usage() {
-    for name in ["run", "window"] {
-        let h = Harness::start(true, |filter| {
-            if filter["conditions"][0]["when"]["path_prefix"] != "/anthropic" {
-                return;
+async fn run_caps_discount_cache_reads_without_changing_usage() {
+    let h = Harness::start(true, |filter| {
+        let path = filter["conditions"][0]["when"]["path_prefix"].clone();
+        for rule in rules_named(filter, "run") {
+            if path == "/mistral" {
+                continue;
             }
-            for rule in rules_named(filter, name) {
-                assert_eq!(rule["weights"]["cached_input"].as_f64(), Some(0.1));
-                rule["reserved_tokens"] = Yaml::from(10);
-                // A raw 90-token charge would reject the second reservation.
-                rule["capacity"] = Yaml::from(MESSAGES_WEIGHTED + 10);
-            }
-        })
-        .await;
-        let token = h.run(1).await;
-        for _ in 0..2 {
-            let (status, body) = h.injected(Some(&token)).await;
-            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(rule["weights"]["cached_input"].as_f64(), Some(0.1));
+            rule["reserved_tokens"] = Yaml::from(10);
+            // A raw charge would reject the second reservation.
+            let weighted = if path == "/anthropic" {
+                MESSAGES_WEIGHTED
+            } else {
+                RESPONSES_WEIGHTED
+            };
+            rule["capacity"] = Yaml::from(weighted + 10);
         }
-        let (status, _) = h.injected(Some(&token)).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{name}");
-        let usage = h.usage(&token).await;
-        assert_eq!(usage["tokens"]["total"], json!(2 * MESSAGES_TOTAL));
-        assert_eq!(usage["tokens"]["cache_read"], json!(40));
+    })
+    .await;
+    let token = h.run(1).await;
+    for _ in 0..2 {
+        let (status, body) = h.injected(Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
+    let (status, _) = h.injected(Some(&token)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let usage = h.usage(&token).await;
+    assert_eq!(usage["tokens"]["total"], json!(2 * MESSAGES_TOTAL));
+    assert_eq!(usage["tokens"]["cache_read"], json!(40));
+
+    let token = h.run(2).await;
+    for _ in 0..2 {
+        let (status, body) = h.respond(Some(&token), "", true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, _) = h.respond(Some(&token), "", true).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let usage = h.usage(&token).await;
+    assert_eq!(usage["tokens"]["total"], json!(2 * RESPONSES_TOTAL));
+    assert_eq!(usage["tokens"]["cache_read"], json!(60));
 }
 
 #[test]
-fn only_anthropic_caps_discount_cache_reads_and_capacities_are_unchanged() {
+fn the_committed_caps_are_as_documented() {
     let mut config: Yaml = serde_yaml::from_str(PRAXIS_YAML).unwrap();
-    let mut count = 0;
+    let mut caps = Vec::new();
     for filter in filters_mut(&mut config) {
         if filter["filter"] != "token_rate_limit" {
             continue;
         }
-        count += 1;
-        let anthropic = filter["conditions"][0]["when"]["path_prefix"] == "/anthropic";
+        assert!(filter["default_weights"].is_null());
+        let path = filter["conditions"][0]["when"]["path_prefix"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         for rule in filter["rules"].as_sequence().unwrap() {
-            let (capacity, window) = match rule["name"].as_str().unwrap() {
+            let name = rule["name"].as_str().unwrap().to_owned();
+            let (capacity, window) = match name.as_str() {
                 "run" => (20_000_000, "6h"),
                 "window" => (100_000_000, "5h"),
                 name => panic!("unexpected cap {name}"),
@@ -1620,16 +1634,25 @@ fn only_anthropic_caps_discount_cache_reads_and_capacities_are_unchanged() {
             assert_eq!(rule["window"].as_str(), Some(window));
             assert_eq!(rule["reserved_tokens"].as_u64(), Some(10_000));
             assert_eq!(rule["reservation_timeout"].as_str(), Some("30m"));
-            assert!(filter["default_weights"].is_null());
-            if anthropic {
+            if path == "/mistral" {
+                assert!(rule["weights"].is_null());
+            } else {
                 assert_eq!(rule["weights"].as_mapping().unwrap().len(), 1);
                 assert_eq!(rule["weights"]["cached_input"].as_f64(), Some(0.1));
-            } else {
-                assert!(rule["weights"].is_null());
             }
+            caps.push((path.clone(), name));
         }
     }
-    assert_eq!(count, 6);
+    let expected = [
+        ("/v1/responses", "run"),
+        ("/anthropic", "run"),
+        ("/mistral", "run"),
+        ("/mistral", "window"),
+    ];
+    assert_eq!(
+        caps,
+        expected.map(|(path, name)| (path.to_owned(), name.to_owned()))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

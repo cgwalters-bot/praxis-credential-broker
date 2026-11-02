@@ -422,8 +422,8 @@ logged 'ANY WORKFLOW' && exit 1
 logged 'called from other repositories' && exit 1
 podman inspect "$test_pod-praxis" | grep -Fq "$test_anthropic_token" && exit 1
 
-# Second pass: a per-run cap of 150 tokens, which the second response
-# overshoots and the third is refused, under the policy with `unproven`.
+# Second pass: a per-run cap of 150 tokens, under which the third response
+# is refused, under the policy with `unproven`.
 test_policy=unproven-policy.yaml
 start_test_pod --volume "$test_dir/praxis.yaml:/etc/praxis/praxis.yaml:ro,Z"
 wait_ready
