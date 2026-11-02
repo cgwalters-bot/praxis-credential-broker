@@ -76,8 +76,7 @@ CLUSTERS = (RESPONSES, ANTHROPIC, PASS, MISTRAL, RUNS)
 FILTERS = [
     "static_response", "static_response", "static_response", "static_response", "openai_responses_proxy",
     "anthropic_messages_format", "anthropic_validate", "anthropic_messages_protocol", "router", "run_token",
-    "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_rate_limit",
-    "token_rate_limit", "token_count", "token_count", "token_count", "path_rewrite", "path_rewrite",
+    "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_rate_limit", "token_count", "token_count", "token_count", "path_rewrite", "path_rewrite",
     "headers", "headers", "headers", "headers", "credential_injection", "load_balancer",
 ]
 

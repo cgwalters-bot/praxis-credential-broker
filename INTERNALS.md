@@ -143,7 +143,7 @@ cluster with no mode is refused with 500.
   upstream: credential-proxy adds the Codex one, and `credential_injection`
   adds the Claude one for the `anthropic` cluster only and the Mistral key
   for the `mistral` cluster only. Injected requests are capped
-  per run and per window (see [metering and caps](#metering-and-caps)),
+  per run, and Mistral's per window too (see [metering and caps](#metering-and-caps)),
   except `count_tokens`, which uses no tokens: `run_token` admits it for the
   run (`usage_free_paths`) but charges it nothing. So a run can call it
   without a cap, as fast as its concurrency allows, on the broker's Claude
@@ -222,8 +222,8 @@ it is when each filter runs, and all of them see the raw path:
    headers, applies the cluster's credential mode, and removes the run token
    headers (`x-run-token`, and `Authorization` unless the mode is
    pass-through).
-6. `token_rate_limit`, four instances: the per-run caps and the windows, for
-   injected requests of each API. Then `token_count`, one per API, for both
+6. `token_rate_limit`, four instances: the per-run caps for injected requests
+   of each API and Mistral's window. Then `token_count`, one per API, for both
    modes. Response filters run in reverse order, so each `token_rate_limit`
    comes before the `token_count` whose counts it reconciles with, and
    `run_token` before them all, so it sees the counts last.
@@ -534,7 +534,8 @@ What they give up, compared with the `workflows` entry:
   registers like a push.
 - **A bound on the number of runs.** Each admitted job is a run with a cap
   of its own, and nothing counts the jobs: what bounds them together is the
-  providers' window caps, shared by everyone. The registry remembers 4096
+  providers' own limits on the subscriptions and Mistral's window cap, shared
+  by everyone. The registry remembers 4096
   runs, each for its lifetime and a day more, and while it is full no run
   registers (503), so enough admitted jobs keep every other job out.
 - With `any: true`, **the listener's network is the only gate on which
@@ -654,7 +655,7 @@ one `x-run-id` header names: 1 to 128 letters, digits, `.`, `_` and `-`
 `max_secs` and `concurrency`, the same per-run token caps (the `run` rules
 in `praxis.yaml`, keyed on its own subject, `unproven-run:NAME`), the same
 usage record and the same `GET` and `DELETE /v1/runs/self`; the providers'
-window caps apply as to every injected request. A request that has an
+limits and Mistral's window cap apply as to every injected request. A request that has an
 `Authorization` header is a claim of proof and is verified as one, exactly
 as without the setting, so a bad token is never a registration without
 proof. Without the section nothing changes: a registration with no token
@@ -702,10 +703,10 @@ What it gives up, all of it deliberately:
 - **A job's agent is such a peer.** The agent must reach the gateway to
   work, so it can register a run of its own under a new name and get a
   fresh per-run cap. Against an agent that tries, a run's cap is a
-  convention. What still bounds it is the quota below, the providers'
-   window caps (100M charged tokens per API in any five hours as committed, shared
-  by everyone, so one agent that used them up stops every other run until
-  the window moves on) and whatever ends the job.
+  convention. What still bounds it is the quota below, the subscriptions' own
+  limits and Mistral's window cap (100M tokens in any five hours as committed),
+  all shared by everyone, so one agent that used one up stops every other run
+  of that provider until it moves on, and whatever ends the job.
 - **Names are the caller's.** Nothing vouches for an `x-run-id`: a record
   with `"proof": "none"` says who the caller claimed to be. A name
   registers once and stays taken until a day after its run expires (409),
@@ -1038,17 +1039,20 @@ response and caps injected use with praxis-ai's own filters:
   condition can't select "injected" across both: so a run that uses both
   APIs gets the cap on each, though a run normally uses one. It reserves
   10k tokens per request, refuses with 429 before anything goes upstream,
-  and reconciles with what `token_count` recorded. Anthropic's run and window
-  rules charge cache reads at 0.1 and every other token class at 1.0;
-  Responses and Mistral count all tokens in full. Usage records retain raw
+  and reconciles with what `token_count` recorded. The Anthropic and Responses
+  run rules charge cache reads at 0.1 and every other token
+  class at 1.0; Mistral counts all tokens in full. Usage records retain raw
   totals. The observation behind the discount is beside the rules in
   `praxis.yaml`; it is a fixed weight, not provider-utilization tracking.
   A run can overshoot its cap by the
   output of its requests in flight.
-- **Windows.** Another `token_rate_limit` per API caps all injected use at
-  100M charged tokens in a sliding 5-hour window, the providers' usage-limit window:
-  each is a subscription with a limit of its own. One run can use up a
-  window and lock out the others until it slides.
+- **Windows.** Another `token_rate_limit` caps all injected Mistral use at
+  100M tokens in a sliding 5-hour window, because Mistral publishes no limit of
+  its own and bills what it serves. One run can use it up and lock out the
+  others until it slides. Codex and Claude have no such cap: they are
+  subscriptions whose providers enforce their limits. A 100M raw cap on Codex
+  stopped every run on 2026-11-02 with the provider's window far from full,
+  and the 429's `Retry-After` of about five hours looked like a hang.
 
 A reservation still open after `reservation_timeout` (30 minutes, longer
 than any one response) is charged its estimate for good, as is one whose
