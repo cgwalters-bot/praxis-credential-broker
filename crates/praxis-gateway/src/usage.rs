@@ -431,9 +431,9 @@ impl BrokerUsage {
         state.anthropic.unified_7d = anthropic(windows.unified_7d);
         state.codex.primary = codex(windows.primary);
         state.codex.secondary = codex(windows.secondary);
-        state.attributed = windows
-            .attributed
-            .map(|window| window.map(Attributed::restore));
+        // Attribution was marked restored when the file was read, not when
+        // this registry was first named.
+        state.attributed = windows.attributed;
     }
 
     /// The snapshot `/usage` serves. Once a budget grants shares, its spend
@@ -732,6 +732,61 @@ struct Windows {
     attributed: [Option<Attributed>; 4],
 }
 
+impl Windows {
+    fn validate(&self, now: u64) -> Result<(), String> {
+        for (name, window) in [
+            ("unified_5h", &self.unified_5h),
+            ("unified_7d", &self.unified_7d),
+        ] {
+            if window.as_ref().is_some_and(|w| w.observed_at > now) {
+                return Err(format!("{name}.observed_at must not be in the future"));
+            }
+            if window
+                .as_ref()
+                .and_then(|w| w.utilization)
+                .is_some_and(|n| !(0.0..=1.0).contains(&n))
+            {
+                return Err(format!("{name}.utilization must be 0 to 1"));
+            }
+        }
+        for (name, window) in [("primary", &self.primary), ("secondary", &self.secondary)] {
+            if let Some(window) = window {
+                if window.observed_at > now {
+                    return Err(format!("{name}.observed_at must not be in the future"));
+                }
+                if window
+                    .used_percent
+                    .is_some_and(|n| !(0.0..=100.0).contains(&n))
+                {
+                    return Err(format!("{name}.used_percent must be 0 to 100"));
+                }
+                if window
+                    .window_minutes
+                    .is_some_and(|n| n == 0 || n.checked_mul(60).is_none())
+                {
+                    return Err(format!(
+                        "{name}.window_minutes must be positive and fit in seconds"
+                    ));
+                }
+                if window
+                    .reset_after_seconds
+                    .is_some_and(|n| window.observed_at.checked_add(n).is_none())
+                {
+                    return Err(format!("{name}.reset_after_seconds overflows observed_at"));
+                }
+            }
+        }
+        for (index, window) in self.attributed.iter().enumerate() {
+            if let Some(window) = window {
+                window
+                    .validate(now)
+                    .map_err(|e| format!("attributed[{index}]: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StateFile {
@@ -824,9 +879,18 @@ fn write_state(path: &Path, registries: BTreeMap<String, Windows>) -> Result<(),
 fn read_state(path: &Path) -> Result<BTreeMap<String, Windows>, String> {
     let read = || -> Result<_, String> {
         let text = std::fs::read(path).map_err(|e| e.to_string())?;
-        let file: StateFile = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
+        let mut file: StateFile = serde_json::from_slice(&text).map_err(|e| e.to_string())?;
         if file.schema != STATE_SCHEMA {
             return Err(format!("schema {:?}, not {STATE_SCHEMA:?}", file.schema));
+        }
+        let now = unix_time();
+        for (name, windows) in &mut file.registries {
+            windows
+                .validate(now)
+                .map_err(|e| format!("registry {name:?}: {e}"))?;
+            for window in windows.attributed.iter_mut().flatten() {
+                *window = window.clone().restore(now);
+            }
         }
         Ok(file.registries)
     };
@@ -1473,6 +1537,188 @@ mod tests {
         assert_eq!(codex(now)["windows"]["secondary"]["hold"], true);
         // Past its reset it is no reading.
         assert!(codex(read_at + 1200)["windows"].get("primary").is_none());
+    }
+
+    #[test]
+    fn incomplete_headers_do_not_refresh_restored_attribution() {
+        let budget = Budget::parse("shares: {public: {codex: 100}}").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let usage = BrokerUsage::default();
+        let now = unix_time();
+        let read_at = now - FIVE_HOURS - 1;
+        let mut complete = HeaderMap::new();
+        complete.insert("x-codex-primary-used-percent", "0".parse().unwrap());
+        complete.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        complete.insert(
+            "x-codex-primary-reset-after-seconds",
+            "604800".parse().unwrap(),
+        );
+        usage.capture_at(Provider::Codex, Consumer::Public, &complete, read_at);
+        let restored = round_trip(&usage, &path);
+        let loaded_at = unix_time();
+        let json = serde_json::to_value(restored.windows()).unwrap();
+        assert!(json["attributed"][2].get("loaded_at").is_none());
+        assert!(json["attributed"][2].get("restored").is_none());
+        assert_eq!(json["attributed"][2]["observed_at"], read_at);
+        let pool =
+            |now| serde_json::to_value(restored.grant_at(&budget, Consumer::Public, now)).unwrap();
+        assert_eq!(pool(loaded_at)["pools"]["codex"]["stale"], false);
+        let later = loaded_at + FIVE_HOURS + 1;
+        let mut partial = HeaderMap::new();
+        partial.insert("x-codex-primary-used-percent", "1".parse().unwrap());
+        restored.capture_at(Provider::Codex, Consumer::Public, &partial, later);
+        let grant = pool(later);
+        assert_eq!(grant["pools"]["codex"]["stale"], true);
+        assert_eq!(grant["pools"]["codex"]["hold"], true);
+        assert_eq!(grant["hold"], false);
+        restored.capture_at(Provider::Codex, Consumer::Public, &complete, later);
+        assert_eq!(pool(later)["pools"]["codex"]["stale"], false);
+    }
+
+    #[test]
+    fn state_file_values_are_range_checked() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let valid = serde_json::to_value(StateFile {
+            schema: STATE_SCHEMA.to_owned(),
+            registries: BTreeMap::from([("default".to_owned(), read_fixtures(20).windows())]),
+        })
+        .unwrap();
+        let cases = [
+            (
+                "/registries/default/attributed/0/observed_at",
+                json!(u64::MAX),
+                "observed_at",
+            ),
+            (
+                "/registries/default/unified_5h/observed_at",
+                json!(u64::MAX),
+                "observed_at",
+            ),
+            (
+                "/registries/default/primary/observed_at",
+                json!(u64::MAX),
+                "observed_at",
+            ),
+            ("/registries/default/attributed/0/used/0", json!(-1), "used"),
+            (
+                "/registries/default/attributed/0/reading/used_percent",
+                json!(101),
+                "used_percent",
+            ),
+            (
+                "/registries/default/attributed/0/reading/used_percent",
+                json!(-1),
+                "used_percent",
+            ),
+            (
+                "/registries/default/attributed/0/reading/window_secs",
+                json!(0),
+                "window_secs",
+            ),
+            (
+                "/registries/default/attributed/0/reading/window_secs",
+                json!(-1),
+                "u64",
+            ),
+            (
+                "/registries/default/unified_5h/utilization",
+                json!(1.1),
+                "utilization",
+            ),
+            (
+                "/registries/default/unified_7d/utilization",
+                json!(-0.1),
+                "utilization",
+            ),
+            (
+                "/registries/default/primary/used_percent",
+                json!(101),
+                "used_percent",
+            ),
+            (
+                "/registries/default/secondary/used_percent",
+                json!(-1),
+                "used_percent",
+            ),
+            (
+                "/registries/default/primary/window_minutes",
+                json!(0),
+                "window_minutes",
+            ),
+            (
+                "/registries/default/primary/window_minutes",
+                json!(u64::MAX),
+                "window_minutes",
+            ),
+            (
+                "/registries/default/primary/reset_after_seconds",
+                json!(u64::MAX),
+                "reset_after_seconds",
+            ),
+        ];
+        for (pointer, value, reason) in cases {
+            let mut file = valid.clone();
+            *file.pointer_mut(pointer).unwrap() = value;
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+            let e = read_state(&path).unwrap_err();
+            assert!(e.contains(reason), "{pointer}: {e}");
+            assert!(e.contains("usage-state.json"), "{pointer}: {e}");
+        }
+    }
+
+    // keep_state owns process-global state and a permanent writer thread.
+    // Run it in a child so other tests cannot seed or wake that writer.
+    #[test]
+    fn keep_state_restores_and_writes_named_windows() {
+        const CHILD_PATH: &str = "PRAXIS_TEST_KEEP_STATE_PATH";
+        let Ok(path) = std::env::var(CHILD_PATH) else {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("usage-state.json");
+            write_state(
+                &path,
+                BTreeMap::from([("keep-state-test".to_owned(), read_fixtures(20).windows())]),
+            )
+            .unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "usage::tests::keep_state_restores_and_writes_named_windows",
+                    "--nocapture",
+                ])
+                .env(CHILD_PATH, &path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        };
+        let path = PathBuf::from(path);
+        keep_state(path.clone());
+        let usage = BrokerUsage::named("keep-state-test");
+        assert!(Arc::ptr_eq(&usage, &BrokerUsage::named("keep-state-test")));
+        let window = usage.windows().primary.unwrap();
+        assert!(window.restored);
+        assert_eq!(window.observed_at, 20);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "55".parse().unwrap());
+        usage.capture_at(Provider::Codex, Consumer::Public, &headers, 30);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let windows = read_state(&path)
+                .unwrap()
+                .remove("keep-state-test")
+                .unwrap();
+            if windows.primary.unwrap().used_percent == Some(55.0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "keep_state did not write the changed window"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

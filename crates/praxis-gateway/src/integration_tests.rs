@@ -926,7 +926,7 @@ async fn a_consumer_is_served_its_own_grant_once_a_budget_is_mounted() {
     assert_eq!(public["schema"], "praxis-broker-grant/v1");
     assert_eq!(public["consumer"], "public");
     // The fixture's windows, first read part-way used, so stale; and
-    // nothing read of Anthropic, so left out.
+    // nothing read of Anthropic, so stale with no windows.
     let codex = &public["pools"]["codex"];
     assert_eq!(codex["windows"]["primary"]["used_percent"], 42.5);
     assert_eq!(codex["windows"]["primary"]["share_percent"], 70.0);
@@ -934,8 +934,11 @@ async fn a_consumer_is_served_its_own_grant_once_a_budget_is_mounted() {
         (&codex["stale"], &codex["hold"]),
         (&json!(true), &json!(true))
     );
-    assert!(public["pools"].get("anthropic").is_none());
-    assert_eq!(public["hold"], true);
+    assert_eq!(
+        public["pools"]["anthropic"],
+        json!({"stale": true, "hold": true, "windows": {}})
+    );
+    assert_eq!(public["hold"], false);
     assert!(!body.contains("30.0"), "{body}");
     let (status, body) = grant("?consumer=private").await;
     assert_eq!(status, StatusCode::OK, "{body}");
