@@ -942,7 +942,7 @@ board's own operator.
 # Each consumer's share of each pool, in percent of every one of its
 # windows: anthropic, codex, mistral. The shares of a pool add up to at most
 # 100. A consumer missing here, or a pool missing from its shares, is
-# granted nothing: its grant holds.
+# granted nothing. A consumer missing here holds at top level.
 shares:
   public: {anthropic: 70, codex: 70, mistral: 70}
   private: {anthropic: 30, codex: 30, mistral: 30}
@@ -963,11 +963,13 @@ A window the gateway first reads part-way used, as it does after a restart
 without usage state (below), is *part-way*: both consumers
 are charged all of that use, and it is stale until it resets. With usage
 state, a restarted gateway takes up each window as attributed before, and
-a window loaded from it counts as read, however old, until its stored
-reset; after that it is no reading. Mistral's use is the consumer's
+a window loaded from it counts as fresh for five hours after the later of
+its stored observation and the file load time, or until its stored reset;
+after the reset it is no reading. The load time is kept only in memory.
+Mistral's use is the consumer's
 list-price spend over the trailing week, from the [spend](#broker-usage-endpoint)
 meter, as a percent of `mistral_weekly_usd`; without `spend: true` there is
-none, and its pool is left out.
+none, and its pool is unread.
 
 **Pacing.** A window of more than five hours (the 7-day ones, and
 Mistral's week) is paced: `allowed_percent = share × (elapsed fraction +
@@ -975,8 +977,8 @@ Mistral's week) is paced: `allowed_percent = share × (elapsed fraction +
 its start (its reset less its length), and for Mistral of the week since
 metering began. The 5-hour windows are not paced: allowed is the share. A
 window holds when its `used_percent` exceeds `allowed_percent`, or when its
-reading is stale: more than five hours old (unless loaded from usage
-state), or part-way.
+reading is stale: more than five hours since the later of its observation
+and its state-file load (if any), or part-way.
 
 ```json
 {
@@ -1000,9 +1002,12 @@ state), or part-way.
 `observed_at` is when the grant was computed. A window is named as in
 `/usage`, and Codex's are those its plan has. A pool is `stale` if any of
 its windows is and holds if any of them does; a pool of the consumer's
-shares with nothing read yet is left out of `pools`, which means hold. The
-top-level `hold` is true if any of the consumer's pools holds or is left
-out, and for a consumer the policy does not name. Percentages are rounded
+shares with nothing read yet has `stale: true`, `hold: true` and empty
+`windows`. A stale or unread pool does not set top-level `hold`: a consumer
+must be able to start work and obtain the reading that clears staleness.
+Top-level `hold` is true if any non-stale pool holds, and for a consumer
+the policy does not name. Pools missing from the policy are not granted
+and are omitted. Percentages are rounded
 to hundredths after `hold` is decided. A query without exactly one
 `consumer` of `public` or `private` gets 400. Like `/usage`, the endpoint is
 unauthenticated, with the same CORS, so whoever reaches the listener can
@@ -1027,7 +1032,8 @@ startup it loads them, each with its `observed_at` as stored, so an old
 reading still looks old and a Codex window still resets at its stored
 `observed_at` plus `reset_after_seconds`. A loaded window has `"restored":
 true` in `/usage` until a response reads it again. A file that is missing,
-unreadable or of another schema is no reading: the gateway logs a warning
+unreadable, of another schema or with invalid ranges (such as negative
+attributed use or a zero window length) is no reading: the gateway logs a warning
 and starts without. When a window changes, the gateway rewrites the file
 five seconds later with the windows as they are then, so a burst of
 responses is one write, through a temporary file beside it (`PATH.tmp`)

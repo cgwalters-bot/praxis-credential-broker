@@ -73,6 +73,9 @@ pub struct Attributed {
     /// Loaded from the usage state file, and not read since.
     #[serde(skip)]
     restored: bool,
+    /// When the state file was read, not persisted across restarts.
+    #[serde(skip)]
+    loaded_at: u64,
     used: [f64; 2],
 }
 
@@ -103,16 +106,36 @@ impl Attributed {
             observed_at: now,
             part_way,
             restored: false,
+            loaded_at: 0,
             used,
         }
     }
 
     /// The window as loaded from the usage state file.
-    pub fn restore(self) -> Self {
+    pub fn restore(self, now: u64) -> Self {
         Self {
             restored: true,
+            loaded_at: now,
             ..self
         }
+    }
+
+    pub(crate) fn validate(&self, now: u64) -> Result<(), String> {
+        if self.observed_at > now {
+            return Err("observed_at must not be in the future".to_owned());
+        }
+        if !(0.0..=100.0).contains(&self.reading.used_percent) {
+            return Err("reading.used_percent must be 0 to 100".to_owned());
+        }
+        if self.reading.window_secs == 0 {
+            return Err("reading.window_secs must be positive".to_owned());
+        }
+        // Accumulated positive rises can exceed 100 if a provider revises
+        // readings downward, but can never be negative or non-finite.
+        if self.used.iter().any(|n| !n.is_finite() || *n < 0.0) {
+            return Err("used must be finite and nonnegative".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -251,7 +274,8 @@ impl Budget {
 
     /// `consumer`'s grant at `now`, from the windows the gateway has read
     /// and its Mistral spend, if metered. A pool it has a share of but
-    /// nothing read of is left out, and holds.
+    /// nothing read of is stale and holds only at pool level, so a consumer
+    /// can start work to obtain a fresh reading.
     pub fn grant(
         &self,
         consumer: Consumer,
@@ -293,13 +317,11 @@ impl Budget {
                     continue;
                 };
                 let reading = window.reading;
-                // A reading kept across a restart is old because the gateway
-                // was down, when nothing brokered was used: it is good until
-                // its window resets, and then is no reading at all.
+                // After its stored reset a restored window is no reading.
                 if window.restored && now >= reading.resets_at {
                     continue;
                 }
-                let old = !window.restored && now.saturating_sub(window.observed_at) > FIVE_HOURS;
+                let old = now.saturating_sub(window.observed_at.max(window.loaded_at)) > FIVE_HOURS;
                 read.push((
                     name,
                     Window {
@@ -312,7 +334,14 @@ impl Budget {
                 ));
             }
             if read.is_empty() {
-                grant.hold = true;
+                grant.pools.insert(
+                    pool,
+                    PoolGrant {
+                        hold: true,
+                        stale: true,
+                        ..PoolGrant::default()
+                    },
+                );
                 continue;
             }
             let mut pool_grant = PoolGrant::default();
@@ -322,7 +351,9 @@ impl Budget {
                 pool_grant.hold |= window_grant.hold;
                 pool_grant.windows.insert(name, window_grant);
             }
-            grant.hold |= pool_grant.hold;
+            // Staleness must not stop all work: that would prevent the
+            // response carrying the next reading from ever arriving.
+            grant.hold |= pool_grant.hold && !pool_grant.stale;
             grant.pools.insert(pool, pool_grant);
         }
         grant
@@ -452,6 +483,7 @@ mod tests {
             observed_at,
             part_way,
             restored: false,
+            loaded_at: 0,
             used,
         }
     }
@@ -466,6 +498,7 @@ mod tests {
             observed_at,
             part_way: false,
             restored: false,
+            loaded_at: 0,
             used,
         }
     }
@@ -505,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_part_way_readings_hold_and_restored_ones_do_not() {
+    fn stale_and_part_way_readings_hold_only_their_pool() {
         let now = T0 + WEEK / 2;
         let cases = [
             ("fresh", week([1.0, 0.0], now, false), false),
@@ -517,10 +550,29 @@ mod tests {
             ("older", week([1.0, 0.0], now - FIVE_HOURS - 1, false), true),
             ("part-way", week([1.0, 0.0], now, true), true),
             // Kept across a restart, and its window has not reset yet.
-            ("restored", week([1.0, 0.0], T0 + 1, false).restore(), false),
+            (
+                "restored",
+                week([1.0, 0.0], T0 + 1, false).restore(now),
+                false,
+            ),
+            (
+                "restored five hours ago",
+                week([1.0, 0.0], T0 + 1, false).restore(now - FIVE_HOURS),
+                false,
+            ),
+            (
+                "restored older",
+                week([1.0, 0.0], T0 + 1, false).restore(now - FIVE_HOURS - 1),
+                true,
+            ),
+            (
+                "observed later than loaded",
+                week([1.0, 0.0], now, false).restore(now - FIVE_HOURS - 1),
+                false,
+            ),
             (
                 "restored part-way",
-                week([1.0, 0.0], T0 + 1, true).restore(),
+                week([1.0, 0.0], T0 + 1, true).restore(now),
                 true,
             ),
         ];
@@ -541,7 +593,7 @@ mod tests {
             let pool = &grant.pools[&Provider::Anthropic];
             assert_eq!(
                 (pool.stale, pool.hold, grant.hold),
-                (hold, hold, true),
+                (hold, hold, false),
                 "{name}"
             );
             assert_eq!(pool.windows["unified_7d"].hold, hold, "{name}");
@@ -550,16 +602,18 @@ mod tests {
     }
 
     /// A window kept across a restart whose reset has passed since is no
-    /// reading: left out, and its pool unread holds.
+    /// reading: its pool holds without holding the whole grant.
     #[test]
     fn a_restored_window_past_its_reset_is_no_reading() {
-        let window = week([1.0, 0.0], T0 + 1, false).restore();
+        let window = week([1.0, 0.0], T0 + 1, false).restore(T0 + WEEK - 1);
         let windows = [(Provider::Anthropic, "unified_7d", Some(&window))];
         let grant = budget().grant(Consumer::Public, &windows, None, T0 + WEEK - 1);
         assert!(!grant.pools[&Provider::Anthropic].hold);
         let grant = budget().grant(Consumer::Public, &windows, None, T0 + WEEK);
-        assert!(grant.hold);
-        assert!(!grant.pools.contains_key(&Provider::Anthropic));
+        assert!(!grant.hold);
+        let pool = &grant.pools[&Provider::Anthropic];
+        assert!(pool.hold && pool.stale);
+        assert!(pool.windows.is_empty());
     }
 
     #[test]
@@ -606,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn a_consumer_missing_from_the_policy_or_a_pool_unread_holds() {
+    fn a_missing_consumer_holds_but_unread_pools_do_not_hold_the_grant() {
         let now = T0;
         let window = week([0.0, 0.0], now, false);
         let windows = [(Provider::Anthropic, "unified_7d", Some(&window))];
@@ -614,13 +668,33 @@ mod tests {
         let grant = only_private.grant(Consumer::Public, &windows, None, now);
         assert!(grant.hold);
         assert!(grant.pools.is_empty());
-        // Codex and Mistral (no spend metered) unread: left out, and held.
+        // Codex and Mistral (no spend metered) unread: held only per pool.
+        let grant = budget().grant(Consumer::Public, &windows, None, now);
+        assert!(!grant.hold);
+        for provider in [Provider::Codex, Provider::Mistral] {
+            let pool = &grant.pools[&provider];
+            assert!(pool.hold && pool.stale);
+            assert!(pool.windows.is_empty());
+        }
+        assert!(!grant.pools[&Provider::Anthropic].hold);
+
+        let unread = budget().grant(Consumer::Public, &[], None, now);
+        assert!(!unread.hold);
+        assert!(unread.pools.values().all(|pool| pool.hold && pool.stale));
+    }
+
+    #[test]
+    fn a_fresh_over_budget_pool_still_holds_the_grant() {
+        let now = T0;
+        let window = five_hours([71.0, 0.0], now);
+        let windows = [(Provider::Anthropic, "unified_5h", Some(&window))];
         let grant = budget().grant(Consumer::Public, &windows, None, now);
         assert!(grant.hold);
-        assert_eq!(
-            grant.pools.keys().collect::<Vec<_>>(),
-            [&Provider::Anthropic]
-        );
-        assert!(!grant.pools[&Provider::Anthropic].hold);
+        assert!(grant.pools[&Provider::Anthropic].hold);
+        assert!(!grant.pools[&Provider::Anthropic].stale);
+        let grant = budget().grant(Consumer::Public, &windows, None, now + FIVE_HOURS + 1);
+        assert!(!grant.hold);
+        assert!(grant.pools[&Provider::Anthropic].hold);
+        assert!(grant.pools[&Provider::Anthropic].stale);
     }
 }
