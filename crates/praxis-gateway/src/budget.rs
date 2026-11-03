@@ -120,10 +120,14 @@ impl Attributed {
         }
     }
 
-    pub(crate) fn validate(&self, now: u64) -> Result<(), String> {
-        if self.observed_at > now {
-            return Err("observed_at must not be in the future".to_owned());
-        }
+    /// Take a reading stored as observed after `now` as observed now, and
+    /// return when it was stored as observed if so. Its reset is absolute,
+    /// so only staleness depends on it.
+    pub(crate) fn clamp_observed_at(&mut self, now: u64) -> Option<u64> {
+        (self.observed_at > now).then(|| std::mem::replace(&mut self.observed_at, now))
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if !(0.0..=100.0).contains(&self.reading.used_percent) {
             return Err("reading.used_percent must be 0 to 100".to_owned());
         }
@@ -349,11 +353,14 @@ impl Budget {
                 let window_grant = window.grant(share, now);
                 pool_grant.stale |= window.stale;
                 pool_grant.hold |= window_grant.hold;
+                // Staleness must not stop all work: that would prevent the
+                // response carrying the next reading from ever arriving. It
+                // is decided per window, so a window that stays stale until
+                // its reset, such as a week's first read part-way, cannot
+                // hide a fresh one over its allowance in the same pool.
+                grant.hold |= window_grant.hold && !window.stale;
                 pool_grant.windows.insert(name, window_grant);
             }
-            // Staleness must not stop all work: that would prevent the
-            // response carrying the next reading from ever arriving.
-            grant.hold |= pool_grant.hold && !pool_grant.stale;
             grant.pools.insert(pool, pool_grant);
         }
         grant
@@ -696,5 +703,32 @@ mod tests {
         assert!(!grant.hold);
         assert!(grant.pools[&Provider::Anthropic].hold);
         assert!(grant.pools[&Provider::Anthropic].stale);
+    }
+
+    /// A stale window, such as a week's first read part-way after a
+    /// restart, holds its pool until it resets; a fresh window in the same
+    /// pool over its allowance must still hold the whole grant meanwhile.
+    #[test]
+    fn a_stale_window_does_not_hide_a_fresh_over_budget_one() {
+        let now = T0 + WEEK / 2;
+        let cases = [
+            ("part-way", week([1.0, 0.0], now, true)),
+            ("old", week([1.0, 0.0], now - FIVE_HOURS - 1, false)),
+        ];
+        for (name, stale) in cases {
+            for (used, hold) in [(90.0, true), (60.0, false)] {
+                let fresh = five_hours([used, 0.0], now);
+                let windows = [
+                    (Provider::Anthropic, "unified_7d", Some(&stale)),
+                    (Provider::Anthropic, "unified_5h", Some(&fresh)),
+                ];
+                let grant = budget().grant(Consumer::Public, &windows, None, now);
+                let pool = &grant.pools[&Provider::Anthropic];
+                assert!(pool.stale && pool.hold, "{name} {used}");
+                assert!(pool.windows["unified_7d"].hold, "{name} {used}");
+                assert_eq!(pool.windows["unified_5h"].hold, hold, "{name} {used}");
+                assert_eq!(grant.hold, hold, "{name} {used}");
+            }
+        }
     }
 }

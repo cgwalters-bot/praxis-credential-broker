@@ -1003,9 +1003,10 @@ and its state-file load (if any), or part-way.
 `/usage`, and Codex's are those its plan has. A pool is `stale` if any of
 its windows is and holds if any of them does; a pool of the consumer's
 shares with nothing read yet has `stale: true`, `hold: true` and empty
-`windows`. A stale or unread pool does not set top-level `hold`: a consumer
-must be able to start work and obtain the reading that clears staleness.
-Top-level `hold` is true if any non-stale pool holds, and for a consumer
+`windows`. A stale window or an unread pool does not set top-level `hold`: a
+consumer must be able to start work and obtain the reading that clears
+staleness. Top-level `hold` is true if any window that is not stale holds,
+even in a pool another window makes stale, and for a consumer
 the policy does not name. Pools missing from the policy are not granted
 and are omitted. Percentages are rounded
 to hundredths after `hold` is decided. A query without exactly one
@@ -1030,7 +1031,10 @@ in the JSON file at `PATH` (schema `praxis-broker-usage-state/v1`), and
 nothing else: not the counts, the operators' totals or the spend. At
 startup it loads them, each with its `observed_at` as stored, so an old
 reading still looks old and a Codex window still resets at its stored
-`observed_at` plus `reset_after_seconds`. A loaded window has `"restored":
+`observed_at` plus `reset_after_seconds`. A window observed later than the
+gateway's clock at startup, as when the host boots with its clock behind,
+is logged and taken as observed then, with its reset where it was. A
+loaded window has `"restored":
 true` in `/usage` until a response reads it again. A file that is missing,
 unreadable, of another schema or with invalid ranges (such as negative
 attributed use or a zero window length) is no reading: the gateway logs a warning
