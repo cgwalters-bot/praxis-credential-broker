@@ -296,21 +296,21 @@ impl Budget {
         };
         for (&pool, &share) in shares {
             let mut read = Vec::new();
-            if pool == Provider::Mistral {
-                if let (Some(cap), Some(spend)) = (self.mistral_weekly_usd, mistral) {
-                    // The trailing week has no reset: it is paced from when
-                    // metering began, so it covers a whole week after one.
-                    read.push((
-                        MISTRAL_WINDOW,
-                        Window {
-                            used_percent: spend.micros as f64 / (cap * 1e6) * 100.0,
-                            start: spend.since,
-                            secs: WEEK,
-                            resets_at: None,
-                            stale: false,
-                        },
-                    ));
-                }
+            if pool == Provider::Mistral
+                && let (Some(cap), Some(spend)) = (self.mistral_weekly_usd, mistral)
+            {
+                // The trailing week has no reset: it is paced from when
+                // metering began, so it covers a whole week after one.
+                read.push((
+                    MISTRAL_WINDOW,
+                    Window {
+                        used_percent: spend.micros as f64 / (cap * 1e6) * 100.0,
+                        start: spend.since,
+                        secs: WEEK,
+                        resets_at: None,
+                        stale: false,
+                    },
+                ));
             }
             for (_, name, window) in windows.iter().filter(|(p, ..)| *p == pool) {
                 let Some(window) = window else {
