@@ -733,14 +733,11 @@ struct Windows {
 }
 
 impl Windows {
-    fn validate(&self, now: u64) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
         for (name, window) in [
             ("unified_5h", &self.unified_5h),
             ("unified_7d", &self.unified_7d),
         ] {
-            if window.as_ref().is_some_and(|w| w.observed_at > now) {
-                return Err(format!("{name}.observed_at must not be in the future"));
-            }
             if window
                 .as_ref()
                 .and_then(|w| w.utilization)
@@ -751,9 +748,6 @@ impl Windows {
         }
         for (name, window) in [("primary", &self.primary), ("secondary", &self.secondary)] {
             if let Some(window) = window {
-                if window.observed_at > now {
-                    return Err(format!("{name}.observed_at must not be in the future"));
-                }
                 if window
                     .used_percent
                     .is_some_and(|n| !(0.0..=100.0).contains(&n))
@@ -779,11 +773,45 @@ impl Windows {
         for (index, window) in self.attributed.iter().enumerate() {
             if let Some(window) = window {
                 window
-                    .validate(now)
+                    .validate()
                     .map_err(|e| format!("attributed[{index}]: {e}"))?;
             }
         }
         Ok(())
+    }
+
+    /// Take each window stored as observed after `now` as observed now, as
+    /// when the host's clock starts behind until it is synchronized, and
+    /// return each one's name and stored `observed_at`. A Codex window keeps
+    /// its absolute reset, so `validate` must have checked it can be added.
+    fn clamp_observed_at(&mut self, now: u64) -> Vec<(String, u64)> {
+        let mut clamped = Vec::new();
+        for (name, window) in [
+            ("unified_5h", &mut self.unified_5h),
+            ("unified_7d", &mut self.unified_7d),
+        ] {
+            if let Some(window) = window.as_mut().filter(|w| w.observed_at > now) {
+                clamped.push((name.to_owned(), window.observed_at));
+                window.observed_at = now;
+            }
+        }
+        for (name, window) in [
+            ("primary", &mut self.primary),
+            ("secondary", &mut self.secondary),
+        ] {
+            if let Some(window) = window.as_mut().filter(|w| w.observed_at > now) {
+                let ahead = window.observed_at - now;
+                clamped.push((name.to_owned(), window.observed_at));
+                window.observed_at = now;
+                window.reset_after_seconds = window.reset_after_seconds.map(|n| n + ahead);
+            }
+        }
+        for (index, window) in self.attributed.iter_mut().enumerate() {
+            if let Some(observed_at) = window.as_mut().and_then(|w| w.clamp_observed_at(now)) {
+                clamped.push((format!("attributed[{index}]"), observed_at));
+            }
+        }
+        clamped
     }
 }
 
@@ -886,8 +914,17 @@ fn read_state(path: &Path) -> Result<BTreeMap<String, Windows>, String> {
         let now = unix_time();
         for (name, windows) in &mut file.registries {
             windows
-                .validate(now)
+                .validate()
                 .map_err(|e| format!("registry {name:?}: {e}"))?;
+            for (window, observed_at) in windows.clamp_observed_at(now) {
+                warn!(
+                    registry = name,
+                    window,
+                    observed_at,
+                    now,
+                    "usage state window observed later than now, as if the clock is behind; taken as observed now"
+                );
+            }
             for window in windows.attributed.iter_mut().flatten() {
                 *window = window.clone().restore(now);
             }
@@ -1587,21 +1624,6 @@ mod tests {
         })
         .unwrap();
         let cases = [
-            (
-                "/registries/default/attributed/0/observed_at",
-                json!(u64::MAX),
-                "observed_at",
-            ),
-            (
-                "/registries/default/unified_5h/observed_at",
-                json!(u64::MAX),
-                "observed_at",
-            ),
-            (
-                "/registries/default/primary/observed_at",
-                json!(u64::MAX),
-                "observed_at",
-            ),
             ("/registries/default/attributed/0/used/0", json!(-1), "used"),
             (
                 "/registries/default/attributed/0/reading/used_percent",
@@ -1666,6 +1688,58 @@ mod tests {
             let e = read_state(&path).unwrap_err();
             assert!(e.contains(reason), "{pointer}: {e}");
             assert!(e.contains("usage-state.json"), "{pointer}: {e}");
+        }
+    }
+
+    /// A host whose clock starts behind, until it is synchronized, reads
+    /// windows observed "later": each is taken as observed now, with its
+    /// reset where it was, rather than losing the whole file.
+    #[test]
+    fn windows_observed_later_than_now_are_taken_as_observed_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-state.json");
+        let ahead = 3 * 3600;
+        let observed_at = unix_time() + ahead;
+        let usage = read_fixtures(observed_at);
+        let before = serde_json::to_value(usage.windows()).unwrap();
+        let before_load = unix_time();
+        let restored = round_trip(&usage, &path);
+        let after = serde_json::to_value(restored.windows()).unwrap();
+        let mut pointers = vec![
+            "/unified_5h".to_owned(),
+            "/unified_7d".to_owned(),
+            "/primary".to_owned(),
+            "/secondary".to_owned(),
+        ];
+        pointers.extend(
+            (0..4)
+                .filter(|i| !before["attributed"][i].is_null())
+                .map(|i| format!("/attributed/{i}")),
+        );
+        assert!(pointers.len() > 4, "no attributed window in {before}");
+        for pointer in pointers {
+            let (before, after) = (
+                &before.pointer(&pointer).unwrap(),
+                &after.pointer(&pointer).unwrap(),
+            );
+            let clamped = after["observed_at"].as_u64().unwrap();
+            assert_eq!(before["observed_at"], observed_at, "{pointer}");
+            assert!(
+                (before_load..observed_at).contains(&clamped),
+                "{pointer}: {clamped}"
+            );
+        }
+        // Absolute resets stay where they were.
+        for window in ["primary", "secondary"] {
+            let reset = |w: &serde_json::Value| {
+                w["observed_at"].as_u64().unwrap() + w["reset_after_seconds"].as_u64().unwrap()
+            };
+            assert_eq!(reset(&after[window]), reset(&before[window]), "{window}");
+        }
+        assert_eq!(after["unified_5h"]["reset"], before["unified_5h"]["reset"]);
+        for i in 0..4 {
+            let reading = |w: &serde_json::Value| w["attributed"][i]["reading"].clone();
+            assert_eq!(reading(&after), reading(&before), "attributed[{i}]");
         }
     }
 
