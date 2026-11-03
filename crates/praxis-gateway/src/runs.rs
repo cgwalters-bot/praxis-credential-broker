@@ -432,15 +432,14 @@ impl Runs {
             actor: identity.actor,
             admitted_by: identity.admitted_by,
         };
-        let record = state.insert(
+        let run = NewRun {
             key,
             proof,
-            Some(identity.jti),
-            identity.consumer,
-            hash,
-            limits,
-            now,
-        );
+            jti: Some(identity.jti),
+            consumer: identity.consumer,
+            token_hash: hash,
+        };
+        let record = state.insert(run, limits, now);
         Ok((token, record))
     }
 
@@ -483,7 +482,14 @@ impl Runs {
         let (token, hash) = new_token();
         // Whoever it is, it is not the public board's.
         let proof = Proof::Unproven { run: name };
-        let record = state.insert(key, proof, None, Consumer::Private, hash, limits, now);
+        let run = NewRun {
+            key,
+            proof,
+            jti: None,
+            consumer: Consumer::Private,
+            token_hash: hash,
+        };
+        let record = state.insert(run, limits, now);
         Ok((token, record))
     }
 
@@ -554,18 +560,25 @@ enum Outcome {
     Failed,
 }
 
+/// A run about to be registered: who it is and how it authenticates.
+struct NewRun {
+    key: RunKey,
+    proof: Proof,
+    jti: Option<String>,
+    consumer: Consumer,
+    token_hash: [u8; 32],
+}
+
 impl State {
-    /// Add a run that starts now, and return its record.
-    fn insert(
-        &mut self,
-        key: RunKey,
-        proof: Proof,
-        jti: Option<String>,
-        consumer: Consumer,
-        token_hash: [u8; 32],
-        limits: Limits,
-        now: Instant,
-    ) -> RunRecord {
+    /// Add `run`, which starts now, and return its record.
+    fn insert(&mut self, run: NewRun, limits: Limits, now: Instant) -> RunRecord {
+        let NewRun {
+            key,
+            proof,
+            jti,
+            consumer,
+            token_hash,
+        } = run;
         let registered = unix_now();
         let record = RunRecord {
             schema: RECORD_SCHEMA,
