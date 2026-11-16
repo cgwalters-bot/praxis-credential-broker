@@ -188,9 +188,11 @@ filter_chains:
         registration:
           policy_file: /etc/praxis-credential-broker/run-token-policy.yaml
         # Long-lived tokens for people; none unless the deployment mounts
-        # this file (operator-tokens.yaml is the example).
+        # this file (operator-tokens.yaml is the example), read again every
+        # 10 s, so that tokens are added and revoked without a restart.
         operators:
           tokens_file: /etc/praxis-credential-broker/operator-tokens.yaml
+          reload_secs: 10
         # What injected requests cost at list price over the trailing week,
         # in /usage, for the board's weekly budget (see INTERNALS.md).
         spend: true

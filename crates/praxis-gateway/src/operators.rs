@@ -10,19 +10,25 @@
 //! authenticated identity under its own name, so the `token_rate_limit`
 //! rule keyed on the identity caps it like a run, and `/usage` counts it
 //! apart from the runs.
+//!
+//! With [`watch`] the file is read again whenever its content changes, so
+//! that tokens are added and revoked without a restart, which would end
+//! every run. Polling the content, rather than watching for events, also
+//! sees a Kubernetes ConfigMap's `..data` symlink swapped.
 use crate::budget::Consumer;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, PoisonError, RwLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 pub const TOKEN_PREFIX: &str = "praxis-operator-";
 /// Operators a tokens file may name, which bounds what `/usage` keeps.
@@ -71,7 +77,9 @@ pub struct Operator {
     clusters: HashSet<String>,
     concurrency: usize,
     consumer: Consumer,
-    in_flight: AtomicUsize,
+    /// Shared with the same token's operator in a reloaded set, so that
+    /// requests in flight across a reload still count.
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl Operator {
@@ -133,20 +141,20 @@ pub struct Operators {
 }
 
 impl Operators {
-    /// The operators the file at `path` names, or none if there is no such
-    /// file. `injected` are the clusters a token may be for.
-    ///
-    /// # Errors
-    ///
-    /// Returns what is wrong with a file that can't be read or isn't valid.
-    pub fn load(path: &Path, injected: &HashSet<&str>) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+    /// The operators `text`, read from `path`, names; none without a file.
+    /// `injected` are the clusters a token may be for. Those whose token
+    /// `previous` also has share its in-flight count.
+    fn from_text(
+        path: &Path,
+        text: Option<&str>,
+        injected: &HashSet<&str>,
+        previous: &Self,
+    ) -> Result<Self, String> {
+        let operators = match text {
+            None => Self::default(),
+            Some(text) => Self::parse(text, injected, previous)
+                .map_err(|e| format!("{}: {e}", path.display()))?,
         };
-        let operators =
-            Self::parse(&text, injected).map_err(|e| format!("{}: {e}", path.display()))?;
         info!(
             tokens_file = %path.display(),
             operators = ?operators.names(),
@@ -155,7 +163,7 @@ impl Operators {
         Ok(operators)
     }
 
-    fn parse(text: &str, injected: &HashSet<&str>) -> Result<Self, String> {
+    fn parse(text: &str, injected: &HashSet<&str>, previous: &Self) -> Result<Self, String> {
         let file: TokensFile = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
         if file.operators.len() > MAX_OPERATORS {
             return Err(format!("at most {MAX_OPERATORS} operators"));
@@ -198,7 +206,11 @@ impl Operators {
                 clusters: entry.clusters,
                 concurrency: entry.concurrency,
                 consumer: entry.consumer,
-                in_flight: AtomicUsize::new(0),
+                in_flight: previous
+                    .by_hash
+                    .get(&hash)
+                    .map(|old| Arc::clone(&old.in_flight))
+                    .unwrap_or_default(),
             };
             if by_hash.insert(hash, Arc::new(operator)).is_some() {
                 return Err("two operators share a token".to_owned());
@@ -229,9 +241,129 @@ impl Operators {
     }
 }
 
+/// The operators a filter admits, which [`watch`] replaces as a whole.
+pub type Shared = RwLock<Arc<Operators>>;
+
+/// The current operators of `shared`.
+pub fn current(shared: &Shared) -> Arc<Operators> {
+    Arc::clone(&shared.read().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// The text of the file at `path`, or none if there is no such file.
+fn read(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The operators the file at `path` names, or none if there is no such
+/// file, calling `loaded` with them. `injected` are the clusters a token
+/// may be for. With `every`, the file is then read again at that interval,
+/// as [`watch`] says.
+///
+/// # Errors
+///
+/// Returns what is wrong with a file that can't be read or isn't valid.
+pub fn load_watched(
+    path: &Path,
+    injected: &HashSet<&str>,
+    every: Option<Duration>,
+    loaded: impl Fn(&Operators) + Send + 'static,
+) -> Result<Arc<Shared>, String> {
+    let text = read(path)?;
+    let operators = Operators::from_text(path, text.as_deref(), injected, &Operators::default())?;
+    loaded(&operators);
+    let shared = Arc::new(RwLock::new(Arc::new(operators)));
+    if let Some(every) = every {
+        let injected = injected.iter().map(|&c| c.to_owned()).collect();
+        watch(
+            path.to_owned(),
+            injected,
+            every,
+            text,
+            Arc::downgrade(&shared),
+            loaded,
+        );
+    }
+    Ok(shared)
+}
+
+/// Every `every`, read the file at `path` again, and if its content
+/// differs from `last`, replace the operators of `shared` with those it
+/// names, calling `loaded` with them first. A file that can't be read or
+/// isn't valid keeps the operators there were. Stops within an interval of
+/// `shared` being dropped, as when a reload of `praxis.yaml` builds another
+/// filter.
+fn watch(
+    path: PathBuf,
+    injected: HashSet<String>,
+    every: Duration,
+    last: Option<String>,
+    shared: Weak<Shared>,
+    loaded: impl Fn(&Operators) + Send + 'static,
+) {
+    let mut last = Ok(last);
+    let watcher = move || {
+        let injected = injected.iter().map(String::as_str).collect();
+        loop {
+            std::thread::sleep(every);
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            let text = read(&path);
+            if text == last {
+                continue;
+            }
+            let operators = text.clone().and_then(|text| {
+                Operators::from_text(&path, text.as_deref(), &injected, &current(&shared))
+            });
+            match operators {
+                Ok(operators) => {
+                    loaded(&operators);
+                    *shared.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(operators);
+                }
+                Err(error) => warn!(%error, "operator tokens not reloaded; keeping the old ones"),
+            }
+            last = text;
+        }
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("operator-tokens".to_owned())
+        .spawn(watcher)
+    {
+        warn!(error = %e, "operator tokens file not watched");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::{os::unix::fs::symlink, path::Path};
+
+    /// Update `name` in `dir` as the kubelet updates a ConfigMap mounted as
+    /// a directory: write version `n` into a directory of its own, and
+    /// point `..data` at it by renaming a new link over the old one. `name`
+    /// links into `..data`, and is replaced by such a link the first time.
+    pub fn kubelet_update(dir: &Path, name: &str, n: u32, text: &str) {
+        let version = format!("..v{n}");
+        std::fs::create_dir(dir.join(&version)).unwrap();
+        std::fs::write(dir.join(&version).join(name), text).unwrap();
+        let replace = |target: &Path, link: &str| {
+            let new = dir.join("..data_tmp");
+            symlink(target, &new).unwrap();
+            std::fs::rename(&new, dir.join(link)).unwrap();
+        };
+        replace(Path::new(&version), "..data");
+        if !dir.join(name).is_symlink() {
+            replace(&Path::new("..data").join(name), name);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{testing::kubelet_update, *};
 
     const TOKEN: &str = "praxis-operator-0000";
 
@@ -241,6 +373,14 @@ mod tests {
 
     fn injected() -> HashSet<&'static str> {
         HashSet::from(["codex", "claude"])
+    }
+
+    fn parse(text: &str) -> Result<Operators, String> {
+        Operators::parse(text, &injected(), &Operators::default())
+    }
+
+    fn load(path: &Path) -> Result<Arc<Operators>, String> {
+        load_watched(path, &injected(), None, |_| {}).map(|shared| current(&shared))
     }
 
     fn entry(name: &str, token: &str, rest: &str) -> String {
@@ -364,7 +504,7 @@ mod tests {
             ),
         ];
         for (case, text, expected) in cases {
-            let parsed = Operators::parse(&text, &injected());
+            let parsed = parse(&text);
             assert_eq!(
                 parsed.as_ref().ok().map(Operators::names),
                 expected,
@@ -378,21 +518,81 @@ mod tests {
     fn a_missing_tokens_file_names_no_operators() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operator-tokens.yaml");
-        assert!(
-            Operators::load(&path, &injected())
-                .unwrap()
-                .names()
-                .is_empty()
-        );
+        assert!(load(&path).unwrap().names().is_empty());
         std::fs::write(&path, "operators: [").unwrap();
-        let error = Operators::load(&path, &injected()).unwrap_err();
+        let error = load(&path).unwrap_err();
         assert!(error.contains("operator-tokens.yaml"), "{error}");
+    }
+
+    #[test]
+    fn a_watched_tokens_file_is_swapped_whole_and_only_when_valid() {
+        const OTHER: &str = "praxis-operator-1111";
+        let me = entry("me", TOKEN, "clusters: [codex], concurrency: 1");
+        let you = entry("you", OTHER, "clusters: [codex]");
+        let dir = tempfile::tempdir().unwrap();
+        let version = |n, text: &str| kubelet_update(dir.path(), "operator-tokens.yaml", n, text);
+        version(1, &format!("operators: [{me}]"));
+        let path = dir.path().join("operator-tokens.yaml");
+        let declared = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared = {
+            let declared = Arc::clone(&declared);
+            load_watched(
+                &path,
+                &injected(),
+                Some(Duration::from_millis(10)),
+                move |loaded| declared.lock().unwrap().push(loaded.names().join(",")),
+            )
+            .unwrap()
+        };
+        let declared = || declared.lock().unwrap().clone();
+        let until = |done: &dyn Fn() -> bool| {
+            for _ in 0..500 {
+                if done() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("not reloaded: {:?}", declared());
+        };
+        let slot = current(&shared)
+            .authenticate(TOKEN)
+            .unwrap()
+            .admit("codex")
+            .unwrap();
+
+        // An added token is admitted, and one that stays keeps its requests
+        // in flight.
+        version(2, &format!("operators: [{me}, {you}]"));
+        until(&|| current(&shared).authenticate(OTHER).is_some());
+        let operators = current(&shared);
+        let operator = operators.authenticate(TOKEN).unwrap();
+        assert_eq!(operator.admit("codex").err(), Some(Refusal::Busy));
+        drop(slot);
+        drop(operator.admit("codex").unwrap());
+
+        // A file that is not valid keeps them all, and is not read again
+        // until it changes.
+        version(3, &format!("operators: [{me}, {you}, {me}]"));
+        version(4, "operators: [");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(current(&shared).names(), ["me", "you"]);
+        assert_eq!(declared(), ["me", "me,you"]);
+
+        // A removed token is refused.
+        version(5, &format!("operators: [{you}]"));
+        until(&|| current(&shared).authenticate(TOKEN).is_none());
+        assert_eq!(declared(), ["me", "me,you", "you"]);
+
+        // The watcher keeps no filter's operators alive, so it stops with them.
+        let watched = Arc::downgrade(&shared);
+        drop(shared);
+        assert!(watched.upgrade().is_none());
     }
 
     #[test]
     fn only_the_whole_token_authenticates_its_operator() {
         let text = format!("operators: [{}]", entry("me", TOKEN, "clusters: [codex]"));
-        let operators = Operators::parse(&text, &injected()).unwrap();
+        let operators = parse(&text).unwrap();
         let operator = operators.authenticate(TOKEN).unwrap();
         assert_eq!(operator.subject(), "operator:me");
         // A rule that names no consumer is the private one's.
@@ -408,7 +608,7 @@ mod tests {
         // A token without the prefix is never an operator's, even if the
         // file has its hash.
         let text = format!("operators: [{}]", entry("me", "bare", "clusters: [codex]"));
-        let operators = Operators::parse(&text, &injected()).unwrap();
+        let operators = parse(&text).unwrap();
         assert!(operators.authenticate("bare").is_none());
     }
 
@@ -418,7 +618,7 @@ mod tests {
             "operators: [{}]",
             entry("me", TOKEN, "clusters: [codex], concurrency: 2")
         );
-        let operators = Operators::parse(&text, &injected()).unwrap();
+        let operators = parse(&text).unwrap();
         let operator = operators.authenticate(TOKEN).unwrap();
         assert_eq!(operator.admit("claude").err(), Some(Refusal::Forbidden));
         let a = operator.admit("codex").unwrap();

@@ -44,7 +44,7 @@ use crate::{
         AnyWorkflow, CalledWorkflow, DEFAULT_AUDIENCE, GITHUB_JWKS, GithubOidc, OidcError, Policy,
         present,
     },
-    operators::{self, Operators},
+    operators,
     runs::{
         Admission, Limits, MAX_UNPROVEN_RUNS, Quota, Refusal, RegisterError, RunKey, RunName, Runs,
         TOKEN_PREFIX, Tokens, Usage,
@@ -108,6 +108,9 @@ const DEFAULT_MAX_SECS: u64 = 6 * 3600;
 const DEFAULT_CONCURRENCY: usize = 4;
 /// The longest a run may last; also keeps deadlines far from overflowing.
 const MAX_SECS: u64 = 30 * 24 * 3600;
+/// The longest interval between reads of the operator tokens file, so that
+/// a revocation is not left waiting for hours by a typo.
+const MAX_RELOAD_SECS: u64 = 3600;
 /// The only event that may register runs unless `events` says otherwise.
 const DEFAULT_EVENT: &str = "workflow_dispatch";
 
@@ -198,6 +201,10 @@ struct OperatorsConfig {
     /// Who holds an operator token, and for which clusters (see
     /// [`crate::operators`]). Without this file there are none.
     tokens_file: PathBuf,
+    /// Read the file again this often, and admit the operators it then
+    /// names; without it the file is read only at startup and at a reload
+    /// of the config, which resets the token caps.
+    reload_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,7 +348,7 @@ pub struct RunTokenFilter {
     credentials: HashMap<String, CredentialMode>,
     usage_cors_origins: HashSet<String>,
     endpoints: RunEndpoints,
-    operators: Operators,
+    operators: Arc<operators::Shared>,
     /// The deployment's budget, if it has one.
     budget: Option<Budget>,
 }
@@ -405,10 +412,30 @@ impl RunTokenFilter {
             .filter(|(_, mode)| **mode == CredentialMode::Injected)
             .map(|(cluster, _)| cluster.as_str())
             .collect();
+        let usage = BrokerUsage::named(&config.registry);
         let operators = match &config.operators {
-            None => Operators::default(),
-            Some(operators) => Operators::load(&operators.tokens_file, &injected)
-                .map_err(|e| format!("{FILTER_NAME}: {e}"))?,
+            None => Arc::default(),
+            Some(operators) => {
+                let reload = operators
+                    .reload_secs
+                    .map(|secs| {
+                        if (1..=MAX_RELOAD_SECS).contains(&secs) {
+                            Ok(Duration::from_secs(secs))
+                        } else {
+                            Err(format!(
+                                "{FILTER_NAME}: operators.reload_secs must be from 1 to {MAX_RELOAD_SECS}"
+                            ))
+                        }
+                    })
+                    .transpose()?;
+                let usage = Arc::clone(&usage);
+                operators::load_watched(&operators.tokens_file, &injected, reload, move |loaded| {
+                    for operator in loaded.sorted() {
+                        usage.declare_operator(operator.name(), operator.consumer());
+                    }
+                })
+                .map_err(|e| format!("{FILTER_NAME}: {e}"))?
+            }
         };
         let budget = match &config.budget {
             None => None,
@@ -416,7 +443,6 @@ impl RunTokenFilter {
                 Budget::load(&budget.policy_file).map_err(|e| format!("{FILTER_NAME}: {e}"))?
             }
         };
-        let usage = BrokerUsage::named(&config.registry);
         if config.spend {
             usage.meter_spend();
         }
@@ -424,9 +450,6 @@ impl RunTokenFilter {
             && registrar.unproven.is_some()
         {
             usage.declare_unproven();
-        }
-        for operator in operators.sorted() {
-            usage.declare_operator(operator.name(), operator.consumer());
         }
         Ok(Box::new(Self {
             runs: Runs::named(&config.registry),
@@ -466,7 +489,7 @@ impl RunTokenFilter {
     fn admit(&self, headers: &HeaderMap, cluster: &str) -> Result<(String, Caller), FilterAction> {
         let unauthenticated = || reject(401, "client authentication required\n");
         let (_, token) = self.token(headers).ok_or_else(unauthenticated)?;
-        if let Some(operator) = self.operators.authenticate(token) {
+        if let Some(operator) = operators::current(&self.operators).authenticate(token) {
             return match operator.admit(cluster) {
                 Ok(slot) => Ok((operator.subject(), Caller::Operator(slot))),
                 Err(operators::Refusal::Forbidden) => {
@@ -1074,6 +1097,18 @@ mod tests {
             ("{credentials: {a: injected}, operators: {}}", false),
             (
                 "{credentials: {a: injected}, operators: {tokens_file: /dev/null, tokens: []}}",
+                false,
+            ),
+            (
+                "{credentials: {a: injected}, operators: {tokens_file: /nonexistent/tokens, reload_secs: 3600}}",
+                true,
+            ),
+            (
+                "{credentials: {a: injected}, operators: {tokens_file: /nonexistent/tokens, reload_secs: 0}}",
+                false,
+            ),
+            (
+                "{credentials: {a: injected}, operators: {tokens_file: /nonexistent/tokens, reload_secs: 3601}}",
                 false,
             ),
         ];
