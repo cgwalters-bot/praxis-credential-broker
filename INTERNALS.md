@@ -774,7 +774,9 @@ mints a token (`praxis-operator-` and 64 hex digits) into a file only its
 owner can read and prints the entry; the token is never printed. Use only
 tokens it minted: the hash protects a random token, not one a person chose.
 The gateway reads the file when it starts, and does not start with a
-malformed one; without the file there are no operators. It mounts as
+malformed one; without the file there are no operators. With
+`operators.reload_secs` (1 to 3600; `praxis.yaml` sets 10) it reads the
+file again at that interval, as described below. It mounts as
 `PRAXIS_OPERATOR_TOKENS` for `native-pod.sh up`, or a drop-in for Quadlet.
 
 An operator token is accepted where a run token is, in the same headers,
@@ -789,16 +791,29 @@ and removed before the request goes upstream. What it grants:
   registers none, and is refused as a pass-through credential (400), so it
   is never sent to a provider.
 
-It does not expire. To revoke one, remove its entry and restart the gateway:
-editing the file alone changes nothing, since Praxis watches `praxis.yaml`
-and the files a filter declares, and `run_token` declares none; and a
-reload that fails keeps the old operators. After the restart, the
-`operator tokens loaded` line in the log names the operators the gateway
-has. (A reload of `praxis.yaml` does read the file again. Like any reload
-it resets the token caps, an operator's included, as under
-[Metering and caps](#metering-and-caps), and it starts the operators'
-in-flight counts afresh, so one may briefly exceed its `concurrency`.) The
-gateway holds only the hash, so the
+It does not expire. To revoke one, remove its entry. With `reload_secs`
+the gateway notices within that interval when the file's content changes:
+a ConfigMap mounted as a directory (not with `subPath`), whose `..data`
+link the kubelet swaps, or, for the file alone bind-mounted by Quadlet or
+`native-pod.sh`, an edit in place on the host (a new file renamed over it
+is not seen through the bind mount). A read may catch an edit in place
+half written, which can parse and name fewer operators until the next
+read. The gateway reads and checks the whole file before it uses any of
+it, and then swaps the operators at once: a removed token is refused from
+the next request, while requests already in flight finish; an added one is
+admitted; and one in both keeps its in-flight count, and, under the same
+name, its token caps and `/usage` counts. No run ends and no cap resets. A
+file that can't be read or isn't valid keeps the operators there were, and
+logs `operator tokens not reloaded` with the reason; a missing file, as at
+startup, means no operators. Each reload logs `operator tokens loaded` with
+the operators the gateway now has. So a token rotates without downtime:
+add the new entry, move the clients to the new token, then remove the old
+entry. Without `reload_secs`, editing the file changes nothing until a
+restart, which ends every run, or a reload of `praxis.yaml`, which reads
+the file again but, like any reload, resets the token caps, an operator's
+included, as under [Metering and caps](#metering-and-caps), and starts the
+operators' in-flight counts afresh, so one may briefly exceed its
+`concurrency`. The gateway holds only the hash, so the
 tokens file is not a secret, but **whoever can write it can use the
 broker's credentials**, like the registration policy; and whoever can read
 a token file can spend that operator's budget until it is revoked. Its use

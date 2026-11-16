@@ -1354,6 +1354,104 @@ async fn without_a_tokens_file_an_operator_token_is_refused() {
     assert_eq!(h.upstream.calls(), 0);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_tokens_are_added_and_revoked_without_a_restart() {
+    const NEW_OPERATOR: &str = "rotated";
+    const NEW_OPERATOR_TOKEN: &str = "praxis-operator-SYNTHETIC-ROTATED-OPERATOR-TOKEN";
+    let h = Harness::start(true, |filter| {
+        if filter["filter"] == "run_token" {
+            filter["operators"]["reload_secs"] = Yaml::from(1);
+        }
+    })
+    .await;
+    let tokens = |operators: &[(&str, &str)]| {
+        let operators: Vec<_> = operators
+            .iter()
+            .map(|(name, token)| {
+                json!({
+                    "name": name,
+                    "token_sha256": hex::encode(Sha256::digest(token)),
+                    "clusters": [RESPONSES],
+                })
+            })
+            .collect();
+        json!({ "operators": operators }).to_string()
+    };
+    let update = |n, text: &str| {
+        crate::operators::testing::kubelet_update(
+            h._policy.path(),
+            "operator-tokens.yaml",
+            n,
+            text,
+        );
+    };
+    let status_of = async |token: &str| h.respond(Some(token), "", false).await.0;
+    let until = async |token: &str, status: StatusCode| {
+        for _ in 0..100 {
+            if status_of(token).await == status {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("{token} not reloaded to {status}");
+    };
+
+    // The operator's cap is spent, and a run is under way.
+    for _ in 0..2 {
+        assert_eq!(status_of(OPERATOR_TOKEN).await, StatusCode::OK);
+    }
+    assert_eq!(
+        status_of(OPERATOR_TOKEN).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let run = h.run(1).await;
+    assert_eq!(status_of(&run).await, StatusCode::OK);
+    assert_eq!(
+        status_of(NEW_OPERATOR_TOKEN).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // An added token is admitted, as the kubelet updates a ConfigMap, and
+    // the one that stays keeps its spent cap.
+    update(
+        1,
+        &tokens(&[
+            (OPERATOR, OPERATOR_TOKEN),
+            (NEW_OPERATOR, NEW_OPERATOR_TOKEN),
+        ]),
+    );
+    until(NEW_OPERATOR_TOKEN, StatusCode::OK).await;
+    assert_eq!(
+        status_of(OPERATOR_TOKEN).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        status_of(CLAUDE_OPERATOR_TOKEN).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let usage = h.broker_usage().await;
+    assert_eq!(usage["operators"][OPERATOR]["requests"], 2);
+    assert_eq!(usage["operators"][NEW_OPERATOR]["requests"], 1);
+
+    // A file that is not valid keeps the operators there were.
+    update(2, "operators: [");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(status_of(NEW_OPERATOR_TOKEN).await, StatusCode::OK);
+
+    // A removed token is refused; the operator that stays, now over its
+    // cap, is still known, and the run goes on to its own cap with its
+    // record.
+    update(3, &tokens(&[(NEW_OPERATOR, NEW_OPERATOR_TOKEN)]));
+    until(OPERATOR_TOKEN, StatusCode::UNAUTHORIZED).await;
+    assert_eq!(
+        status_of(NEW_OPERATOR_TOKEN).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(status_of(&run).await, StatusCode::OK);
+    assert_eq!(status_of(&run).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.usage(&run).await["requests"], 2);
+}
+
 /// Praxis AI's own startup validation, which the test harness skips,
 /// accepts praxis.yaml; it refuses, say, conditions on security filters.
 #[test]
